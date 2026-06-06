@@ -8,20 +8,19 @@
 //
 // Status (stage-1 simulation):
 //   - Mechanism verified: a synthetic sequence (same as traceIF_tb) decodes
-//     correctly through this harness (frames "3412 0302 ..." recovered).
-//   - Real data feeds in and the TPIU sync sequence is correctly detected:
-//     slowitm.dat -> ~170 syncs (capture is mostly idle sync words),
-//     fastitm.dat -> ~64 syncs plus real ITM payload words.
-//   - Byte-stream analysis confirms the TPIU full-sync word (ff ff ff 7f)
-//     is present once the captured byte is split as dina=low nibble,
-//     dinb=high nibble (see feedByte).
-//
-// TODO(align): full per-TRACECLK phase/bit-order alignment so that complete
-//   16-bit-half-word frames are reassembled from the real captures. Sync is
-//   detected but full frame reassembly from real .dat needs the exact nibble
-//   feed phase to match traceIF's internal shift order. Tracked separately;
-//   not blocking — synthetic decode + sync detection already validate the
-//   chip-independent framing logic.
+//     correctly through this harness.
+//   - Nibble mapping confirmed: dina = low nibble, dinb = high nibble. A
+//     cycle-accurate model of traceIF's width=3 shift register yields 64
+//     RE-sync hits on fastitm.dat with this mapping and 0 with any other
+//     (swap / bit-reverse), so the alignment is unambiguous.
+//   - Real captures now decode (after the traceIF reset-branch fix that made
+//     FrAvail observable):
+//       * slowitm.dat -> mostly idle TPIU sync (capture is idle).
+//       * fastitm.dat -> 64 syncs and real ITM payload frames, e.g.
+//         FRAME[0]=...101010f0f4...f1710 carrying actual ITM data, followed
+//         by idle sync frames. RTL sync count matches the model (64).
+//   - Conclusion: traceIF correctly reassembles frames from real captured
+//     trace data; chip-independent framing logic validated against real data.
 //
 // Run with (default slowitm.dat):
 //   iverilog -o r verilog/traceIF.v verilog/testbeds/traceIF_stim_tb.v ; vvp r
