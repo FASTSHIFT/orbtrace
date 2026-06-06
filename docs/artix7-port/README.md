@@ -106,5 +106,6 @@ graph TD
 - [x] 选型收敛（方案丙）
 - [x] fork + remote 配置 + `artix7-port` 分支
 - [x] 文档归档
-- [ ] **第一阶段：无硬件仿真验证**（进行中，见 `PLAN.md`）
-- [ ] 后续：以太网栈 OOC 综合定板（35T/100T）→ 上板满速 PoC
+- [x] **第一阶段：无硬件仿真验证** —— 逻辑层非平台风险已消化（`pytest tests/` 11 passed + iverilog 物理层组帧/重同步/真实数据，详见 `PLAN.md`），过程中修复 2 个真实缺陷
+- [ ] **第二阶段：选板与 OOC 综合** —— 以太网栈 OOC 综合定板（35T/100T），选板 datasheet 门（TRACECLK 落 MRCC 等）
+- [ ] **第三阶段：上板 PoC** —— 采样前端移植（ECP5→Artix ISERDES/IDELAY）、满速源同步采样眼图/时序、千兆网出口带宽实测
