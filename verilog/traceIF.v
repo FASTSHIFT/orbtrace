@@ -135,5 +135,16 @@ module traceIF # (parameter MAXBUSWIDTH = 4, SYNC_BITS=27) (
                     end // else: !if(remainingClocks)
                end // else: !if (syncPacket)
           end // else: !if(rst)
+        else
+          begin
+             // Reset: establish deterministic state so FrAvail toggles from a
+             // known value (otherwise it stays X in simulation and never
+             // produces an observable frame-ready edge).
+             FrAvail         <= 1'b0;
+             construct       <= 36'b0;
+             remainingClocks <= 3'b0;
+             elemCount       <= ~0;
+             isREsync        <= 1'b0;
+          end
      end // always @ (posedge traceClkin, posedge rst)
 endmodule // traceIF
