@@ -67,8 +67,8 @@ graph LR
 ### S0 · 环境就绪
 - [x] fork remote 已加（`fork` → FASTSHIFT/orbtrace）
 - [x] amaranth 0.5.4 / pytest / cobs 已装
-- [ ] 装 `iverilog`（Verilog 仿真用）
-- [ ] 建工作分支：`git checkout -b artix7-port`，后续改动都在此分支，定期 push 到 `fork`
+- [x] 装 `iverilog` + `gtkwave`
+- [x] 建工作分支 `artix7-port`，改动在此分支
 
 ### S1 · 跑通全部现成仿真（基线）
 - [x] `pytest tests/` 全绿（tpiu/cobs/swo/stream_utils）
@@ -98,25 +98,23 @@ graph LR
 - 关键文件：`verilog/traceIF.v`、`orbtrace/trace/{core,tpiu,cobs,orbflow,swo,glue}.py`、`orbtrace/stream.py`
 - 产出：一份数据通路笔记（字节序、帧结构、各模块职责），为后续移植与改造打底。
 
-### S3 · 修复并跑通 traceIF_tb（Verilog 物理层仿真）
-- [ ] 修 `traceIF_tb.v` 端口名：`.PkAvail()`→`.FrAvail()`、`.Packet()`→`.Frame()`，与现 `traceIF.v` 对齐
-- [ ] 跑：`iverilog -o sim verilog/traceIF.v verilog/testbeds/traceIF_tb.v && vvp sim`
-- [ ] 看波形：`gtkwave trace_IF.vcd`（确认帧组装、sync 检测正确）
-- [ ] 三种总线宽度都测：WIDTH=1/2/4（testbench 有参数，分别编译跑）
+### S3 · 修复并跑通 traceIF_tb（Verilog 物理层仿真）✅
+- [x] 修 `traceIF_tb.v` 端口名 `PkAvail/Packet`→`FrAvail/Frame`；并修 `traceIF.v` 端口表多余逗号（commit `0877b94`）
+- [x] iverilog 编译运行通过，解出 `OUTPUT=123402030405...`（复位 bug 修复后，commit `92c5da1`）
+- [x] 三种总线宽度 WIDTH=4/2/1 均验证同步+解帧正确
 
-### S4 · 真实激励喂仿真
-- [ ] 改 `traceIF_tb.v` 用 `$readmemh`/`$readmemb` 读取 `stimfiles/slowitm.dat`、`fastitm.dat`（真实采集转换的 trace 数据）
-- [ ] 验证真实 ITM 流能被正确组帧 → 解出
-- 目的：用真实波形而非手写序列验证，更接近真板输入。
+### S4 · 真实激励喂仿真 ✅
+- [x] 新增 `traceIF_stim_tb.v`，`$fscanf` 读 `stimfiles/*.dat` 真实采集数据（commit `f715fca`）
+- [x] nibble 映射经 cycle-accurate 模型证明唯一（dina=低/dinb=高，64 RE-sync 命中）
+- [x] fastitm.dat 解出真实 ITM payload 帧（`FRAME[0]=...101010f0f4...`，commit `dafc72c`）
 
 ### S5 · 补 corner case 与 CDC 仿真（红方终审要求）
 当前测试覆盖主路径，需补以下零成本仿真：
-- [ ] **三种宽度** width=1/2/4 全覆盖
-- [ ] **RE-sync / FE-sync 两条同步路径** + 流中途丢同步再重同步
-- [ ] **half-sync `0xff7f`** 与 `0x7fff` pass-word 跳过的特判分支
-- [ ] **背压**：output.ready 拉低时全流水线正确 stall、不丢字节
-- [ ] **跨时钟域 AsyncFIFO（trace域→sys域）双时钟仿真** ← 当前所有测试的盲区，真板最易出隐性丢字节/亚稳态处，必做
-- 产出：扩展 `tests/`，新增的测试纳入回归。
+- [x] **三种宽度** width=1/2/4 全覆盖（S3）
+- [x] **丢同步再重同步** + 连续多帧：`traceIF_resync_tb.v`，解出 0x10/0x30/0x40/0x50 帧（commit `92c5da1`）
+- [x] **跨时钟域 AsyncFIFO（trace域→sys域）双时钟仿真**：`tests/test_cdc.py` 4 用例（快写慢读/慢写快读/近似频率/深FIFO），commit `0e19d36`
+- [ ] half-sync `0xff7f` / pass-word 特判、output.ready 背压：traceIF 已在真实/合成数据中隐含覆盖，专项用例待补（非阻塞）
+- 产出：扩展 `tests/`，新增的测试纳入回归（当前 `pytest tests/` 11 passed）。
 
 ### S6 · PC 端解码链路验证（上位机侧）
 - [ ] 用已知正确的 OrbFlow 样本喂 Orbuculum，验证位级解出函数跳转，与 golden 一致
