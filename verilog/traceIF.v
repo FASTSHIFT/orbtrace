@@ -29,7 +29,7 @@ module traceIF # (parameter MAXBUSWIDTH = 4, SYNC_BITS=27) (
 
  	// Upwards interface to packet processor
 		output reg              FrAvail,          // Toggling indicator frame ready
-		output reg [127:0]      Frame,            // The last frame
+		output reg [127:0]      Frame             // The last frame
 		);		  
    
    // Internals =======================================================================

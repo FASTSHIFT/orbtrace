@@ -38,10 +38,9 @@ traceIF DUT (
 		.width(width_tb),              // How wide the bus under consideration is 0..3 (1, 1, 2 & 4 bits)
 
 	// Upwards interface to packet processor
-		.PkAvail(dAvail_tb),           // Flag indicating packet is available
-		.Packet(dout_tb)               // The last packet that has been received
+		.FrAvail(dAvail_tb),           // Flag indicating frame is available
+		.Frame(dout_tb)                // The last frame that has been received
 	     );
-   
 
    //-----------------------------------------------------------
    // Send a byte to the traceport, toggling clock appropriately
