@@ -35,7 +35,16 @@
 
 `default_nettype none
 
-module trace_probe_top (
+module trace_probe_top #(
+    // r11 HG-3: RGMII RX delay strategy.
+    //   0 = rely on PHY-side RGMII RX internal delay (RTL8211E strap); the
+    //       FPGA feeds phy_rxd straight into fpga_core (current default).
+    //   1 = add FPGA-side IDELAY on the 5 RGMII RX lines (needed if the
+    //       PHY strap leaves RX delay OFF). This requires a SECOND
+    //       IDELAYCTRL because the RGMII pins are in BANK 15 while the
+    //       trace IDELAYCTRL is in BANK 16 (verified via check_pincompat).
+    parameter PHY_RX_DELAY_INTERNAL = 0
+) (
     // Board oscillator + reset
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -367,6 +376,55 @@ module trace_probe_top (
     );
 
     // ------------------------------------------------------------------
+    // r11 HG-3: optional FPGA-side RGMII RX IDELAY (BANK 15, 2nd IDELAYCTRL).
+    // When PHY_RX_DELAY_INTERNAL=1 we delay phy_rxd[3:0]+phy_rx_ctl with a
+    // 5th..9th IDELAYE2 governed by a SECOND IDELAYCTRL in the RGMII bank
+    // (BANK 15). When =0 the signals pass straight through (PHY does the
+    // delay). This proves both strap outcomes synthesise & place before we
+    // commit to a board, instead of waiting on the vendor strap answer.
+    // ------------------------------------------------------------------
+    wire [3:0] phy_rxd_int;
+    wire       phy_rx_ctl_int;
+
+    generate
+        if (PHY_RX_DELAY_INTERNAL) begin : g_rgmii_idelay
+            wire rgmii_idelay_rdy;
+            (* IODELAY_GROUP = "rgmii_idelay_grp" *)
+            IDELAYCTRL u_rgmii_idelayctrl (
+                .RDY (rgmii_idelay_rdy), .REFCLK (clk200), .RST (sys_rst)
+            );
+            genvar r;
+            for (r = 0; r < 4; r = r + 1) begin : g_rxd
+                (* IODELAY_GROUP = "rgmii_idelay_grp" *)
+                IDELAYE2 #(
+                    .IDELAY_TYPE("FIXED"), .DELAY_SRC("IDATAIN"),
+                    .HIGH_PERFORMANCE_MODE("TRUE"), .IDELAY_VALUE(16),
+                    .SIGNAL_PATTERN("DATA"), .REFCLK_FREQUENCY(200.0)
+                ) u_rxd_dly (
+                    .C(clk200), .REGRST(1'b0), .LD(1'b0), .CE(1'b0),
+                    .INC(1'b0), .CINVCTRL(1'b0), .CNTVALUEIN(5'd0),
+                    .IDATAIN(phy_rxd[r]), .DATAIN(1'b0), .LDPIPEEN(1'b0),
+                    .DATAOUT(phy_rxd_int[r]), .CNTVALUEOUT()
+                );
+            end
+            (* IODELAY_GROUP = "rgmii_idelay_grp" *)
+            IDELAYE2 #(
+                .IDELAY_TYPE("FIXED"), .DELAY_SRC("IDATAIN"),
+                .HIGH_PERFORMANCE_MODE("TRUE"), .IDELAY_VALUE(16),
+                .SIGNAL_PATTERN("DATA"), .REFCLK_FREQUENCY(200.0)
+            ) u_rxctl_dly (
+                .C(clk200), .REGRST(1'b0), .LD(1'b0), .CE(1'b0),
+                .INC(1'b0), .CINVCTRL(1'b0), .CNTVALUEIN(5'd0),
+                .IDATAIN(phy_rx_ctl), .DATAIN(1'b0), .LDPIPEEN(1'b0),
+                .DATAOUT(phy_rx_ctl_int), .CNTVALUEOUT()
+            );
+        end else begin : g_rgmii_direct
+            assign phy_rxd_int    = phy_rxd;
+            assign phy_rx_ctl_int = phy_rx_ctl;
+        end
+    endgenerate
+
+    // ------------------------------------------------------------------
     // T1: gigabit Ethernet stack (verilog-ethernet NexysVideo fpga_core).
     // For T4 sizing we instantiate fpga_core with the SF byte stream gated
     // into the sw input so the synthesizer cannot prune it. Real UDP-trace
@@ -387,8 +445,8 @@ module trace_probe_top (
         .sw          ({3'b0, sf_out_valid, sf_data[3:0]}),
         .led         (),
         .phy_rx_clk  (phy_rx_clk),
-        .phy_rxd     (phy_rxd),
-        .phy_rx_ctl  (phy_rx_ctl),
+        .phy_rxd     (phy_rxd_int),
+        .phy_rx_ctl  (phy_rx_ctl_int),
         .phy_tx_clk  (phy_tx_clk),
         .phy_txd     (phy_txd),
         .phy_tx_ctl  (phy_tx_ctl),

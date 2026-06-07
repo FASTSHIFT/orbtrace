@@ -37,7 +37,16 @@
 
 `default_nettype none
 
-module trace_capture_a7 (
+module trace_capture_a7 #(
+    // Clock buffering for TRACECLK:
+    //   "BUFG"     : global clock buffer (OOC-friendly, conservative,
+    //                larger insertion delay/skew — Stage-2 default).
+    //   "BUFR_IO"  : BUFIO drives the IDDR bit-clock + BUFR drives the
+    //                fabric clock. Region-local, much lower skew between
+    //                TRACECLK and the IDDR C pins — the proper source-
+    //                synchronous choice (r11 HG-2 sensitivity study).
+    parameter CLK_BUF = "BUFG"
+) (
     input  wire        rst,
     input  wire        ref_200m,
 
@@ -78,13 +87,33 @@ module trace_capture_a7 (
     );
 
     // ------------------------------------------------------------------
-    // Clock path: TRACECLK -> IBUF -> BUFG.
-    // For real HW BUFR/BUFIO + region constraints can give better source-
-    // synchronous timing; BUFG is OOC-friendly and conservative.
+    // Clock path: TRACECLK -> IBUF -> { BUFG | BUFIO+BUFR }.
+    // r11 HG-2: BUFG is conservative (large insertion delay + global skew);
+    // BUFIO/BUFR is region-local and gives a much tighter source-sync
+    // window between TRACECLK and the IDDR C pins. CLK_BUF selects which,
+    // so we can quantify the window difference in OOC without committing
+    // the main line.
+    //
+    //   trace_clk_io  : the clock that drives the IDDR C pins (sampling)
+    //   trace_clk     : the fabric-side clock (traceIF runs on this)
+    // For BUFG both are the same net; for BUFR_IO the IDDR uses the BUFIO
+    // output while the fabric uses the (divide-by-1) BUFR output.
     // ------------------------------------------------------------------
     wire trace_clk_ibuf;
+    wire trace_clk_io;     // -> IDDR C
     IBUF u_ibuf_clk (.I(trace_clk_p), .O(trace_clk_ibuf));
-    BUFG u_bufg_clk (.I(trace_clk_ibuf), .O(trace_clk));
+
+    generate
+        if (CLK_BUF == "BUFR_IO") begin : g_bufr
+            BUFIO u_bufio_clk (.I(trace_clk_ibuf), .O(trace_clk_io));
+            BUFR #(.BUFR_DIVIDE("BYPASS")) u_bufr_clk (
+                .I(trace_clk_ibuf), .O(trace_clk), .CE(1'b1), .CLR(1'b0)
+            );
+        end else begin : g_bufg
+            BUFG u_bufg_clk (.I(trace_clk_ibuf), .O(trace_clk));
+            assign trace_clk_io = trace_clk;
+        end
+    endgenerate
 
     // ------------------------------------------------------------------
     // Per-lane: IBUF -> IDELAYE2 -> IDDR (DDR_CLK_EDGE = SAME_EDGE_PIPELINED).
@@ -148,7 +177,7 @@ module trace_capture_a7 (
             ) u_iddr (
                 .Q1 (trace_a[i]),  // rising-edge sample
                 .Q2 (trace_b[i]),  // falling-edge sample
-                .C  (trace_clk),
+                .C  (trace_clk_io), // BUFIO (BUFR_IO) or BUFG net
                 .CE (1'b1),
                 .D  (data_dly[i]),
                 .R  (rst),

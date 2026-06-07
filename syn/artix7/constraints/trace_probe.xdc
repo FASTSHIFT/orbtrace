@@ -128,6 +128,19 @@ set_property IOSTANDARD LVCMOS33 [get_ports trace_dbg_valid]
 set_property IOSTANDARD LVCMOS33 [get_ports trace_dbg_last]
 set_property IOSTANDARD LVCMOS33 [get_ports trace_dbg_lost]
 
+# r11 HG-1: constrain the dbg outputs so STA actually analyses the clk100
+# trace segment (sf_data -> dbg). Without an output delay these are
+# unconstrained and report_timing/get_timing_paths ignore them — which
+# was why the connectivity check came back empty (not because the path is
+# broken). The dbg pins are a temporary Stage-2 observation bus (Stage-3
+# replaces them with the UDP bridge), so the output delay value is not a
+# real board requirement; we use a loose value purely to make the
+# pipeline-end paths visible to STA. A max_delay datapath-only keeps these
+# synthetic paths from polluting the real WNS.
+set dbg_ports [get_ports {trace_dbg_data[*] trace_dbg_inter[*] trace_dbg_valid trace_dbg_last trace_dbg_lost}]
+set_max_delay 8.0 -datapath_only -to $dbg_ports
+set_false_path -hold -to $dbg_ports
+
 # ============================================================
 # Asynchronous clock domains (declare unrelated to avoid spurious cross-clock
 # timing checks in the simplified T4 datapath; production CDC will be
