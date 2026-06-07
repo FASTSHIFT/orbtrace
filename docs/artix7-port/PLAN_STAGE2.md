@@ -89,6 +89,21 @@ graph TD
 - [ ] **以太网 PHY 型号与接口**（确认 RGMII，对应 T1 选的核）—— 微相板为 Realtek（螃蟹 logo），大概率 RTL8211 + RGMII，需文档确认
 - [ ] **35T 与 100T 引脚兼容性**（若 T4 判 35T 偏紧想留升级余地）
 
+#### T5 初步核对结论（基于 A7-Lite 官方资料：`A7_lite.xdc` / `A7_LITE_GPIO.xlsx` / `A7-LITE_Rev1_3.pdf`）
+
+> 已用厂商资料完成大部分核对，结论利好；标 ✅ 为已确认，⚠️ 为待 Vivado 器件库精确落定。
+
+| 选板门项 | 结论 | 依据 |
+|---------|------|------|
+| 200MHz 参考钟 | ✅ 满足 | 板载 50MHz 晶振（CLK_50M@J19），经 MMCM 倍频出 200MHz |
+| 5 线同 bank + 3.3V | ✅ 满足 | GPIO1 扩展口整组在 **Bank 16**，`VCCIO_A` 电压可配，板上有 VCC_3V3；trace 5 线全放 GPIO1 即可 |
+| TRACECLK 落时钟能力脚 | ✅ 基本确认（⚠️待精确对应） | 原理图显示 GPIO1(Bank16) 含多个 MRCC/SRCC 脚：如 `IO_L12P_T1_MRCC_16`、`IO_L13P_T2_MRCC_16`、`IO_L11P_T1_SRCC_16`。TRACECLK 落其一即可；**具体 GPIO1_xx ↔ MRCC 脚的精确对应需装 Vivado 后用器件库核对** |
+| 以太网 RGMII | ✅ 确认 RGMII | `A7_lite.xdc` 的 ETH 引脚组为标准 RGMII（RXCK/RXCTL/RXD[3:0]+TXCK/TXCTL/TXD[3:0]+MDC/MDIO），LVCMOS33；PHY 为 Realtek（螃蟹 logo），对应 T1 选 RGMII MAC |
+| 35T/100T 引脚兼容 | ⚠️ 待确认 | 微相 A7-Lite 35T/100T 均为 **FGG484** 封装（见 `04_source_code`/规格），同封装通常引脚兼容；具体以厂商确认为准 |
+| GPIO 引出形式 | ✅ 加分项 | GPIO1/GPIO2 以**差分对（P/N）**引出（共 ~42 对 IO），利于 trace 信号完整性 |
+
+**结论：A7-Lite 通过选板门的关键项**（时钟、bank/电压、TRACECLK 时钟脚、RGMII 出口均满足）。**唯一待精确落定的是"GPIO1 哪个引脚号 = 哪个 MRCC 脚"，需 Vivado 器件库核对后写进 trace 的 xdc。** 原始 `A7_lite.xdc` 只含板载固定外设，**trace 引脚需自行从 GPIO1 中选定并新增约束**。
+
 ---
 
 ## 3. 决策判据（定 35T 还是 100T）
