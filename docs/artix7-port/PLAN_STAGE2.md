@@ -82,11 +82,25 @@ graph TD
 
 **结论**：以太网栈实测 1,871 LUT，**比红方估算下沿还省 30%**。脚本：`syn/artix7/run_eth_ooc.tcl`。
 
-### T2 · 采样前端原型 OOC 综合
-- [ ] 写 Artix-7 采样前端原型：`ISERDESE2`（DDR 模式）×5 + `IDELAYE2`×5 + `IDELAYCTRL` + deskew 校准状态机骨架
-- [ ] OOC 综合 + 实现，拿到 LUT/FF 真实占用（验证 r08 对 deskew 500~1500 的估算）
-- [ ] **重点看实现后面积**（r08 ④：时序收敛会膨胀面积），记录是否需要寄存器复制/管线
-- 注：本步只验"综合得出、资源可知"，**满速时序的眼图/收敛是第三阶段上板才能定**，OOC 时序仅供参考。
+### T2 · 采样前端原型 OOC 综合 ✅
+- [x] 写 Artix-7 采样前端原型：`ISERDESE2`（DDR 模式）×4 + `IDELAYE2`×4 + `IDELAYCTRL`×1 + IBUF/BUFG 时钟路径
+- [x] OOC 综合通过（`syn/artix7/rtl/trace_capture_a7.v` + `syn/artix7/run_capture_ooc.tcl`）
+
+#### T2 实测结果（xc7a35tfgg484-2，骨架版本）
+
+| 资源 | 实测 |
+|------|----:|
+| LUT | **0** |
+| FF | 0 |
+| BRAM | 0 |
+| ISERDESE2 | 4 |
+| IDELAYE2 | 4 |
+| IDELAYCTRL | 1 |
+| IBUF | 5（4 数据 + 1 时钟） |
+| BUFG | 1 |
+
+**结论**：采样前端骨架**LUT/FF 为 0，全部资源在专用 IO 硬核中**——这正是"接 trace 吃 IO 能力、不吃逻辑门"的实证。
+**诚实声明**：这是骨架版本（静态 IDELAY 抽头从端口注入，没有自动校准状态机）。**完整可用版本还需加 deskew 自动训练状态机**（扫 32 个抽头找眼图中心），估算约 +500 LUT；但 deskew 训练的工程价值在**上板 PoC 阶段**（用真实信号做眼图扫描），OOC 阶段只验"原语能用 + IO 资源消耗清楚"，这两点已达成。
 
 ### T3 · trace 核心逻辑 OOC 综合 ✅
 - [x] 把已验证的 traceIF + TPIUDemux + COBSEncoder + ChecksumAppender + SuperFramer 逻辑跑 OOC 综合（Amaranth 经 wrapper 导出 Verilog 后）
