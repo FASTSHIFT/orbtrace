@@ -104,7 +104,7 @@ module trace_probe_top (
     wire sys_rst = rst_sync[3];
 
     // ------------------------------------------------------------------
-    // T2: trace capture front-end (ISERDESE2 + IDELAYE2)
+    // T2: trace capture front-end (IDDR + IDELAYE2 + IDELAYCTRL)
     // ------------------------------------------------------------------
     wire        trace_clk;
     wire [3:0]  trace_a, trace_b;

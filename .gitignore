@@ -31,3 +31,15 @@ fp-info-cache
 htmlcov/
 .pytest_cache/
 __pycache__/
+
+# Vivado / xsim artifacts
+.Xil/
+*.jou
+*.log
+*.str
+xsim.dir/
+webtalk*.log
+xelab.pb
+xvlog.pb
+xsim.pb
+syn/artix7/*.v.bak

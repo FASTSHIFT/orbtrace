@@ -83,8 +83,9 @@ graph TD
 **结论**：以太网栈实测 1,871 LUT，**比红方估算下沿还省 30%**。脚本：`syn/artix7/run_eth_ooc.tcl`。
 
 ### T2 · 采样前端原型 OOC 综合 ✅
-- [x] 写 Artix-7 采样前端原型：`ISERDESE2`（DDR 模式）×4 + `IDELAYE2`×4 + `IDELAYCTRL`×1 + IBUF/BUFG 时钟路径
+- [x] 写 Artix-7 采样前端原型：`IDELAYE2`×4 + `IDDR`×4 + `IDELAYCTRL`×1 + IBUF/BUFG 时钟路径
 - [x] OOC 综合通过（`syn/artix7/rtl/trace_capture_a7.v` + `syn/artix7/run_capture_ooc.tcl`）
+- [x] **xsim 端到端仿真通过**（`syn/artix7/sim/trace_capture_a7_tb.v` + `run_xsim.sh`），用与 `traceIF_tb` 相同的 TPIU sync + 16 字节 payload 驱动，DUT 解出 `FRAME[0] = 123402030405060708090a0b0c0d0e0f`，与下游一致
 
 #### T2 实测结果（xc7a35tfgg484-2，骨架版本）
 
@@ -93,14 +94,17 @@ graph TD
 | LUT | **0** |
 | FF | 0 |
 | BRAM | 0 |
-| ISERDESE2 | 4 |
+| IDDR | 4 |
 | IDELAYE2 | 4 |
 | IDELAYCTRL | 1 |
 | IBUF | 5（4 数据 + 1 时钟） |
 | BUFG | 1 |
 
 **结论**：采样前端骨架**LUT/FF 为 0，全部资源在专用 IO 硬核中**——这正是"接 trace 吃 IO 能力、不吃逻辑门"的实证。
-**诚实声明**：这是骨架版本（静态 IDELAY 抽头从端口注入，没有自动校准状态机）。**完整可用版本还需加 deskew 自动训练状态机**（扫 32 个抽头找眼图中心），估算约 +500 LUT；但 deskew 训练的工程价值在**上板 PoC 阶段**（用真实信号做眼图扫描），OOC 阶段只验"原语能用 + IO 资源消耗清楚"，这两点已达成。
+
+**原语选型说明**：早期版本写的是 ISERDESE2，理论上能跑更高速率，但仿真发现 DDR x2 模式下 ISERDES 的边沿对齐与 traceIF 单周期采样模型不完全匹配（且 ISERDES 在 trace 4-bit DDR @≤400Mbps 速率下属过度设计）。改回 IDDR（`DDR_CLK_EDGE = SAME_EDGE_PIPELINED`），**与 orbtrace upstream `glue.py` 用的 litex `DDRInput` 1:1 对应**（litex DDRInput 在 7-series 就是 IDDR），仿真一发通过。资源数据无差异（IDDR/ISERDES 都是专用 IO 块）。
+
+**诚实声明**：这是骨架版本（静态 IDELAY 抽头从端口注入，没有自动校准状态机）。**完整可用版本还需加 deskew 自动训练状态机**（扫 32 个抽头找眼图中心），估算约 +500 LUT；但 deskew 训练的工程价值在**上板 PoC 阶段**（用真实信号做眼图扫描），OOC 阶段只验"原语能用 + IO 资源消耗清楚 + 逻辑端到端能解帧"，这三点已达成。
 
 ### T3 · trace 核心逻辑 OOC 综合 ✅
 - [x] 把已验证的 traceIF + TPIUDemux + COBSEncoder + ChecksumAppender + SuperFramer 逻辑跑 OOC 综合（Amaranth 经 wrapper 导出 Verilog 后）
@@ -137,6 +141,7 @@ graph TD
 | F8 Muxes | 1 | 0.01% |
 | **Block RAM Tile** | 8.5（6 RAMB36 + 5 RAMB18） | **17%** |
 | ISERDESE2 / IDELAYE2 / IDELAYCTRL | 4 / 4 / 1 | — |
+| IDDR | 4 | — |
 | MMCM | 1 | — |
 | BUFG | 5 | — |
 
