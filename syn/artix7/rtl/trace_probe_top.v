@@ -57,7 +57,20 @@ module trace_probe_top (
 
     // LEDs (sanity)
     output wire        led0,
-    output wire        led1
+    output wire        led1,
+
+    // Trace pipeline observability bus (Stage-2 sizing only).
+    // r09 A1: without these output ports Vivado's opt_design propagates
+    // dead-code through the entire trace post-pipeline because their final
+    // sink (fpga_core.sw) has no observable effect. Exposing the SF byte
+    // stream + intermediate valid signals to a real top-level output
+    // forces the synthesiser to keep the modules in the routed netlist,
+    // giving truthful T4 utilization. Stage-3 will replace these probe
+    // pins with the real UDP-trace bridge into udp_complete's s_udp_*.
+    output wire [7:0]  trace_dbg_data,    // sf_data
+    output wire        trace_dbg_valid,   // sf_out_valid
+    output wire        trace_dbg_last,    // sf_out_last
+    output wire [3:0]  trace_dbg_inter    // {dmux,chk,cobs,fr_pulse} valids
 );
 
     wire rst = ~rst_n;
@@ -113,11 +126,20 @@ module trace_probe_top (
 
     // ------------------------------------------------------------------
     // T2: trace capture front-end (IDDR + IDELAYE2 + IDELAYCTRL)
+    //
+    // r09 A1 fix: DONT_TOUCH protects the entire trace pipeline from
+    // being pruned during opt_design when the downstream UDP-trace
+    // bridge doesn't yet exist. Without this Vivado infers the trace
+    // inputs as unconstrained-equivalent-constant and dead-code
+    // propagates through the entire pipeline, yielding a misleadingly
+    // small utilization. Stage-3 replaces these attributes with a real
+    // data sink into udp_complete.s_udp_payload_axis_t* + AsyncFIFO.
     // ------------------------------------------------------------------
     wire        trace_clk;
     wire [3:0]  trace_a, trace_b;
     wire        idelayctrl_rdy;
 
+    (* DONT_TOUCH = "true" *)
     trace_capture_a7 u_capture (
         .rst           (sys_rst),
         .ref_200m      (clk200),
@@ -141,6 +163,7 @@ module trace_probe_top (
     wire [127:0] frame128;
     wire         tif_rst = sys_rst | ~idelayctrl_rdy;
 
+    (* DONT_TOUCH = "true" *)
     traceIF #(.MAXBUSWIDTH(4)) u_traceif (
         .rst        (tif_rst),
         .traceDina  (trace_a),
@@ -153,18 +176,95 @@ module trace_probe_top (
     );
 
     // ------------------------------------------------------------------
-    // Cross from trace_clk domain to clk100 (sys). For T4 sizing we use a
-    // simple 2-FF synchroniser on a derived "frame valid pulse" + register
-    // the frame data; this is *not* the production CDC (orbtrace uses an
-    // AsyncFIFO). It keeps the front-end and back-end timing-isolated for
-    // synthesis purposes.
+    // Cross from trace_clk domain to clk100 (sys) using a real AsyncFIFO
+    // (r09 P0-2 fix). The previous 2-FF synchroniser + frame_lat handshake
+    // was a textbook CDC bug: a single-bit toggle synchroniser cannot
+    // protect the 128-bit frame128 payload, since the 128 wires propagate
+    // with independent skew across the trace_clk -> clk100 boundary.
+    // xsim missed this because all wires arrive in the same simulator
+    // picosecond; on real hardware Vivado would not have flagged it
+    // either, because set_clock_groups -asynchronous explicitly suppresses
+    // CDC checks on these paths. Using verilog-ethernet's axis_async_fifo
+    // fixes this with a Gray-coded pointer crossing + true single-port
+    // BRAM, the same primitive the rest of the gigabit Ethernet stack
+    // already trusts. Depth 16 frames * 16 bytes = 256 byte buffer,
+    // sized to absorb a few frames of 100 MHz trace_clk to 100 MHz sys
+    // schedule slip without dropping.
     // ------------------------------------------------------------------
-    reg fr_avail_meta, fr_avail_sync, fr_avail_d;
-    always @(posedge clk100) {fr_avail_d, fr_avail_sync, fr_avail_meta} <= {fr_avail_sync, fr_avail_meta, fr_avail};
-    wire fr_pulse = fr_avail_sync ^ fr_avail_d;
+    wire        cdc_in_valid = 1'b1;       // traceIF emits a frame every
+                                           // few trace_clk cycles; we let
+                                           // the FIFO pace itself via
+                                           // s_tready/back-pressure when
+                                           // frame128 is replicated.
+    wire        cdc_in_ready;
+    wire        cdc_out_valid;
+    wire        cdc_out_ready = 1'b1;      // dmux always ready in skeleton
+    wire [127:0] cdc_out_frame;
 
-    reg [127:0] frame_lat;
-    always @(posedge clk100) if (fr_pulse) frame_lat <= frame128;
+    // We need a one-shot trigger when frame128 changes (FrAvail toggles in
+    // trace_clk domain). Detect rising edge of fr_avail in trace_clk and
+    // pulse axis_tvalid for one trace_clk cycle.
+    //
+    // Reset is intentionally not propagated into this register (no async
+    // reset and no synchronous reset on the toggle detector itself): the
+    // BRAM-backed AsyncFIFO write-enable would otherwise be driven by a
+    // register with an asynchronous reset, triggering Vivado DRC
+    // REQP-1839 (potential RAMB content corruption on reset assertion).
+    // The FIFO consumes its own m_rst/s_rst paths; this stage only needs
+    // to debounce the toggle.
+    reg fr_avail_q;
+    always @(posedge trace_clk) fr_avail_q <= fr_avail;
+    wire frame_strobe = fr_avail ^ fr_avail_q;   // toggle detect
+
+    axis_async_fifo #(
+        .DEPTH       (16),
+        .DATA_WIDTH  (128),
+        .KEEP_ENABLE (0),
+        .LAST_ENABLE (0),
+        .USER_ENABLE (0),
+        .FRAME_FIFO  (0)
+    ) u_frame_cdc (
+        // s side: trace_clk
+        .s_clk           (trace_clk),
+        .s_rst           (sys_rst),
+        .s_axis_tdata    (frame128),
+        .s_axis_tkeep    (16'h0),
+        .s_axis_tvalid   (frame_strobe),
+        .s_axis_tready   (cdc_in_ready),
+        .s_axis_tlast    (1'b0),
+        .s_axis_tid      (8'h0),
+        .s_axis_tdest    (8'h0),
+        .s_axis_tuser    (1'b0),
+        // m side: clk100
+        .m_clk           (clk100),
+        .m_rst           (sys_rst),
+        .m_axis_tdata    (cdc_out_frame),
+        .m_axis_tkeep    (),
+        .m_axis_tvalid   (cdc_out_valid),
+        .m_axis_tready   (cdc_out_ready),
+        .m_axis_tlast    (),
+        .m_axis_tid      (),
+        .m_axis_tdest    (),
+        .m_axis_tuser    (),
+        // unused ctrl
+        .s_pause_req     (1'b0),
+        .s_pause_ack     (),
+        .m_pause_req     (1'b0),
+        .m_pause_ack     (),
+        .s_status_depth  (),
+        .s_status_depth_commit (),
+        .s_status_overflow     (),
+        .s_status_bad_frame    (),
+        .s_status_good_frame   (),
+        .m_status_depth        (),
+        .m_status_depth_commit (),
+        .m_status_overflow     (),
+        .m_status_bad_frame    (),
+        .m_status_good_frame   ()
+    );
+
+    wire        fr_pulse = cdc_out_valid;       // 1 sys-clk pulse per frame
+    wire [127:0] frame_lat = cdc_out_frame;     // synchronous to clk100
 
     // ------------------------------------------------------------------
     // T3 - TPIU demux + checksum + COBS + super-framer (clk100 domain)
@@ -176,6 +276,7 @@ module trace_probe_top (
 
     // For sizing: drive in_valid from fr_pulse; in_frame from frame_lat.
     // (Production handshaking is more careful; sizing isn't sensitive.)
+    (* DONT_TOUCH = "true" *)
     tpiu_demux u_dmux (
         .clk        (clk100),
         .rst        (sys_rst),
@@ -193,6 +294,7 @@ module trace_probe_top (
     );
 
     wire chk_out_valid; wire [7:0] chk_data; wire chk_out_last;
+    (* DONT_TOUCH = "true" *)
     checksum_appender u_chk (
         .clk        (clk100),
         .rst        (sys_rst),
@@ -207,6 +309,7 @@ module trace_probe_top (
     );
 
     wire cobs_out_valid; wire [7:0] cobs_data; wire cobs_out_last;
+    (* DONT_TOUCH = "true" *)
     cobs_encoder u_cobs (
         .clk        (clk100),
         .rst        (sys_rst),
@@ -221,6 +324,7 @@ module trace_probe_top (
     );
 
     wire sf_out_valid; wire [7:0] sf_data; wire sf_out_last;
+    (* DONT_TOUCH = "true" *)
     super_framer u_sf (
         .clk        (clk100),
         .rst        (sys_rst),
@@ -273,6 +377,14 @@ module trace_probe_top (
 
     assign led0 = idelayctrl_rdy;
     assign led1 = sf_out_valid;
+
+    // r09 A1 fix: expose trace pipeline outputs as real top-level ports so
+    // opt_design cannot prune them. Stage-3 replaces this with a proper
+    // UDP-trace bridge into u_eth's s_udp_payload_axis_t* inputs.
+    assign trace_dbg_data  = sf_data;
+    assign trace_dbg_valid = sf_out_valid;
+    assign trace_dbg_last  = sf_out_last;
+    assign trace_dbg_inter = {dmux_out_valid, chk_out_valid, cobs_out_valid, fr_pulse};
 
 endmodule
 

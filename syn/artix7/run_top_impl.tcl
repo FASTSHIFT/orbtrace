@@ -78,3 +78,54 @@ puts "============ POST-IMPLEMENTATION UTILIZATION ============"
 report_utilization
 puts "============ POST-IMPLEMENTATION TIMING ============"
 report_timing_summary -no_detailed_paths -no_header
+
+# r09 B1: dump worst-case slack for both setup and hold across all corners
+# so the WNS/WHS numbers in the report are no longer ambiguous.
+puts "============ WORST CASE SETUP / HOLD ============"
+puts "--- worst SETUP path ---"
+report_timing -delay_type max -max_paths 1 -path_type summary
+puts "--- worst HOLD path ---"
+report_timing -delay_type min -max_paths 1 -path_type summary
+puts "--- IDDR-related hold paths (top 5) ---"
+report_timing -delay_type min -max_paths 5 -path_type summary -through [get_pins -hierarchical -filter "REF_NAME == IDDR"]
+
+# r09 A1: prove trace pipeline survives opt_design pruning.
+puts "============ TRACE PIPELINE SURVIVAL CHECK ============"
+foreach inst {u_capture u_traceif u_dmux u_chk u_cobs u_sf} {
+    # Vivado >=2020.2: get_cells * inside the hierarchical instance.
+    # Use an absolute hierarchical wildcard with leading slash semantics.
+    set cells [get_cells -quiet -hierarchical -filter "NAME =~ $inst/*"]
+    if {[llength $cells] == 0} {
+        # try direct child (for non-flattened or DONT_TOUCH-protected blackbox)
+        set self [get_cells -quiet $inst]
+        if {[llength $self] > 0} {
+            set cells [get_cells -quiet -filter "PARENT == $inst"]
+            if {[llength $cells] == 0} {
+                # if it's a leaf (DONT_TOUCH boxed), at least the box itself is there
+                set cells $self
+            }
+        }
+    }
+    set lut [llength [filter $cells "REF_NAME =~ LUT*"]]
+    set ff  [llength [filter $cells "REF_NAME =~ FD*"]]
+    set ram [llength [filter $cells "REF_NAME =~ RAMB*"]]
+    set io  [llength [filter $cells "REF_NAME =~ IDDR* || REF_NAME =~ IDELAY*"]]
+    puts [format "  %-12s : LUT=%4d FF=%4d BRAM=%2d IO=%2d  (%d total cells)" \
+                 $inst $lut $ff $ram $io [llength $cells]]
+}
+
+puts "============ TRACE PIPELINE TOP-LEVEL SIGNAL CHECK ============"
+foreach sig {fr_avail frame128 fr_pulse dmux_out_valid chk_out_valid cobs_out_valid sf_out_valid} {
+    set nets [get_nets -hierarchical -top_net_of_hierarchical_group "trace_probe_top/$sig"]
+    if {[llength $nets] > 0} {
+        puts "  net trace_probe_top/$sig : SURVIVED"
+    } else {
+        # try simple non-hierarchical
+        set net [get_nets -quiet $sig]
+        if {[llength $net] > 0} {
+            puts "  net $sig : SURVIVED (top-level)"
+        } else {
+            puts "  net $sig : *** OPTIMIZED AWAY ***"
+        }
+    }
+}

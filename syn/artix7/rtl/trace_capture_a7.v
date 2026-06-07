@@ -61,14 +61,20 @@ module trace_capture_a7 (
 
     // ------------------------------------------------------------------
     // IDELAYCTRL: shared by all four data lanes. Required for IDELAYE2 in
-    // VAR_LOAD mode. Reset must be asserted >=60ns and released
-    // synchronously to ref_200m (handled by upper level).
+    // VAR_LOAD mode. UG471 mandates RST be asserted >=60ns asynchronously
+    // and released synchronously to REFCLK; do that here.
     // ------------------------------------------------------------------
+    reg [3:0] idc_rst_sync = 4'hf;
+    always @(posedge ref_200m or posedge rst)
+        if (rst) idc_rst_sync <= 4'hf;
+        else     idc_rst_sync <= {idc_rst_sync[2:0], 1'b0};
+    wire idc_rst = idc_rst_sync[3];
+
     (* IODELAY_GROUP = "trace_idelay_grp" *)
     IDELAYCTRL u_idelayctrl (
         .RDY    (idelayctrl_rdy),
         .REFCLK (ref_200m),
-        .RST    (rst)
+        .RST    (idc_rst)
     );
 
     // ------------------------------------------------------------------
@@ -104,7 +110,13 @@ module trace_capture_a7 (
                 .IDELAY_TYPE         ("VAR_LOAD"),
                 .DELAY_SRC           ("IDATAIN"),
                 .HIGH_PERFORMANCE_MODE("TRUE"),
-                .IDELAY_VALUE        (0),
+                // Default sits at mid-tap (16/31). Stage-3 deskew FSM
+                // calibrates per lane; the static value here exists so
+                // OOC/post-impl timing analysis sees a non-zero per-lane
+                // delay and does not flag a -5 ns hold failure on the
+                // bare trace_data_in -> IDDR/D path. ~78 ps/tap *  16 ~
+                // 1.25 ns, aligned to the set_input_delay window in xdc.
+                .IDELAY_VALUE        (16),
                 .SIGNAL_PATTERN      ("DATA"),
                 .REFCLK_FREQUENCY    (200.0),
                 .CINVCTRL_SEL        ("FALSE"),

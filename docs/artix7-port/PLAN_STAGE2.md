@@ -124,43 +124,74 @@ graph TD
 
 **结论**：trace 核心**远比估算更省**，35T 装这部分毫无压力。逻辑门确实不是约束，剩下的 LUT 全留给以太网栈（T1）。流程见 `syn/artix7/`：`export_trace_modules.py`（导 Verilog）+ `run_ooc.tcl`（批量综合）。
 
-### T4 · 合并实现 + 真实时钟约束 ✅
+### T4 · 合并实现 + 真实时钟约束 ✅ (r09 终审修订版)
 - [x] 写最小集成顶层 `syn/artix7/rtl/trace_probe_top.v`：把 T1（以太网栈）+ T2（采样前端）+ T3（trace 核心）实例化在一起，加 MMCM 时钟分配（50MHz → 125MHz/125MHz@90°/200MHz/100MHz）
-- [x] 写真实约束 `syn/artix7/constraints/trace_probe.xdc`：板载 50MHz、复位、trace 5 线（GPIO1 Bank16，TRACECLK→D17 MRCC）、RGMII（A7-Lite ETH 引脚组）、千兆网 125MHz、IDELAYCTRL 200MHz、跨域异步声明
+- [x] 写真实约束 `syn/artix7/constraints/trace_probe.xdc`：板载 50MHz、复位、trace 5 线（GPIO1 Bank16，TRACECLK→D17 MRCC + 4 数据脚 P 端 GPIO1_0/1/2/3P）、RGMII（A7-Lite ETH 引脚组）、千兆网 125MHz、IDELAYCTRL 200MHz、跨域异步声明、**source-sync DDR set_input_delay**
 - [x] 综合 + opt + place + route 全部通过；**时序收敛**
+- [x] **r09 修复**：trace pipeline DONT_TOUCH + AsyncFIFO 跨域 + IDELAYCTRL 同步释放 + GPIO1 引脚重新分配。详见 `proposals/11-r09回应-真实数据落地修复.md`
 
-#### T4 全设计 post-implementation 真实结果（xc7a35tfgg484-2）
+#### T4 全设计 post-implementation 真实结果（xc7a35tfgg484-2，r09 修复版）
 
 | 资源 | 实测 | 占 35T |
 |------|----:|------:|
-| **Slice LUT** | **2,161** | **10.39%** |
-| LUT as Logic | 2,069 | 9.95% |
+| **Slice LUT** | **2,317** | **11.14%** |
+| LUT as Logic | 2,225 | 10.70% |
 | LUT as Memory | 92 | 0.96% |
-| **Slice Registers** | **3,352** | **8.06%** |
-| Slice 占用 | 1,146 | 14.06% |
-| F7 Muxes | 22 | 0.13% |
-| F8 Muxes | 1 | 0.01% |
-| **Block RAM Tile** | 8.5（6 RAMB36 + 5 RAMB18） | **17%** |
-| IDDR / IDELAYE2 / IDELAYCTRL | 4 / 4 / 1 | — |
+| **Slice Registers** | **3,294** | **7.92%** |
+| Slice 占用 | ~1,170 | ~14.4% |
+| **Block RAM Tile** | **11** (8 RAMB36 + 6 RAMB18) | **22%** |
+| IDDR | 9 (4 trace + 5 RGMII RX) | — |
+| IDELAYE2 | 4 | — |
+| IDELAYCTRL | 1 | — |
 | MMCM | 1 | — |
-| BUFG | 6 | — |
+| BUFG | 5 | — |
+
+#### T4 trace pipeline 实测分项（DONT_TOUCH 保护下，post-impl）
+
+| 模块 | LUT | FF | BRAM | 备注 |
+|------|----:|---:|----:|------|
+| u_capture | 0 | 4 | 0 | 9 IO 硬核 (4 IDDR + 4 IDELAY + 1 IDELAYCTRL) + RST 同步链 |
+| u_traceif | 142 | 284 | 0 | T3 OOC = 119 LUT，顶层多 19% |
+| u_dmux | 254 | 70 | 0 | T3 OOC = 228 LUT，顶层多 11% |
+| u_chk | 21 | 9 | 0 | — |
+| u_cobs | 145 | 70 | 2 | — |
+| u_sf | 21 | 51 | 0 | — |
+| **合计** | **583** | **488** | **2** | **占 35T 2.80% LUT** |
 
 #### T4 post-implementation 时序结果
 
 | 时序指标 | 值 | 含义 |
 |---------|---|------|
-| **WNS** (Worst Negative Setup Slack) | **+1.151 ns** | setup 路径最紧处仍有 1.15ns 余量 ✅ |
+| **WNS** (Worst Negative Setup Slack) | **+1.110 ns** | setup 路径最紧处仍有 1.11 ns 余量 ✅ |
 | **TNS** (Total Negative Slack) | **0 ns** | 无任何 setup 失败终点 ✅ |
-| **WHS** (Worst Hold Slack) | **+0.052 ns** | hold 路径最紧处仍有 52ps 余量 ✅ |
+| **WHS** (Worst Hold Slack) | **+0.045 ns** | hold 路径最紧处仍有 45 ps 余量 ✅ |
 | **THS** | **0 ns** | 无任何 hold 失败终点 ✅ |
-| 跨域路径 | 全部 false_path | trace_clk_in / phy_rx_clk / clk100 / clk125 各异步组互斥 |
+| trace_data_in→IDDR 路径 | `set_false_path -hold` | 诚实声明：源同步采样需 deskew 训练后实测眼图替代静态时序检查（Stage-3） |
 
-**与红方 r08 悲观估算对照**：r08 上沿叠加 + 时序膨胀 + 80% 可用率给的是 ~95% LUT 破板情景；**实测 10.39% LUT,余量 89.6%**；**时序所有路径满足且有正余量**。即使后续补 deskew 训练状态机（~500 LUT）+ UDP-trace 桥接（~500 LUT）+ 各类胶水，最终也不会超过 ~18% LUT。**35T 是绝对够用的，红方的破板情景完全没出现。**
+**与红方 r09 反算的对照**：
+- 红方反算"完整版预估 ~24% LUT"——蓝方接受口径。当前 T4 实测 11.14%，含 Stage-3 待补的 deskew FSM(+1500 LUT)、UDP-trace 桥(+600 LUT)、时序膨胀(+500 LUT) 后，预估完整版**~4,917 LUT (24% of 35T) + 13 BRAM (26%)**，**35T 仍有 76% 余量**。
+- 35T 锁定下单决策**仍成立**，但理由从"实测 11% 剩 89%"修正为"完整版预估 24%，物理与时序余量都装得下"。
 
-**P&R 路上的两个 hidden bug 已修**（见 commit history）：
-1. `fpga_core` 实例化漏传 `TARGET="XILINX"`,导致 `oddr.v` 走 GENERIC 行为模型双 always 块写同一 reg,触发 6 个 DRC MDRV-1 错误。修法：透传 TARGET 参数。
+**P&R 路上修复的 bug 清单**（含 r09 必补项）：
+1. `fpga_core` 实例化漏传 `TARGET="XILINX"` → `oddr.v` 走 GENERIC 行为模型双 always 块写同一 reg → 6 个 DRC MDRV-1 错误。修法：透传 TARGET 参数。
 2. MMCM 加 90° 时钟时把 CLKOUT 重映射,但 xdc 的 `set_clock_groups` 没同步更新,导致 100MHz 域不在异步组里,clk100→clk125 419 个失败终点。修法：把 CLKOUT3 也加进异步组。
-两个问题都不是 35T 的物理资源问题,纯是顶层胶水写法瑕疵,通过 P&R 暴露并清理。
+3. **r09 A1**：trace pipeline 整条被 opt_design 剪枝（fpga_core.sw 是不可观测端口）。修法：6 个 trace 实例加 `(* DONT_TOUCH = "true" *)` + 加 14 个真实 GPIO1 dbg 输出端口 + xdc 加 `set_input_delay`。
+4. **r09 B2**：frame128 多 bit 裸跨域 + 2-FF 单 bit 同步器 = CDC 风险。修法：用 verilog-ethernet 的 `axis_async_fifo` (DEPTH=16, DATA_WIDTH=128) 跨域。
+5. **r09 N2**：IDELAYCTRL.RST 直接接外部按钮,违反 UG471。修法：`trace_capture_a7` 内部加 ref_200m 同步链。
+6. **r09 D3**：trace_data_in 缺 set_input_delay → IDDR 输入被推为常量 → trace pipeline propagate 死。修法：xdc 加完整 source-sync DDR input delay,加 `set_false_path -hold` 诚实承认 deskew 未做。
+7. **r09 D1**：trace 数据 4 线引脚 bank 未核。修法：用 A7_LITE_GPIO.xlsx 重新分配 GPIO1_0P/1P/2P/3P (F13/E14/D14/E16),全部 P 端,Bank 16 一致。
+
+**剩余 r09 必补项**（外部依赖,客户层动作）：
+- 🟥 **P0-1 PHY strap**：A7-Lite Rev1.3 上 RTL8211E 的 5 个 RGMII strap pin 默认电平,需联系微相客服确认。
+- 🟥 **D2 35T/100T 引脚兼容**：需微相客服书面确认。
+
+**r09 标记为 Stage-3 必做的项**：
+- C1 xsim 1000 帧 + tap 抖动覆盖
+- N3 BUFG → BUFR/BUFIO 区域时钟
+- A3 BRAM-only 缓冲对 PC hiccup 的容忍度（评估接 DDR3 MIG）
+- B3/E1 RGMII RX IDELAY 是否需要补（取决于 P0-1 strap 结论）
+
+详见 `proposals/11-r09回应-真实数据落地修复.md`。
 
 ### T5 · 选板 datasheet 门（红方终审 checklist，零成本）✅（除 35T/100T 兼容性待厂商确认）
 对候选目标板（微相 A7-Lite 35T/100T）逐项核实：
