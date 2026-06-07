@@ -2,10 +2,24 @@ name: build
 
 on:
   push:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'CONTRIBUTORS'
+      - 'COPYING'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE'
+      - 'CONTRIBUTORS'
+      - 'COPYING'
 
 jobs:
   orbtrace_mini:
+    # Upstream ECP5 mini-board build; not relevant to the Artix-7 port fork.
+    if: github.repository == 'orbcode/orbtrace'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,6 +39,7 @@ jobs:
             build/orbtrace_mini/gateware/csr.csv
 
   orbtrace_mini_dfu:
+    if: github.repository == 'orbcode/orbtrace'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,6 +59,7 @@ jobs:
             build/orbtrace_mini_dfu/gateware/csr.csv
   
   orbtrace_mini_test:
+    if: github.repository == 'orbcode/orbtrace'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -63,16 +79,24 @@ jobs:
             build/orbtrace_mini_test/gateware/csr.csv
 
   test:
+    # Lightweight unit-test job: only what tests/ actually need.
+    # Skips pdm + oss-cad-suite (which pull in LiteX/Migen/VexRiscv just to
+    # build mini bitstreams) so it runs in <2min and never hangs on the
+    # big build dependency resolve that bites the upstream test job.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - run: git fetch --prune --unshallow --no-recurse-submodules
-      - uses: YosysHQ/setup-oss-cad-suite@v3
-      - run: python3 -m pip install pdm
-      - run: pdm install -dG test
-      - run: pdm test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install minimal test dependencies
+        run: pip install 'amaranth==0.5.4' amaranth-yosys 'cobs>=1.2.1' 'pytest>=8.3.5' pytest-cov
+      - name: Run tests
+        run: PYTHONPATH=. pytest tests/ -v
+      - name: Coverage on trace pipeline
+        run: PYTHONPATH=. pytest tests/ --cov=orbtrace.trace --cov=orbtrace.stream --cov-report=term
 
   iverilog_testbenches:
     # Verilog testbench regression (added in artix7-port branch).
