@@ -80,9 +80,23 @@ graph TD
 - [ ] **重点看实现后面积**（r08 ④：时序收敛会膨胀面积），记录是否需要寄存器复制/管线
 - 注：本步只验"综合得出、资源可知"，**满速时序的眼图/收敛是第三阶段上板才能定**，OOC 时序仅供参考。
 
-### T3 · trace 核心逻辑 OOC 综合
-- [ ] 把第一阶段已验证的 traceIF + TPIU 解帧 + COBS + OrbFlow 逻辑（Amaranth 导出 Verilog，或现有 Verilog）跑 OOC 综合
-- [ ] 拿到实现后 LUT/FF/BRAM（验证 r08 对 trace 核心 ~2-4K LUT 的估算）
+### T3 · trace 核心逻辑 OOC 综合 ✅
+- [x] 把已验证的 traceIF + TPIUDemux + COBSEncoder + ChecksumAppender + SuperFramer 逻辑跑 OOC 综合（Amaranth 经 wrapper 导出 Verilog 后）
+- [x] 拿到 OOC 实测：**整套 trace 核心 = 494 LUT / 484 FF / 1 BRAM（占 35T 的 2.38% LUT）**
+
+#### T3 实测结果（xc7a35tfgg484-2，2025-XX）
+
+| 模块 | LUT | FF | BRAM | r08 估算 | 偏差 |
+|------|----:|---:|----:|---------|------|
+| traceIF | 119 | 284 | 0 | 200~400 | ✅ 比下沿还省 |
+| checksum_appender | 16 | 9 | 0 | 30~80 | ✅ |
+| cobs_encoder | 113 | 70 | 1 | 300~500 | ✅✅ 大幅省 |
+| super_framer | 18 | 51 | 0 | 100~200 | ✅ |
+| tpiu_demux（含 6 子模块） | 228 | 70 | 0 | 400~800 | ✅ |
+| **trace 核心合计** | **494** | **484** | **1** | 1630~3780 | **比估算上沿小 ~7×** |
+| **占 35T** | **2.38%** | 1.16% | 2% | — | — |
+
+**结论**：trace 核心**远比估算更省**，35T 装这部分毫无压力。逻辑门确实不是约束，剩下的 LUT 全留给以太网栈（T1）。流程见 `syn/artix7/`：`export_trace_modules.py`（导 Verilog）+ `run_ooc.tcl`（批量综合）。
 
 ### T4 · 合并实现 + 真实时钟约束
 - [ ] 把 T1+T2+T3 合到目标器件顶层，加真实时钟约束：RGMII 125MHz + IDELAYCTRL 200MHz ref + trace 满速域
