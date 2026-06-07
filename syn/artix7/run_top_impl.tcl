@@ -89,21 +89,17 @@ report_timing -delay_type min -max_paths 1 -path_type summary
 puts "--- IDDR-related hold paths (top 5) ---"
 report_timing -delay_type min -max_paths 5 -path_type summary -through [get_pins -hierarchical -filter "REF_NAME == IDDR"]
 
-# r09 A1: prove trace pipeline survives opt_design pruning.
+# r09 A1 / r10 A1+NEW-3: prove the trace pipeline is in the routed netlist
+# AND end-to-end connected (not just black-box shells). Cell counts + a
+# real end-to-end timing path are the authoritative evidence.
 puts "============ TRACE PIPELINE SURVIVAL CHECK ============"
 foreach inst {u_capture u_traceif u_dmux u_chk u_cobs u_sf} {
-    # Vivado >=2020.2: get_cells * inside the hierarchical instance.
-    # Use an absolute hierarchical wildcard with leading slash semantics.
     set cells [get_cells -quiet -hierarchical -filter "NAME =~ $inst/*"]
     if {[llength $cells] == 0} {
-        # try direct child (for non-flattened or DONT_TOUCH-protected blackbox)
         set self [get_cells -quiet $inst]
         if {[llength $self] > 0} {
             set cells [get_cells -quiet -filter "PARENT == $inst"]
-            if {[llength $cells] == 0} {
-                # if it's a leaf (DONT_TOUCH boxed), at least the box itself is there
-                set cells $self
-            }
+            if {[llength $cells] == 0} { set cells $self }
         }
     }
     set lut [llength [filter $cells "REF_NAME =~ LUT*"]]
@@ -114,18 +110,23 @@ foreach inst {u_capture u_traceif u_dmux u_chk u_cobs u_sf} {
                  $inst $lut $ff $ram $io [llength $cells]]
 }
 
-puts "============ TRACE PIPELINE TOP-LEVEL SIGNAL CHECK ============"
-foreach sig {fr_avail frame128 fr_pulse dmux_out_valid chk_out_valid cobs_out_valid sf_out_valid} {
-    set nets [get_nets -hierarchical -top_net_of_hierarchical_group "trace_probe_top/$sig"]
-    if {[llength $nets] > 0} {
-        puts "  net trace_probe_top/$sig : SURVIVED"
-    } else {
-        # try simple non-hierarchical
-        set net [get_nets -quiet $sig]
-        if {[llength $net] > 0} {
-            puts "  net $sig : SURVIVED (top-level)"
-        } else {
-            puts "  net $sig : *** OPTIMIZED AWAY ***"
-        }
-    }
-}
+# r10 A1: BRAM attribution (answer A2-Recheck — separate AsyncFIFO vs cobs)
+puts "============ BRAM ATTRIBUTION ============"
+puts "  AsyncFIFO RAMB: [llength [get_cells -quiet -hier -filter {REF_NAME =~ RAMB* && NAME =~ *u_frame_cdc*}]]"
+puts "  cobs RAMB     : [llength [get_cells -quiet -hier -filter {REF_NAME =~ RAMB* && NAME =~ *u_cobs*}]]"
+
+# r10 A1 + NEW-3: end-to-end timing path is the real connectivity proof.
+puts "============ END-TO-END PIPELINE TIMING PATH ============"
+report_timing -quiet \
+    -from [get_pins -quiet -hier -filter {NAME =~ *u_traceif*construct_reg*/C}] \
+    -to   [get_ports -quiet trace_dbg_data[*]] \
+    -max_paths 3 -path_type summary -no_header
+
+# r10 A3: false_path scope check.
+puts "============ EXCEPTIONS SUMMARY (A3) ============"
+report_exceptions -summary
+puts "============ IDDR -> traceIF SAME-DOMAIN HOLD (A3) ============"
+report_timing -quiet -delay_type min \
+    -from [get_pins -quiet -hier -filter {NAME =~ *u_iddr*/Q1}] \
+    -to   [get_pins -quiet -hier -filter {NAME =~ *u_traceif*/D}] \
+    -max_paths 3 -path_type summary -no_header

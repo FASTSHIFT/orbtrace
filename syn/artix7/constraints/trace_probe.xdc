@@ -19,12 +19,15 @@ set_false_path -from [get_ports rst_n]
 # ============================================================
 # ARM Trace pins (GPIO1, Bank 16, see PLAN_STAGE2 §T5).
 # TRACECLK on MRCC-capable pin GPIO1_4P (D17 = IO_L12P_T1_MRCC_16).
-# Data lanes on adjacent GPIO1 Bank 16 differential P pins (verified
-# against A7_LITE_GPIO.xlsx — all on Bank 16, all 3.3V VCCIO_A).
-#   trace_data_in[0] -> GPIO1_0P / F13
-#   trace_data_in[1] -> GPIO1_1P / E14   (note: P pin of pair 1 is E14)
-#   trace_data_in[2] -> GPIO1_2P / D14
-#   trace_data_in[3] -> GPIO1_3P / E16
+# Pin functions VERIFIED via Vivado get_property BANK/PIN_FUNC (r10 D1),
+# NOT just the vendor xlsx (which had a P/N labelling slip):
+#   trace_clk_in     -> D17  BANK=16  IO_L12P_T1_MRCC_16  (MRCC ✓)
+#   trace_data_in[0] -> F13  BANK=16  IO_L1P_T0_16
+#   trace_data_in[1] -> E14  BANK=16  IO_L4N_T0_16   (N-side; single-ended
+#                                                     LVCMOS33 is fine)
+#   trace_data_in[2] -> D14  BANK=16  IO_L6P_T0_16
+#   trace_data_in[3] -> E16  BANK=16  IO_L5P_T0_16
+# All five share BANK 16 -> a single IDELAYCTRL drives all trace IDELAYE2.
 # ============================================================
 set_property PACKAGE_PIN D17 [get_ports trace_clk_in]
 set_property PACKAGE_PIN F13 [get_ports {trace_data_in[0]}]
@@ -118,10 +121,12 @@ set_property PACKAGE_PIN F16 [get_ports {trace_dbg_inter[0]}]
 set_property PACKAGE_PIN E17 [get_ports {trace_dbg_inter[1]}]
 set_property PACKAGE_PIN A18 [get_ports {trace_dbg_inter[2]}]
 set_property PACKAGE_PIN A19 [get_ports {trace_dbg_inter[3]}]
+set_property PACKAGE_PIN B17 [get_ports trace_dbg_lost]
 set_property IOSTANDARD LVCMOS33 [get_ports {trace_dbg_data[*]}]
 set_property IOSTANDARD LVCMOS33 [get_ports {trace_dbg_inter[*]}]
 set_property IOSTANDARD LVCMOS33 [get_ports trace_dbg_valid]
 set_property IOSTANDARD LVCMOS33 [get_ports trace_dbg_last]
+set_property IOSTANDARD LVCMOS33 [get_ports trace_dbg_lost]
 
 # ============================================================
 # Asynchronous clock domains (declare unrelated to avoid spurious cross-clock

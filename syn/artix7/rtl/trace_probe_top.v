@@ -70,7 +70,8 @@ module trace_probe_top (
     output wire [7:0]  trace_dbg_data,    // sf_data
     output wire        trace_dbg_valid,   // sf_out_valid
     output wire        trace_dbg_last,    // sf_out_last
-    output wire [3:0]  trace_dbg_inter    // {dmux,chk,cobs,fr_pulse} valids
+    output wire [3:0]  trace_dbg_inter,   // {dmux,chk,cobs,fr_pulse} valids
+    output wire        trace_dbg_lost     // r10 NEW-1: FIFO overflow seen (OR of lost counter)
 );
 
     wire rst = ~rst_n;
@@ -212,9 +213,36 @@ module trace_probe_top (
     // REQP-1839 (potential RAMB content corruption on reset assertion).
     // The FIFO consumes its own m_rst/s_rst paths; this stage only needs
     // to debounce the toggle.
-    reg fr_avail_q;
-    always @(posedge trace_clk) fr_avail_q <= fr_avail;
-    wire frame_strobe = fr_avail ^ fr_avail_q;   // toggle detect
+    //
+    // fr_avail comes from traceIF.FrAvail, which HAS an async reset. Feed
+    // it through one reset-less isolation flop first so the toggle XOR
+    // (and hence the FIFO write-enable) is no longer combinationally tied
+    // to an async-reset register — this clears the residual REQP-1839 on
+    // u_traceif/FrAvail_reg.
+    reg fr_avail_iso, fr_avail_q;
+    always @(posedge trace_clk) begin
+        fr_avail_iso <= fr_avail;        // reset-less isolation
+        fr_avail_q   <= fr_avail_iso;
+    end
+    wire frame_strobe = fr_avail_iso ^ fr_avail_q;   // toggle detect
+
+    // ------------------------------------------------------------------
+    // r10 NEW-1 fix: overflow accounting. traceIF is free-running and
+    // cannot be back-pressured (it samples on every trace_clk edge), so a
+    // single-cycle frame_strobe that lands while the FIFO is full would
+    // silently drop a frame. Rather than pretend back-pressure exists, we
+    // make the loss VISIBLE: count every frame_strobe that is not accepted
+    // (tvalid & !tready), the same approach orbtrace upstream uses with
+    // util.Monitor.lost. The PC-side decoder can then attribute a
+    // resync to a known FIFO overflow instead of misdiagnosing it as a
+    // sampling / signal-integrity fault. (Real fix in Stage-3: deeper
+    // FIFO + DDR3 spill; for Stage-2 sizing the counter quantifies the
+    // problem.)
+    wire fifo_overflow_evt = frame_strobe & ~cdc_in_ready;
+    reg [15:0] trace_lost_cnt;
+    always @(posedge trace_clk)
+        if (sys_rst)               trace_lost_cnt <= 16'd0;
+        else if (fifo_overflow_evt) trace_lost_cnt <= trace_lost_cnt + 16'd1;
 
     axis_async_fifo #(
         .DEPTH       (16),
@@ -371,9 +399,37 @@ module trace_probe_top (
         .uart_txd    ()
     );
 
-    // PHY mgmt tied off (real management TBD in stage-3)
-    assign phy_mdio = 1'bz;
-    assign phy_mdc  = 1'b0;
+    // ------------------------------------------------------------------
+    // PHY management (MDIO) master interface — r10 NEW-2.
+    // r09/r10 P0-1: if the RTL8211E strap pins default to RGMII RX/TX
+    // internal delay enabled, the only software remedy is to reconfigure
+    // the PHY's RGMII delay register (page 0xa43, reg 0x0d) over MDIO at
+    // boot. The previous version drove phy_mdio = 1'bz / phy_mdc = 1'b0,
+    // i.e. no MDIO master at all — which meant that even if the vendor
+    // confirmed "strap is bad but you can fix it via MDIO", this design
+    // physically could not. We now expose a proper tri-stated MDIO master
+    // interface so a boot-time register-write sequence can be dropped in.
+    //
+    // The actual register-write FSM is a Stage-3 deliverable (it needs the
+    // confirmed strap value to know WHAT to write); here we provide the
+    // tri-state plumbing + a parameter-gated idle so the pins are driven
+    // correctly and the interface exists. mdio_oe=0 => high-Z (PHY drives
+    // / bus idle), matching MDIO open-drain-ish convention.
+    // ------------------------------------------------------------------
+    wire mdio_mst_o;     // master output data (to be driven by Stage-3 FSM)
+    wire mdio_mst_oe;    // master output enable (1 = drive, 0 = release)
+    wire mdio_mst_i;     // master input data (read from PHY)
+    wire mdio_mst_clk;   // MDC from master
+
+    // Stage-2 stub: bus idle, master FSM not yet implemented. Stage-3
+    // replaces these two assigns with the register-write sequencer.
+    assign mdio_mst_o   = 1'b0;
+    assign mdio_mst_oe  = 1'b0;   // released (high-Z) until Stage-3 FSM
+    assign mdio_mst_clk = 1'b0;
+
+    assign phy_mdio   = mdio_mst_oe ? mdio_mst_o : 1'bz;  // real tri-state
+    assign mdio_mst_i = phy_mdio;                          // readback path
+    assign phy_mdc    = mdio_mst_clk;
 
     assign led0 = idelayctrl_rdy;
     assign led1 = sf_out_valid;
@@ -385,6 +441,7 @@ module trace_probe_top (
     assign trace_dbg_valid = sf_out_valid;
     assign trace_dbg_last  = sf_out_last;
     assign trace_dbg_inter = {dmux_out_valid, chk_out_valid, cobs_out_valid, fr_pulse};
+    assign trace_dbg_lost  = |trace_lost_cnt;   // r10 NEW-1: any FIFO overflow ever seen
 
 endmodule
 
