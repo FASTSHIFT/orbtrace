@@ -34,9 +34,11 @@ source = "scm"
 
 [tool.pdm.scripts]
 test.cmd = "pytest tests/"
+cov.cmd = "pytest tests/ --cov=orbtrace.trace --cov=orbtrace.stream --cov-report=term-missing"
 
 [dependency-groups]
 test = [
     "cobs>=1.2.1",
     "pytest>=8.3.5",
+    "pytest-cov>=7.1",
 ]

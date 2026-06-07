@@ -24,3 +24,10 @@ fp-info-cache
 /.venv/
 /.pdm-build/
 /.pdm-python
+
+# Coverage / pytest cache
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+__pycache__/
