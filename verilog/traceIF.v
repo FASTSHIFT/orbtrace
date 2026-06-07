@@ -11,20 +11,20 @@
 // Working from CoreSight TPIU-Lite Technical Reference Manual Revision: r0p0
 
 module traceIF # (parameter MAXBUSWIDTH = 4, SYNC_BITS=27) (
-		input                   rst,              // Reset synchronised to clock
+		input  wire             rst,              // Reset synchronised to clock
 
 	// Downwards interface to the trace pins (1-n bits max, can be less)
-		input [MAXBUSWIDTH-1:0] traceDina,        // Tracedata rising edge (LSB)
-		input [MAXBUSWIDTH-1:0] traceDinb,        // Tracedata falling edge (MSB)
-		input                   traceClkin,       // Tracedata clock... async to clk
-		input [1:0]             width,            // Incoming Bus width
+		input  wire [MAXBUSWIDTH-1:0] traceDina,  // Tracedata rising edge (LSB)
+		input  wire [MAXBUSWIDTH-1:0] traceDinb,  // Tracedata falling edge (MSB)
+		input  wire             traceClkin,       // Tracedata clock... async to clk
+		input  wire [1:0]       width,            // Incoming Bus width
                                                           //  0..3 (1, 1, 2 & 4 bits)
         // DIAGNOSTIC
-                output                  edgeOutput,
+                output wire             edgeOutput,
 
 `ifdef RESPECT_SYNC_TO
         // Control downwards interface
-                input                   ignoreSyncCount,  // Dont take account of sync bit
+                input  wire             ignoreSyncCount,  // Dont take account of sync bit
 `endif
 
  	// Upwards interface to packet processor
@@ -65,7 +65,18 @@ module traceIF # (parameter MAXBUSWIDTH = 4, SYNC_BITS=27) (
    always @(posedge traceClkin, posedge rst)
      begin
         // Default status bits
-	if (!rst)
+	if (rst)
+	  begin
+             // Reset: establish deterministic state so FrAvail toggles from a
+             // known value (otherwise it stays X in simulation and never
+             // produces an observable frame-ready edge).
+             FrAvail         <= 1'b0;
+             construct       <= 36'b0;
+             remainingClocks <= 3'b0;
+             elemCount       <= ~0;
+             isREsync        <= 1'b0;
+          end
+	else
 	  begin
              /* Roll constructed value along to accomodate new data for 4, 2 & 1 bits */
              case (width)
@@ -135,16 +146,5 @@ module traceIF # (parameter MAXBUSWIDTH = 4, SYNC_BITS=27) (
                     end // else: !if(remainingClocks)
                end // else: !if (syncPacket)
           end // else: !if(rst)
-        else
-          begin
-             // Reset: establish deterministic state so FrAvail toggles from a
-             // known value (otherwise it stays X in simulation and never
-             // produces an observable frame-ready edge).
-             FrAvail         <= 1'b0;
-             construct       <= 36'b0;
-             remainingClocks <= 3'b0;
-             elemCount       <= ~0;
-             isREsync        <= 1'b0;
-          end
      end // always @ (posedge traceClkin, posedge rst)
 endmodule // traceIF
