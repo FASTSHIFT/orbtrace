@@ -1,0 +1,3 @@
+[submodule "syn/external/verilog-ethernet"]
+	path = syn/external/verilog-ethernet
+	url = https://github.com/alexforencich/verilog-ethernet.git

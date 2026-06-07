@@ -73,3 +73,32 @@ jobs:
       - run: python3 -m pip install pdm
       - run: pdm install -dG test
       - run: pdm test
+
+  iverilog_testbenches:
+    # Verilog testbench regression (added in artix7-port branch).
+    # Runs iverilog against the hand-written Verilog (traceIF.v) and the three
+    # testbenches under verilog/testbeds/ to prevent silent regressions in the
+    # physical-layer framing logic, which is otherwise only covered indirectly.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: sudo apt-get update && sudo apt-get install -y iverilog
+      - name: traceIF basic (width=4)
+        run: |
+          iverilog -o /tmp/sim verilog/traceIF.v verilog/testbeds/traceIF_tb.v
+          vvp /tmp/sim | tee /tmp/out
+          grep -q 'OUTPUT=123402030405060708090a0b0c0d0e0f' /tmp/out
+      - name: traceIF re-sync and back-to-back frames
+        run: |
+          iverilog -o /tmp/sim verilog/traceIF.v verilog/testbeds/traceIF_resync_tb.v
+          vvp /tmp/sim | tee /tmp/out
+          # Expect 6 frames printed (3 real + 3 flush zero frames).
+          test "$(grep -c 'FRAME\[' /tmp/out)" -ge 3
+      - name: traceIF real-capture stimulus (slowitm)
+        run: |
+          iverilog -o /tmp/sim verilog/traceIF.v verilog/testbeds/traceIF_stim_tb.v
+          vvp /tmp/sim | tee /tmp/out
+          # Real capture should at least feed bytes and detect TPIU sync words.
+          grep -q 'Got sync' /tmp/out
