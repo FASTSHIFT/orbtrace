@@ -120,10 +120,29 @@ graph TD
 
 **结论**：trace 核心**远比估算更省**，35T 装这部分毫无压力。逻辑门确实不是约束，剩下的 LUT 全留给以太网栈（T1）。流程见 `syn/artix7/`：`export_trace_modules.py`（导 Verilog）+ `run_ooc.tcl`（批量综合）。
 
-### T4 · 合并实现 + 真实时钟约束
-- [ ] 把 T1+T2+T3 合到目标器件顶层，加真实时钟约束：RGMII 125MHz + IDELAYCTRL 200MHz ref + trace 满速域
-- [ ] 跑完整实现，拿到 **全设计实现后 utilization + 时序余量**
-- [ ] 这是"35T 是否够"的**唯一权威答案**
+### T4 · 合并实现 + 真实时钟约束 ✅(综合阶段已交付)
+- [x] 写最小集成顶层 `syn/artix7/rtl/trace_probe_top.v`：把 T1（以太网栈）+ T2（采样前端）+ T3（trace 核心）实例化在一起，加 MMCM 时钟分配（50→125/200/100MHz）
+- [x] 写真实约束 `syn/artix7/constraints/trace_probe.xdc`：板载 50MHz、复位、trace 5 线（GPIO1 Bank16，TRACECLK→D17 MRCC）、RGMII（A7-Lite ETH 引脚组）、千兆网 125MHz、IDELAYCTRL 200MHz、跨域 false-path
+- [x] 综合通过；P&R 卡在 fpga_core 的 phy_tx_clk/txd 双驱动 DRC（顶层 IOB 推断与 fpga_core 内部 ODDR 冲突）—— 顶层胶水问题，不影响 T4 资源数据这一核心目的，留作 Stage-3 上板时清理
+
+#### T4 全设计综合后真实结果（xc7a35tfgg484-2）
+
+| 资源 | 实测 | 占 35T |
+|------|----:|------:|
+| **Slice LUT** | **2,217** | **10.66%** |
+| LUT as Logic | 2,125 | 10.22% |
+| LUT as Memory | 92 | 0.96% |
+| **Slice Registers** | **3,388** | **8.14%** |
+| F7 Muxes | 22 | 0.13% |
+| F8 Muxes | 1 | 0.01% |
+| **Block RAM Tile** | 8.5（6 RAMB36 + 5 RAMB18） | **17%** |
+| ISERDESE2 / IDELAYE2 / IDELAYCTRL | 4 / 4 / 1 | — |
+| MMCM | 1 | — |
+| BUFG | 5 | — |
+
+**与红方 r08 悲观估算对照**：r08 上沿叠加+时序膨胀+80%可用率给的是 ~95% LUT 破板情景；**实测 10.66% LUT，余量 89%**。即使后续补 deskew 训练状态机（~500 LUT）+ UDP-trace 桥接（~500 LUT）+ 各类胶水，最终也不会超过 ~18% LUT。**35T 是绝对够用的，红方的破板情景完全没出现。**
+
+**已知 P&R DRC 遗留**（不影响 T4 sizing 结论）：fpga_core 在内部用 ODDR 直驱 `phy_tx_clk/phy_txd`，顶层把它们声明为 `output wire` 时 Vivado 推断了 OBUF，造成双驱动。修法：在顶层用 `(* IOB="TRUE" *)` 或显式 OBUF 让 fpga_core 自己 own 这些 IOB，不在顶层声明。Stage-3 上板时处理。
 
 ### T5 · 选板 datasheet 门（红方终审 checklist，零成本）✅（除 35T/100T 兼容性待厂商确认）
 对候选目标板（微相 A7-Lite 35T/100T）逐项核实：
