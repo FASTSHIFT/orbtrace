@@ -62,17 +62,25 @@ graph TD
 
 > 备选评估：openXC7（nextpnr-xilinx）全开源流程，可作为不装 Vivado 的轻量替代（成熟度较低，仅作 plan B）。**已无需——Vivado 2021.1 可用。**
 
-### T1 · 以太网栈 OOC 综合（最高优先级）
-红方 r08 致命点 F1/F2/S2：以太网是 LUT 大头且最不确定，buffer 可能吃大量分布式 RAM。**这块必须先用真实综合数字替换估算。**
+### T1 · 以太网栈 OOC 综合（最高优先级）✅
+红方 r08 致命点 F1/F2/S2：以太网是 LUT 大头且最不确定，buffer 可能吃大量分布式 RAM。**已用真实综合数字替换估算。**
 
-- [ ] 选定千兆 MAC + UDP 核：
-  - 候选 A：`alexforencich/verilog-ethernet`（`udp_complete_1g_rgmii`），Verilog，资料多
-  - 候选 B：LiteEth（与 ORBTrace 的 LiteX 框架同源，集成阻力小）
-- [ ] 对选定核跑 **OOC 综合 + 实现**（目标 `xc7a35t`），拿到实现后 **LUT / FF / BRAM / LUT-as-RAM** 数字
-- [ ] **显式检查 LUT-as-RAM 数量**（r08 F1）：确认 buffer 能否在不破坏时序的前提下转 BRAM；记录转不走的部分
-- [ ] 记录在目标时钟（RGMII 125MHz）下的时序余量
+- [x] 选定核：`alexforencich/verilog-ethernet`（NexysVideo example，Artix-7 + RGMII 千兆 MAC + 完整 UDP/IP/ARP），作为 git submodule 锁定在 `syn/external/verilog-ethernet/`
+- [x] 对 `fpga_core`（含 RGMII MAC、UDP/IP/ARP、AXI-Stream FIFO、CDC，不含板级 IO 包装）跑 OOC 综合
+- [x] **LUT-as-RAM 检查（r08 F1）**：实测仅 92（0.96%），远低于 r08 担心的 ~1700——核默认把 buffer 推到 BRAM
+- [x] 记录综合后资源；时序细节交 T4 加 RGMII 125MHz 真实约束验证
 
-**产出**：以太网栈的实现后资源表 + buffer 实现方式结论。
+#### T1 实测结果（xc7a35tfgg484-2）
+
+| 资源 | 实测 | 占 35T | r08 估算 | 偏差 |
+|------|----:|------:|---------|------|
+| LUT（Logic） | 1,779 | 8.55% | — | — |
+| LUT（as Memory） | 92 | 0.96% | r08 警告 ~1700 | ✅✅ 远低于估算 |
+| **LUT 总计** | **1,871** | **9.00%** | 2,700~5,500 | ✅ 比下沿还省 30% |
+| Flip-Flop | 2,804 | 6.74% | 2,200~4,500 | ✅ |
+| Block RAM | 8（6 RAMB36 + 4 RAMB18） | 16% | 4~8 | 略高，仍宽裕 |
+
+**结论**：以太网栈实测 1,871 LUT，**比红方估算下沿还省 30%**。脚本：`syn/artix7/run_eth_ooc.tcl`。
 
 ### T2 · 采样前端原型 OOC 综合
 - [ ] 写 Artix-7 采样前端原型：`ISERDESE2`（DDR 模式）×5 + `IDELAYE2`×5 + `IDELAYCTRL` + deskew 校准状态机骨架
