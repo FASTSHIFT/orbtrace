@@ -47,12 +47,20 @@ graph TD
 
 ## 2. 任务分解
 
-### T0 · 工具链就绪
-- [ ] 装 **Xilinx Vivado**（WebPACK/Standard 免费版即可，支持 Artix-7；Linux 原生版，几十 GB）
-- [ ] 确认目标器件库：`xc7a35t` 与 `xc7a100t`（同 FGG484 封装，便于将来无痛升级——T5 需核实引脚兼容）
-- [ ] 备选评估：openXC7（nextpnr-xilinx）全开源流程，可作为不装 Vivado 的轻量替代（成熟度较低，仅作 plan B）
+### T0 · 工具链就绪 ✅
+- [x] 装 **Xilinx Vivado 2021.1**（统一整包 `Xilinx_Unified_2021.1`，Win/Linux 通用；装于 `~/workpath/tools/xilinx/`）
+- [x] 确认器件库含目标器件：`xc7a35tfgg484-1/-2` 与 `xc7a100tfgg484-1/-2` 均可用（无 license 限制）
+- [x] 验证 `vivado -version` 正常输出
 
-> 注：Vivado 是本阶段唯一"重"的一步，也是整个第二阶段的门槛。装好后 T1–T4 都是零硬件、可重复跑的综合任务。
+**安装中遇到的两个坑及修复（环境重建时照做）：**
+1. **locale 缺失**：Vivado 脚本硬编码 `en_US.UTF-8`，中文系统报 `locale::facet::_S_create_c_locale name not valid`。
+   修复：`sudo locale-gen en_US.UTF-8 && sudo update-locale`
+2. **缺 `libtinfo.so.5`**：Ubuntu 24 只有 `.so.6`，报 `libtinfo.so.5: cannot open shared object file`。
+   修复：`sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6.4 /usr/lib/x86_64-linux-gnu/libtinfo.so.5`
+
+**每次使用前**：`source ~/workpath/tools/xilinx/Vivado/2021.1/settings64.sh`（建议加进 `~/.bashrc`）
+
+> 备选评估：openXC7（nextpnr-xilinx）全开源流程，可作为不装 Vivado 的轻量替代（成熟度较低，仅作 plan B）。**已无需——Vivado 2021.1 可用。**
 
 ### T1 · 以太网栈 OOC 综合（最高优先级）
 红方 r08 致命点 F1/F2/S2：以太网是 LUT 大头且最不确定，buffer 可能吃大量分布式 RAM。**这块必须先用真实综合数字替换估算。**
@@ -81,13 +89,13 @@ graph TD
 - [ ] 跑完整实现，拿到 **全设计实现后 utilization + 时序余量**
 - [ ] 这是"35T 是否够"的**唯一权威答案**
 
-### T5 · 选板 datasheet 门（红方终审 checklist，零成本）
-对候选目标板（如微相 A7-Lite 35T/100T）逐项书面核实：
-- [ ] **TRACECLK 候选引脚落在时钟能力脚（MRCC/SRCC）** —— 否则满速采样时序崩
-- [ ] **5 根 trace 线（TRACECLK+TRACED0-3）尽量同 IO bank、bank 电压可配 3.3V**
-- [ ] **板载时钟能经 MMCM 生成稳定 200MHz**（IDELAYCTRL 参考钟）
-- [ ] **以太网 PHY 型号与接口**（确认 RGMII，对应 T1 选的核）—— 微相板为 Realtek（螃蟹 logo），大概率 RTL8211 + RGMII，需文档确认
-- [ ] **35T 与 100T 引脚兼容性**（若 T4 判 35T 偏紧想留升级余地）
+### T5 · 选板 datasheet 门（红方终审 checklist，零成本）✅（除 35T/100T 兼容性待厂商确认）
+对候选目标板（微相 A7-Lite 35T/100T）逐项核实：
+- [x] **TRACECLK 候选引脚落在时钟能力脚（MRCC/SRCC）** —— GPIO1 含 4 个 MRCC，首选 GPIO1_4P(D17)
+- [x] **5 根 trace 线尽量同 IO bank、bank 电压可配 3.3V** —— GPIO1 全在 Bank 16，可配 3.3V
+- [x] **板载时钟能经 MMCM 生成稳定 200MHz** —— 50MHz 晶振 J19
+- [x] **以太网 PHY 型号与接口** —— RGMII（Realtek PHY），对应 T1 选 RGMII MAC
+- [ ] **35T 与 100T 引脚兼容性** —— 同 FGG484 封装，待厂商最终确认
 
 #### T5 初步核对结论（基于 A7-Lite 官方资料：`A7_lite.xdc` / `A7_LITE_GPIO.xlsx` / `A7-LITE_Rev1_3.pdf`）
 
@@ -97,12 +105,30 @@ graph TD
 |---------|------|------|
 | 200MHz 参考钟 | ✅ 满足 | 板载 50MHz 晶振（CLK_50M@J19），经 MMCM 倍频出 200MHz |
 | 5 线同 bank + 3.3V | ✅ 满足 | GPIO1 扩展口整组在 **Bank 16**，`VCCIO_A` 电压可配，板上有 VCC_3V3；trace 5 线全放 GPIO1 即可 |
-| TRACECLK 落时钟能力脚 | ✅ 基本确认（⚠️待精确对应） | 原理图显示 GPIO1(Bank16) 含多个 MRCC/SRCC 脚：如 `IO_L12P_T1_MRCC_16`、`IO_L13P_T2_MRCC_16`、`IO_L11P_T1_SRCC_16`。TRACECLK 落其一即可；**具体 GPIO1_xx ↔ MRCC 脚的精确对应需装 Vivado 后用器件库核对** |
+| TRACECLK 落时钟能力脚 | ✅ **确认（Vivado 器件库已核对）** | GPIO1/Bank16 共 8 个时钟能力脚，含 4 个 MRCC（全局时钟，可驱动 BUFG/BUFR/BUFIO→ISERDES）。TRACECLK 落 MRCC 脚即可 |
 | 以太网 RGMII | ✅ 确认 RGMII | `A7_lite.xdc` 的 ETH 引脚组为标准 RGMII（RXCK/RXCTL/RXD[3:0]+TXCK/TXCTL/TXD[3:0]+MDC/MDIO），LVCMOS33；PHY 为 Realtek（螃蟹 logo），对应 T1 选 RGMII MAC |
 | 35T/100T 引脚兼容 | ⚠️ 待确认 | 微相 A7-Lite 35T/100T 均为 **FGG484** 封装（见 `04_source_code`/规格），同封装通常引脚兼容；具体以厂商确认为准 |
 | GPIO 引出形式 | ✅ 加分项 | GPIO1/GPIO2 以**差分对（P/N）**引出（共 ~42 对 IO），利于 trace 信号完整性 |
 
-**结论：A7-Lite 通过选板门的关键项**（时钟、bank/电压、TRACECLK 时钟脚、RGMII 出口均满足）。**唯一待精确落定的是"GPIO1 哪个引脚号 = 哪个 MRCC 脚"，需 Vivado 器件库核对后写进 trace 的 xdc。** 原始 `A7_lite.xdc` 只含板载固定外设，**trace 引脚需自行从 GPIO1 中选定并新增约束**。
+**结论：A7-Lite 通过选板门全部关键项**（时钟、bank/电压、TRACECLK 时钟脚、RGMII 出口均满足）。原始 `A7_lite.xdc` 只含板载固定外设，**trace 引脚需自行从 GPIO1 中选定并新增约束**。
+
+#### GPIO1（Bank 16）时钟能力脚（Vivado `xc7a35tfgg484-2` 器件库核对结果）
+
+| 排针信号 | 排针脚 | package pin | 功能名 | 类型 |
+|---------|-------|------------|--------|------|
+| **GPIO1_4P** | 9 | **D17** | IO_L12P_T1_MRCC_16 | **MRCC** ← TRACECLK 首选 |
+| GPIO1_4N | 10 | C17 | IO_L12N_T1_MRCC_16 | MRCC |
+| GPIO1_16P | 37 | C18 | IO_L13P_T2_MRCC_16 | MRCC |
+| GPIO1_16N | 38 | C19 | IO_L13N_T2_MRCC_16 | MRCC |
+| GPIO1_12P | 27 | B17 | IO_L11P_T1_SRCC_16 | SRCC |
+| GPIO1_12N | 28 | B18 | IO_L11N_T1_SRCC_16 | SRCC |
+| GPIO1_15P | 35 | E19 | IO_L14P_T2_SRCC_16 | SRCC |
+| GPIO1_15N | 36 | D19 | IO_L14N_T2_SRCC_16 | SRCC |
+
+**建议 trace 引脚分配**（待写入 trace 专用 xdc）：
+- **TRACECLK → GPIO1_4P (D17, MRCC)** —— 全局时钟能力脚，驱动 ISERDES 采样
+- **TRACED0-3 → GPIO1 任意 4 个普通脚**（同 Bank 16，3.3V），尽量与 TRACECLK 邻近以减小 skew
+- 全部 IOSTANDARD = LVCMOS33（与 ETH 同，板上 Bank16 为 3.3V）
 
 ---
 
