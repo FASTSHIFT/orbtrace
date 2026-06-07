@@ -124,30 +124,43 @@ graph TD
 
 **结论**：trace 核心**远比估算更省**，35T 装这部分毫无压力。逻辑门确实不是约束，剩下的 LUT 全留给以太网栈（T1）。流程见 `syn/artix7/`：`export_trace_modules.py`（导 Verilog）+ `run_ooc.tcl`（批量综合）。
 
-### T4 · 合并实现 + 真实时钟约束 ✅(综合阶段已交付)
-- [x] 写最小集成顶层 `syn/artix7/rtl/trace_probe_top.v`：把 T1（以太网栈）+ T2（采样前端）+ T3（trace 核心）实例化在一起，加 MMCM 时钟分配（50→125/200/100MHz）
-- [x] 写真实约束 `syn/artix7/constraints/trace_probe.xdc`：板载 50MHz、复位、trace 5 线（GPIO1 Bank16，TRACECLK→D17 MRCC）、RGMII（A7-Lite ETH 引脚组）、千兆网 125MHz、IDELAYCTRL 200MHz、跨域 false-path
-- [x] 综合通过；P&R 卡在 fpga_core 的 phy_tx_clk/txd 双驱动 DRC（顶层 IOB 推断与 fpga_core 内部 ODDR 冲突）—— 顶层胶水问题，不影响 T4 资源数据这一核心目的，留作 Stage-3 上板时清理
+### T4 · 合并实现 + 真实时钟约束 ✅
+- [x] 写最小集成顶层 `syn/artix7/rtl/trace_probe_top.v`：把 T1（以太网栈）+ T2（采样前端）+ T3（trace 核心）实例化在一起，加 MMCM 时钟分配（50MHz → 125MHz/125MHz@90°/200MHz/100MHz）
+- [x] 写真实约束 `syn/artix7/constraints/trace_probe.xdc`：板载 50MHz、复位、trace 5 线（GPIO1 Bank16，TRACECLK→D17 MRCC）、RGMII（A7-Lite ETH 引脚组）、千兆网 125MHz、IDELAYCTRL 200MHz、跨域异步声明
+- [x] 综合 + opt + place + route 全部通过；**时序收敛**
 
-#### T4 全设计综合后真实结果（xc7a35tfgg484-2）
+#### T4 全设计 post-implementation 真实结果（xc7a35tfgg484-2）
 
 | 资源 | 实测 | 占 35T |
 |------|----:|------:|
-| **Slice LUT** | **2,217** | **10.66%** |
-| LUT as Logic | 2,125 | 10.22% |
+| **Slice LUT** | **2,161** | **10.39%** |
+| LUT as Logic | 2,069 | 9.95% |
 | LUT as Memory | 92 | 0.96% |
-| **Slice Registers** | **3,388** | **8.14%** |
+| **Slice Registers** | **3,352** | **8.06%** |
+| Slice 占用 | 1,146 | 14.06% |
 | F7 Muxes | 22 | 0.13% |
 | F8 Muxes | 1 | 0.01% |
 | **Block RAM Tile** | 8.5（6 RAMB36 + 5 RAMB18） | **17%** |
-| ISERDESE2 / IDELAYE2 / IDELAYCTRL | 4 / 4 / 1 | — |
-| IDDR | 4 | — |
+| IDDR / IDELAYE2 / IDELAYCTRL | 4 / 4 / 1 | — |
 | MMCM | 1 | — |
-| BUFG | 5 | — |
+| BUFG | 6 | — |
 
-**与红方 r08 悲观估算对照**：r08 上沿叠加+时序膨胀+80%可用率给的是 ~95% LUT 破板情景；**实测 10.66% LUT，余量 89%**。即使后续补 deskew 训练状态机（~500 LUT）+ UDP-trace 桥接（~500 LUT）+ 各类胶水，最终也不会超过 ~18% LUT。**35T 是绝对够用的，红方的破板情景完全没出现。**
+#### T4 post-implementation 时序结果
 
-**已知 P&R DRC 遗留**（不影响 T4 sizing 结论）：fpga_core 在内部用 ODDR 直驱 `phy_tx_clk/phy_txd`，顶层把它们声明为 `output wire` 时 Vivado 推断了 OBUF，造成双驱动。修法：在顶层用 `(* IOB="TRUE" *)` 或显式 OBUF 让 fpga_core 自己 own 这些 IOB，不在顶层声明。Stage-3 上板时处理。
+| 时序指标 | 值 | 含义 |
+|---------|---|------|
+| **WNS** (Worst Negative Setup Slack) | **+1.151 ns** | setup 路径最紧处仍有 1.15ns 余量 ✅ |
+| **TNS** (Total Negative Slack) | **0 ns** | 无任何 setup 失败终点 ✅ |
+| **WHS** (Worst Hold Slack) | **+0.052 ns** | hold 路径最紧处仍有 52ps 余量 ✅ |
+| **THS** | **0 ns** | 无任何 hold 失败终点 ✅ |
+| 跨域路径 | 全部 false_path | trace_clk_in / phy_rx_clk / clk100 / clk125 各异步组互斥 |
+
+**与红方 r08 悲观估算对照**：r08 上沿叠加 + 时序膨胀 + 80% 可用率给的是 ~95% LUT 破板情景；**实测 10.39% LUT,余量 89.6%**；**时序所有路径满足且有正余量**。即使后续补 deskew 训练状态机（~500 LUT）+ UDP-trace 桥接（~500 LUT）+ 各类胶水，最终也不会超过 ~18% LUT。**35T 是绝对够用的，红方的破板情景完全没出现。**
+
+**P&R 路上的两个 hidden bug 已修**（见 commit history）：
+1. `fpga_core` 实例化漏传 `TARGET="XILINX"`,导致 `oddr.v` 走 GENERIC 行为模型双 always 块写同一 reg,触发 6 个 DRC MDRV-1 错误。修法：透传 TARGET 参数。
+2. MMCM 加 90° 时钟时把 CLKOUT 重映射,但 xdc 的 `set_clock_groups` 没同步更新,导致 100MHz 域不在异步组里,clk100→clk125 419 个失败终点。修法：把 CLKOUT3 也加进异步组。
+两个问题都不是 35T 的物理资源问题,纯是顶层胶水写法瑕疵,通过 P&R 暴露并清理。
 
 ### T5 · 选板 datasheet 门（红方终审 checklist，零成本）✅（除 35T/100T 兼容性待厂商确认）
 对候选目标板（微相 A7-Lite 35T/100T）逐项核实：

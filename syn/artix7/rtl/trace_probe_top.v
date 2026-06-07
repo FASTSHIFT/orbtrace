@@ -63,38 +63,46 @@ module trace_probe_top (
     wire rst = ~rst_n;
 
     // ------------------------------------------------------------------
-    // MMCM: 50MHz -> { 125MHz (RGMII), 200MHz (IDELAYCTRL), 100MHz (sys) }
+    // MMCM: 50MHz -> { 125MHz (RGMII clk), 125MHz @90° (RGMII clk90),
+    //                  200MHz (IDELAYCTRL), 100MHz (sys) }
+    // The 90° offset clk125 is required by ssio_ddr_out for the RGMII TX
+    // clock to be source-synchronous-correct (data clocked on clk, clock
+    // pin driven by clk90 so the centre-aligned eye lands at the PHY).
     // ------------------------------------------------------------------
     wire clkfb;
-    wire clk125_unbuf, clk200_unbuf, clk100_unbuf;
+    wire clk125_unbuf, clk125_90_unbuf, clk200_unbuf, clk100_unbuf;
     wire mmcm_locked;
 
     MMCME2_BASE #(
         .CLKIN1_PERIOD(20.0),     // 50MHz -> 20ns
         .CLKFBOUT_MULT_F(20.0),   // VCO = 1000MHz
         .DIVCLK_DIVIDE(1),
-        .CLKOUT0_DIVIDE_F(8.0),   // 125MHz
-        .CLKOUT1_DIVIDE(5),       // 200MHz
-        .CLKOUT2_DIVIDE(10),      // 100MHz sys
+        .CLKOUT0_DIVIDE_F(8.0),   // 125MHz, 0°
+        .CLKOUT1_DIVIDE(8),       // 125MHz, 90° (RGMII TX)
+        .CLKOUT1_PHASE(90.0),
+        .CLKOUT2_DIVIDE(5),       // 200MHz (IDELAYCTRL)
+        .CLKOUT3_DIVIDE(10),      // 100MHz sys
         .CLKOUT0_PHASE(0.0),
-        .CLKOUT1_PHASE(0.0),
-        .CLKOUT2_PHASE(0.0)
+        .CLKOUT2_PHASE(0.0),
+        .CLKOUT3_PHASE(0.0)
     ) u_mmcm (
         .CLKIN1   (sys_clk_50),
         .CLKFBIN  (clkfb),
         .CLKFBOUT (clkfb),
         .CLKOUT0  (clk125_unbuf),
-        .CLKOUT1  (clk200_unbuf),
-        .CLKOUT2  (clk100_unbuf),
+        .CLKOUT1  (clk125_90_unbuf),
+        .CLKOUT2  (clk200_unbuf),
+        .CLKOUT3  (clk100_unbuf),
         .LOCKED   (mmcm_locked),
         .RST      (rst),
         .PWRDWN   (1'b0)
     );
 
-    wire clk125, clk200, clk100;
-    BUFG u_bg125 (.I(clk125_unbuf), .O(clk125));
-    BUFG u_bg200 (.I(clk200_unbuf), .O(clk200));
-    BUFG u_bg100 (.I(clk100_unbuf), .O(clk100));
+    wire clk125, clk125_90, clk200, clk100;
+    BUFG u_bg125   (.I(clk125_unbuf),    .O(clk125));
+    BUFG u_bg125_90(.I(clk125_90_unbuf), .O(clk125_90));
+    BUFG u_bg200   (.I(clk200_unbuf),    .O(clk200));
+    BUFG u_bg100   (.I(clk100_unbuf),    .O(clk100));
 
     // Reset stretching: hold rst high until MMCM locks.
     reg [3:0] rst_sync;
@@ -231,10 +239,17 @@ module trace_probe_top (
     // For T4 sizing we instantiate fpga_core with the SF byte stream gated
     // into the sw input so the synthesizer cannot prune it. Real UDP-trace
     // bridging is Stage-3 work.
+    //
+    // TARGET="XILINX" is required: oddr.v / iddr.v default to a "GENERIC"
+    // behavioural model that uses two always blocks driving the same reg,
+    // which Vivado flags as a multiple-driver DRC. Setting TARGET="XILINX"
+    // selects the proper ODDR/IDDR primitive instantiation.
     // ------------------------------------------------------------------
-    fpga_core u_eth (
+    fpga_core #(
+        .TARGET("XILINX")
+    ) u_eth (
         .clk         (clk125),
-        .clk90       (clk125),               // 90deg simplified for sizing
+        .clk90       (clk125_90),
         .rst         (sys_rst),
         .btnu(1'b0), .btnl(1'b0), .btnd(1'b0), .btnr(1'b0), .btnc(1'b0),
         .sw          ({3'b0, sf_out_valid, sf_data[3:0]}),

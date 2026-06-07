@@ -67,6 +67,12 @@ set_property IOSTANDARD LVCMOS33 [get_ports led1]
 # Asynchronous clock domains (declare unrelated to avoid spurious cross-clock
 # timing checks in the simplified T4 datapath; production CDC will be
 # AsyncFIFO-based and handled in Stage-3).
+#
+# MMCM mapping (must match trace_probe_top.v MMCME2_BASE):
+#   CLKOUT0 = 125 MHz, 0°    (RGMII MAC)
+#   CLKOUT1 = 125 MHz, 90°   (RGMII TX clk pin)
+#   CLKOUT2 = 200 MHz        (IDELAYCTRL)
+#   CLKOUT3 = 100 MHz        (sys/trace-core domain)
 # ============================================================
 set_clock_groups -asynchronous \
     -group [get_clocks sys_clk_50] \
@@ -74,4 +80,5 @@ set_clock_groups -asynchronous \
     -group [get_clocks phy_rx_clk] \
     -group [get_clocks -of_objects [get_pins u_mmcm/CLKOUT0]] \
     -group [get_clocks -of_objects [get_pins u_mmcm/CLKOUT1]] \
-    -group [get_clocks -of_objects [get_pins u_mmcm/CLKOUT2]]
+    -group [get_clocks -of_objects [get_pins u_mmcm/CLKOUT2]] \
+    -group [get_clocks -of_objects [get_pins u_mmcm/CLKOUT3]]
