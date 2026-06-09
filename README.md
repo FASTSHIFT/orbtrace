@@ -59,6 +59,15 @@ WNS = +1.254 ns, WHS = +0.034 ns, TNS = THS = 0, DRC 0 errors.
 Real hardware risks (eye-scan margin, PHY strap, metastability MTBF) are
 explicitly carried into **Stage-3 (on-board PoC)**.
 
+**Stage-3 status:** the board has arrived and first-light is done — a
+2-LED blink bitstream builds, programs over JTAG, and runs
+(`End of startup status: HIGH`), proving the PC → JTAG → FPGA-config
+chain. Getting there hit two environment-only snags (Linux `ftdi_sio`
+grabbing the FT232H, and VMware's EHCI USB passthrough failing to open
+the FTDI MPSSE endpoint); both are written up in
+**[`docs/artix7-port/stage3-bringup/01-board-bringup-troubleshooting.md`](docs/artix7-port/stage3-bringup/01-board-bringup-troubleshooting.md)**.
+Bring-up sources live in [`syn/artix7/bringup/`](syn/artix7/bringup/).
+
 Full plan and evidence: **[`docs/artix7-port/`](docs/artix7-port/)**
 (see [`PLAN.md`](docs/artix7-port/PLAN.md), [`PLAN_STAGE2.md`](docs/artix7-port/PLAN_STAGE2.md),
 the `proposals/` and `reviews/` directories).
@@ -210,6 +219,13 @@ WNS = +1.254 ns、WHS = +0.034 ns、TNS = THS = 0、DRC 0 错误。
 
 真实硬件风险（眼图余量、PHY strap 配置、亚稳态 MTBF）已明确带入
 **第三阶段（上板 PoC）**。
+
+**第三阶段进展：** 板子已到货并完成首次点灯——2-LED blink bitstream
+综合、JTAG 烧录、上板运行（`End of startup status: HIGH`），证明
+PC → JTAG → FPGA 配置链路打通。过程中踩了两个纯环境坑（Linux `ftdi_sio`
+抢占 FT232H、VMware EHCI USB 透传打不开 FTDI MPSSE 端点），完整记录见
+**[`docs/artix7-port/stage3-bringup/01-board-bringup-troubleshooting.md`](docs/artix7-port/stage3-bringup/01-board-bringup-troubleshooting.md)**。
+Bring-up 源码在 [`syn/artix7/bringup/`](syn/artix7/bringup/)。
 
 完整计划与证据见 **[`docs/artix7-port/`](docs/artix7-port/)**
 （[`PLAN.md`](docs/artix7-port/PLAN.md)、[`PLAN_STAGE2.md`](docs/artix7-port/PLAN_STAGE2.md)，
