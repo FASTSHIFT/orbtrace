@@ -84,8 +84,16 @@ since the RTL8211E straps its own RX/TX delays on. The debugging journey
 (including the dead ends) is in
 **[`docs/artix7-port/stage3-bringup/03-rgmii-net-link.md`](docs/artix7-port/stage3-bringup/03-rgmii-net-link.md)**.
 
+**Next (Stage-4):** with those three islands proven, the remaining work
+is to wire them into one stream — `trace pins → traceIF → OrbFlow → UDP →
+Orbuculum` — and decode a real instruction flow end-to-end. The plan,
+structured as a falsifiable ladder (V0 digital loopback → V1 sampling
+eye-scan → V2 real ETM → V3 Orbuculum → V4 speed/UDP robustness), is in
+**[`PLAN_STAGE4.md`](docs/artix7-port/PLAN_STAGE4.md)**.
+
 Full plan and evidence: **[`docs/artix7-port/`](docs/artix7-port/)**
 (see [`PLAN.md`](docs/artix7-port/PLAN.md), [`PLAN_STAGE2.md`](docs/artix7-port/PLAN_STAGE2.md),
+[`PLAN_STAGE4.md`](docs/artix7-port/PLAN_STAGE4.md),
 the `proposals/` and `reviews/` directories).
 
 ---
@@ -255,8 +263,15 @@ Bring-up 源码在 [`syn/artix7/bringup/`](syn/artix7/bringup/)。
 strap 默认已经把自己的 RX/TX delay 打开了。完整调试过程（含走过的弯路）见
 **[`docs/artix7-port/stage3-bringup/03-rgmii-net-link.md`](docs/artix7-port/stage3-bringup/03-rgmii-net-link.md)**。
 
+**下一步（第四阶段）：** 三个孤岛验证完毕后，剩下的活是把它们连成一条流——
+`trace 引脚 → traceIF → OrbFlow → UDP → Orbuculum`——端到端解出真实执行流。
+计划按「可证伪的阶梯」组织（V0 数字回环 → V1 采样眼图 → V2 真实 ETM →
+V3 Orbuculum → V4 升速/UDP 鲁棒性），见
+**[`PLAN_STAGE4.md`](docs/artix7-port/PLAN_STAGE4.md)**。
+
 完整计划与证据见 **[`docs/artix7-port/`](docs/artix7-port/)**
-（[`PLAN.md`](docs/artix7-port/PLAN.md)、[`PLAN_STAGE2.md`](docs/artix7-port/PLAN_STAGE2.md)，
+（[`PLAN.md`](docs/artix7-port/PLAN.md)、[`PLAN_STAGE2.md`](docs/artix7-port/PLAN_STAGE2.md)、
+[`PLAN_STAGE4.md`](docs/artix7-port/PLAN_STAGE4.md)，
 以及 `proposals/` 和 `reviews/` 目录）。
 
 ---
