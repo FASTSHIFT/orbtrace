@@ -76,6 +76,14 @@ sequence and the gotchas (GPIO must be hand-muxed to AF0; ETM must be
 enabled, not just the TPIU) are in
 **[`docs/artix7-port/stage3-bringup/02-stm32-etm-enable.md`](docs/artix7-port/stage3-bringup/02-stm32-etm-enable.md)**.
 
+**Gigabit link up:** the on-board RGMII + RTL8211E gigabit Ethernet path
+is working both directions — the FPGA answers ARP and a UDP loopback on
+port 1234 echoes back end-to-end. The fix was removing the FPGA-side
+double-delay on both RX (bypass IDELAY) and TX (`USE_CLK90="FALSE"`),
+since the RTL8211E straps its own RX/TX delays on. The debugging journey
+(including the dead ends) is in
+**[`docs/artix7-port/stage3-bringup/03-rgmii-net-link.md`](docs/artix7-port/stage3-bringup/03-rgmii-net-link.md)**.
+
 Full plan and evidence: **[`docs/artix7-port/`](docs/artix7-port/)**
 (see [`PLAN.md`](docs/artix7-port/PLAN.md), [`PLAN_STAGE2.md`](docs/artix7-port/PLAN_STAGE2.md),
 the `proposals/` and `reviews/` directories).
@@ -240,6 +248,12 @@ Bring-up 源码在 [`syn/artix7/bringup/`](syn/artix7/bringup/)。
 "被测对象会不会发 trace"这个问题在接 FPGA 之前就已坐实。完整寄存器序列和
 踩坑（GPIO 必须手动切到 AF0 复用；要使能 ETM 而不只是 TPIU）见
 **[`docs/artix7-port/stage3-bringup/02-stm32-etm-enable.md`](docs/artix7-port/stage3-bringup/02-stm32-etm-enable.md)**。
+
+**千兆网口打通：** 板载 RGMII + RTL8211E 千兆以太网收发双向已通——FPGA 正常
+应答 ARP，UDP 1234 端口环回端到端原样回显。修复关键是去掉 FPGA 端在 RX
+（旁路 IDELAY）和 TX（`USE_CLK90="FALSE"`）两侧的双重延迟，因为 RTL8211E 的
+strap 默认已经把自己的 RX/TX delay 打开了。完整调试过程（含走过的弯路）见
+**[`docs/artix7-port/stage3-bringup/03-rgmii-net-link.md`](docs/artix7-port/stage3-bringup/03-rgmii-net-link.md)**。
 
 完整计划与证据见 **[`docs/artix7-port/`](docs/artix7-port/)**
 （[`PLAN.md`](docs/artix7-port/PLAN.md)、[`PLAN_STAGE2.md`](docs/artix7-port/PLAN_STAGE2.md)，
