@@ -25,12 +25,13 @@
 STM32F429-DISC ──(ETM 4-bit trace)──> [A7-Lite FPGA] ──RGMII──> RTL8211E ──RJ45──┐
                                                                                  │
 PC (VMware, 桥接网卡, 192.168.10.245) ──WiFi/有线──> OpenWrt 路由器 192.168.10.1 ─┘
-                                          FPGA IP = 192.168.10.200
+                                          FPGA IP = 192.168.10.42
 ```
 
 - VMware 网卡设 **桥接模式**（不是 NAT），VM 直接拿到 `192.168.10.x`，和 FPGA 同网段。
 - FPGA、PC 都接同一台 OpenWrt 路由器，省掉交叉网线 / 直连网卡的麻烦。
-- FPGA IP 在 `fpga_core.v` 里硬编码：`local_ip = 192.168.10.200`，`gateway_ip = 192.168.10.1`。
+- FPGA IP/MAC 在 `fpga_core_net.v` 里硬编码：`local_ip = 192.168.10.42`、`local_mac = 02:CA:FE:A7:7E:5C`、`gateway_ip = 192.168.10.1`。MAC 第一字节 `0x02` 是 locally-administered 标志（自造、非厂商分配）。
+  > 早期用过 `.200`，但那是局域网里一个旧下线设备复用过的 IP，换成 `.42`（“万物答案”）避免将来撞 IP。
 
 ---
 
@@ -45,6 +46,10 @@ PC (VMware, 桥接网卡, 192.168.10.245) ──WiFi/有线──> OpenWrt 路�
 7. 重新综合烧录后：
    - `ip neigh` 删掉旧表项再 ping → ARP 解析出 `192.168.10.200 lladdr 02:00:00:00:00:00 REACHABLE`，**FPGA 回了 ARP，TX 通了 ✅**
    - `echo HELLO | nc -u 192.168.10.200 1234` → **原样回显，UDP 双向环回打通 ✅**
+
+> 注：上面时间线里的 `192.168.10.200` / `02:00:00:00:00:00` 是当时调试用的旧地址。
+> 后来发现 `.200` 是局域网里一个旧设备复用过的 IP，已改成 `.42` +
+> MAC `02:CA:FE:A7:7E:5C`（见前文「网络拓扑」与文末「文件清单」）。
 
 ---
 
@@ -93,8 +98,8 @@ LED0 立刻从「快闪（CRC bad）」变「慢闪（CRC good）」。
 | 验证项 | 方法 | 状态 |
 |--------|------|------|
 | RGMII RX 物理层 | LED0 慢闪 = 收到 CRC-good 帧 | ✅ |
-| RGMII TX 物理层 | `ip neigh` 看到 FPGA 回的 ARP（`02:00:00:00:00:00 REACHABLE`） | ✅ |
-| 协议栈 RX→TX 全链路 | `nc -u 192.168.10.200 1234` 发 UDP，原样回显 | ✅ 5/5 |
+| RGMII TX 物理层 | `ip neigh` 看到 FPGA 回的 ARP（`02:CA:FE:A7:7E:5C REACHABLE`） | ✅ |
+| 协议栈 RX→TX 全链路 | `nc -u 192.168.10.42 1234` 发 UDP，原样回显 | ✅ 5/5 |
 | 时序收敛 | 综合 WNS=+1.385ns / WHS=+0.058ns，0 DRC error | ✅ |
 
 > verilog-ethernet 的 NexysVideo core **不实现 ICMP echo**，所以 `ping` 不通是正常的（ARP 能解析就证明 TX 通）。真正的端到端验证用 **UDP 1234 端口环回**。
@@ -122,16 +127,17 @@ wire fast = cnt[21];   // ~15 Hz
 
 ```
 syn/artix7/bringup/
+  fpga_core_net.v         verilog-ethernet NexysVideo example core 的本地 fork
+                          （模块改名 fpga_core_net；submodule 保持 pristine）
+    - local_ip = 192.168.10.42 / gateway = 192.168.10.1
+    - local_mac = 02:CA:FE:A7:7E:5C（locally-administered）
+    - USE_CLK90 = "FALSE"（TX 时序修复）
+    - 新增 dbg_rx_good_frame / dbg_rx_bad_fcs / dbg_tx_axis_tvalid 三个 debug 输出
   net_test_top.v          纯网络验证顶层（RX 旁路 IDELAY，LED 频率编码）
   net_test.xdc            RGMII 引脚（全 BANK15）+ 时钟约束
-  run_net_test.tcl        综合→实现→生成 net_test.bit/.mcs
+  run_net_test.tcl        综合→实现→生成 net_test.bit/.mcs（读本地 fpga_core_net.v + submodule 库）
   program_net_test.tcl    JTAG 烧录 net_test.bit
   build/                  构建产物（git ignored）
-
-syn/external/verilog-ethernet/example/NexysVideo/fpga/rtl/fpga_core.v
-  - local_ip = 192.168.10.200 / gateway = 192.168.10.1
-  - USE_CLK90 = "FALSE"（TX 时序修复）
-  - 新增 dbg_rx_good_frame / dbg_rx_bad_fcs / dbg_tx_axis_tvalid 三个 debug 输出
 ```
 
 构建 + 烧录：
@@ -143,10 +149,10 @@ vivado -mode batch -source ../run_net_test.tcl       # 出 net_test.bit
 vivado -mode batch -source ../program_net_test.tcl   # JTAG 烧录
 
 # 验证（VM 桥接到 192.168.10.x 网段）
-ip neigh del 192.168.10.200 dev <iface>
-ping -c1 192.168.10.200                              # 触发 ARP（ping 本身不通是正常的）
-ip neigh show 192.168.10.200                         # 应为 ...02:00:00:00:00:00 REACHABLE
-echo HELLO | nc -u -w2 192.168.10.200 1234           # 应原样回显
+sudo ip neigh flush dev <iface>                      # 清本机 ARP 缓存，避免旧表项误导
+ping -c1 192.168.10.42                               # 触发 ARP（ping 本身不通是正常的）
+ip neigh show 192.168.10.42                          # 应为 ...02:ca:fe:a7:7e:5c REACHABLE
+echo HELLO | nc -u -w2 192.168.10.42 1234            # 应原样回显
 ```
 
 ---

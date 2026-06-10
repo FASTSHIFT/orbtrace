@@ -35,7 +35,7 @@ THE SOFTWARE.
  * core (syn/external/verilog-ethernet/example/NexysVideo/fpga/rtl/fpga_core.v),
  * forked into the A7-Lite bring-up so the submodule stays pristine.
  * A7-Lite-specific changes vs upstream:
- *   - local_ip/gateway_ip set to 192.168.10.200 / .1 (match LAN)
+ *   - local_ip/gateway_ip set to 192.168.10.42 / .1 (match LAN)
  *   - eth_mac_1g_rgmii_fifo USE_CLK90 = "FALSE" (RTL8211E straps TX delay on;
  *     driving TXC 90-deg-shifted on top double-delays -> no TX. See
  *     docs/artix7-port/stage3-bringup/03-rgmii-net-link.md)
@@ -232,8 +232,10 @@ wire tx_fifo_udp_payload_axis_tlast;
 wire tx_fifo_udp_payload_axis_tuser;
 
 // Configuration
-wire [47:0] local_mac   = 48'h02_00_00_00_00_00;
-wire [31:0] local_ip    = {8'd192, 8'd168, 8'd10,  8'd200};
+// MAC is locally-administered (first octet 0x02): CA:FE + A7 nods to the
+// Artix-7. IP .42 is "the answer" and avoids the previously-recycled .200.
+wire [47:0] local_mac   = 48'h02_CA_FE_A7_7E_5C;
+wire [31:0] local_ip    = {8'd192, 8'd168, 8'd10,  8'd42};
 wire [31:0] gateway_ip  = {8'd192, 8'd168, 8'd10,  8'd1};
 wire [31:0] subnet_mask = {8'd255, 8'd255, 8'd255, 8'd0};
 

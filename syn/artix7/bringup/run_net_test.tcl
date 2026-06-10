@@ -68,5 +68,5 @@ write_cfgmem -force -format mcs -interface spix4 -size 16 \
     -loadbit "up 0x0 net_test.bit" -file net_test.mcs
 
 puts "============ NET TEST BUILD DONE ============"
-puts " net_test.bit -> JTAG load; FPGA IP = 192.168.10.200"
-puts " Test: ping 192.168.10.200 ; UDP echo on port 1234"
+puts " net_test.bit -> JTAG load; FPGA IP = 192.168.10.42"
+puts " Test: ping 192.168.10.42 ; UDP echo on port 1234"

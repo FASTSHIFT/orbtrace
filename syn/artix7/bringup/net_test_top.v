@@ -7,7 +7,7 @@
 //
 // fpga_core is the verilog-ethernet NexysVideo example core: it answers ARP,
 // replies to ICMP echo (ping), and loops back UDP on port 1234. FPGA IP is
-// set to 192.168.10.200 (edit fpga_core.v local_ip to match your LAN).
+// set to 192.168.10.42 (edit fpga_core_net.v local_ip to match your LAN).
 //
 // Board: A7-Lite (XC7A35T). 50 MHz osc on J19. RGMII on the on-board ETH
 // (RTL8211E), pins from A7_lite.xdc.
