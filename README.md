@@ -68,6 +68,14 @@ the FTDI MPSSE endpoint); both are written up in
 **[`docs/artix7-port/stage3-bringup/01-board-bringup-troubleshooting.md`](docs/artix7-port/stage3-bringup/01-board-bringup-troubleshooting.md)**.
 Bring-up sources live in [`syn/artix7/bringup/`](syn/artix7/bringup/).
 
+**Target self-test:** the STM32F429 (DISC1) ETM → TPIU → 4-bit parallel
+trace port has been enabled over ST-Link/OpenOCD and verified on a scope
+(TRACECLK + TRACED0..3 carry data) — so the "does the target emit trace?"
+question is settled before wiring it to the FPGA. The exact register
+sequence and the gotchas (GPIO must be hand-muxed to AF0; ETM must be
+enabled, not just the TPIU) are in
+**[`docs/artix7-port/stage3-bringup/02-stm32-etm-enable.md`](docs/artix7-port/stage3-bringup/02-stm32-etm-enable.md)**.
+
 Full plan and evidence: **[`docs/artix7-port/`](docs/artix7-port/)**
 (see [`PLAN.md`](docs/artix7-port/PLAN.md), [`PLAN_STAGE2.md`](docs/artix7-port/PLAN_STAGE2.md),
 the `proposals/` and `reviews/` directories).
@@ -226,6 +234,12 @@ PC → JTAG → FPGA 配置链路打通。过程中踩了两个纯环境坑（Li
 抢占 FT232H、VMware EHCI USB 透传打不开 FTDI MPSSE 端点），完整记录见
 **[`docs/artix7-port/stage3-bringup/01-board-bringup-troubleshooting.md`](docs/artix7-port/stage3-bringup/01-board-bringup-troubleshooting.md)**。
 Bring-up 源码在 [`syn/artix7/bringup/`](syn/artix7/bringup/)。
+
+**被测对象自验：** STM32F429（DISC1）的 ETM → TPIU → 4-bit 并行 trace 端口
+已通过 ST-Link/OpenOCD 使能，并用示波器确认（TRACECLK + TRACED0..3 有数据）——
+"被测对象会不会发 trace"这个问题在接 FPGA 之前就已坐实。完整寄存器序列和
+踩坑（GPIO 必须手动切到 AF0 复用；要使能 ETM 而不只是 TPIU）见
+**[`docs/artix7-port/stage3-bringup/02-stm32-etm-enable.md`](docs/artix7-port/stage3-bringup/02-stm32-etm-enable.md)**。
 
 完整计划与证据见 **[`docs/artix7-port/`](docs/artix7-port/)**
 （[`PLAN.md`](docs/artix7-port/PLAN.md)、[`PLAN_STAGE2.md`](docs/artix7-port/PLAN_STAGE2.md)，
