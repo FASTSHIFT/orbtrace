@@ -82,4 +82,28 @@ J-Trace 支持列表有 F429 → ETM 指令 trace 在这芯片**确实能 work**
 - 重抓 16KB 仍 100% idle。
 - ETMCR 复位值 0x411 的 **bit0=1=powerdown**;我们写的值 bit0=0 已清 powerdown,理论上 OK。
 
-**当前最可疑**:ETMTECR1 写不进 = 可能 ETM 的 trace 时钟/电源域没真正给(写 ETMCR 那个域能写、写 TraceEnable 逻辑那个域写不进),或 STM32 还需额外的 trace 时钟使能(RCC/DBGMCU 层)。**下一步该试 OpenOCD 原生 `etm` 驱动**(它知道这类握手),或对照 RM0090 的 DBGMCU trace 时钟章节。**或先走 ITM+DWT 路线把 PC 侧解码链路验通**(不依赖 ETM TraceEnable)。
+## 第三轮:OpenOCD 原生 etm 驱动 —— 此路不通(已坐实原因)
+
+试了 OpenOCD 的原生 `etm` 命令,结论:**在 ST-Link 上用不了**。
+- 我们走的是 ST-Link 的 **HLA 传输**(`hla_swd`)。HLA(high-level adapter)隐藏了底层 JTAG/SWD,**不暴露 OpenOCD 的 `etm`/`trace` 基础设施**(`help etm` 返回空、`etm` 命令未注册)。
+- 而且 OpenOCD 原生 `etm` 是为驱动 **ETB(片上 trace buffer)或外部 trace 采集设备**设计的,跟我们"ETM→TPIU 引脚→FPGA"这条并行 trace 路径不对口——就算能用也只是换个方式写同样的寄存器。
+
+## 关键状态复盘(全实测)
+配置寄存器现在全部正确,但 ETM 就是不发指令 trace:
+
+| 项 | 值 | 判断 |
+|----|-----|------|
+| ETMCR | 0x980 | powerdown 已清、已使能 ✓ |
+| ETMTEEVR | 0x6f | trace always ✓ |
+| ETMTECR1 | 0 | bit25=0,纯靠 TEEVR(无比较器,正确)✓ |
+| DEMCR | 0x01000000 | TRCENA ✓ |
+| DBGMCU | 0xe7 | trace IO + 4-bit ✓ |
+| TPIU SPPR/CSPSR/FFCR | 0 / 8 / 0x102 | 并行/4-bit/formatter on ✓ |
+| **ETMSR** | **0** | **bit2 trace-active = 0,trace 没真正跑** |
+| 抓 16KB | 100% idle | TPIU 只发 `0x7fff` |
+
+**ETMSR bit2=0** 是核心矛盾:所有使能位都对,但 ETM 报告"没在 trace"。说明卡点在寄存器层之下——疑似 trace 时钟/电源域门控,或 ETM→ATB→TPIU 的连接/时钟前提没满足(HLA 下还无法用 OpenOCD trace 子系统去深查)。
+
+## 建议下一步(换路线,别再死磕 ETM 寄存器)
+1. **ITM + DWT PC 采样**(最务实):ITM/DWT 不依赖 ETM TraceEnable,DWT 周期采 PC + ITM 输出,走同样的 TPIU 4-bit 并行口出来。FPGA 采样链、抓取、Orbuculum 全不用变,只换 STM32 侧配置(`gdbinit-jlink` 那套 DWT/ITM 寄存器)。能验通"真实数据→Orbuculum→`orbtop` 出函数热度",**坐实整条 PC 侧符号还原链路**。这不是完整指令流,但是当前能拿到的最高价值结果。
+2. 若坚持 ETM 完整指令流:需要换**全 JTAG/SWD 传输 + 支持 trace 的调试器**(如 J-Link/ULINKpro),或对照 Keil "Enable 4-Pin Trace (ETM) on STM32F4xx" 官方流程逐项核(它是 vendor 验证过的),重点查我们寄存器都对了之后仍 ETMSR bit2=0 的那个隐藏前提。
