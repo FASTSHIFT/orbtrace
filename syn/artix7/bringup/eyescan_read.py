@@ -46,21 +46,28 @@ def render(t: bytes):
     best = t[128] & 0x1F
     eye_found = (t[129] >> 7) & 1
 
-    print("\n     tap | good  bad | status")
+    # An aligned tap yields a HIGH, stable frame count; a misaligned tap may
+    # still fluke an occasional sync lock (low count). So "open" = frame
+    # count above a fraction of the peak, not merely >0.
+    peak = max(good) if good else 0
+    thresh = max(8, peak // 2)
+
+    print(f"\n     tap | good  bad | status   (peak={peak}, open>={thresh})")
     print("    -----+-----------+----------------------")
     eye = []
     for tap in range(N_TAPS):
         g, b = good[tap], bad[tap]
-        if g > 0 and b == 0:
-            status = "OPEN  (frames decode clean)"
+        if b > 0:
+            status = "marginal (bad frames)"
+        elif g >= thresh:
+            status = "OPEN"
             eye.append(tap)
-        elif g > 0 and b > 0:
-            status = "marginal (some bad frames)"
-        elif b > 0:
-            status = "sync but all frames bad"
+        elif g > 0:
+            status = f"weak ({g})  (fluke sync, not aligned)"
         else:
-            status = "no sync / no frame"
-        print(f"     {tap:3d} | {g:4d} {b:4d} | {status}")
+            status = "no sync"
+        bar = "#" * min(40, g * 40 // peak) if peak else ""
+        print(f"     {tap:3d} | {g:5d} {b:3d} | {status:18s} {bar}")
 
     print(f"\n  FPGA best_tap = {best}   eye_found = {eye_found}")
     actual = t[132:148]

@@ -20,7 +20,9 @@
 
 `default_nettype none
 
-module eyescan_top (
+module eyescan_top #(
+    parameter EXT_SRC = 0    // 0 = self-loopback pattern; 1 = external STM32 trace
+) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
 
@@ -139,7 +141,7 @@ module eyescan_top (
     wire       scan_done, eye_found;
     wire [4:0] best_tap;
 
-    trace_eyescan #(.WIN_BITS(18)) u_eye (
+    trace_eyescan #(.WIN_BITS(18), .EXT_SRC(EXT_SRC)) u_eye (
         .rst           (sys_rst),
         .clk_tx        (clk100),
         .txclk_out     (txclk_pat),

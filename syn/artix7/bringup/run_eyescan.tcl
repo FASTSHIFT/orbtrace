@@ -62,7 +62,11 @@ foreach s {
 
 read_xdc $bdir/eyescan.xdc
 
-synth_design -top eyescan_top -part $part
+# EXT_SRC: 0 = self-loopback pattern (V1), 1 = external STM32 trace (V2).
+set extsrc 0
+if {[info exists ::env(EXT_SRC)]} { set extsrc $::env(EXT_SRC) }
+puts "============ EXT_SRC = $extsrc ============"
+synth_design -top eyescan_top -part $part -generic EXT_SRC=$extsrc
 opt_design
 place_design
 route_design

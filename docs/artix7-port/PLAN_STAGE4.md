@@ -105,11 +105,15 @@ graph TD
 - [x] **实测通过**：tap 18-31 共 14 个 tap 干净开眼，best_tap=24，traceIF 解出 `1234…0f` 逐字节正确。
 - **关键产出**：① 判据必须用 orbtrace 的 traceIF（sync 锁定 + isREsync 自动处理上升/下降沿），别自造 bit 校验器；② **源同步采样时钟必须用 BUFR_IO 而非 BUFG**（上板坐实 HG-2）；③ 诊断纪律：iverilog 仿真先定位「逻辑对、是物理相位问题」再上板。详见 `stage4-datapath/03-v1-eyescan-loopback.md`
 
-### V2 · 接真实 STM32 ETM（低速）
-- **输入**：STM32 ETM 配**低 trace_clk**，跑可控执行流（如空 while 里 toggle 变量）。
-- **出口**：TPIUDemux 解出的 payload 走 UDP；`trace_lost_cnt`（stage2 已规划，对标 Orbuculum `Monitor.lost`）一起带出。
-- **判据**：① sync 建立稳定（isREsync 稳）② lost_cnt == 0 ③ PC 拿到的 ITM 包对得上已知程序行为。
-- **前置**：V0/V1 必须先绿（这一阶第一次有真实不可控输入）。
+### V2 · 接真实 STM32 ETM（低速）✅（采样+解帧部分）
+- **输入**：STM32 ETM 配低 trace_clk（TPIU /16 prescale），跑真实指令流。
+- **判据（EXT_SRC 模式）**：内容每帧变，改判「每 tap traceIF 锁 sync 吐出的帧数」，高且稳=相位对。
+- [x] 拆自环、STM32 PE2-6 → FPGA trace 输入脚 + 共地；`etm_enable.cfg` 打开 ETM
+- [x] eyescan 加 `EXT_SRC` 参数（不驱动 pattern、任何解出帧都计数）
+- [x] **实测通过**：眼心 tap 27-29 簇、best_tap=28 稳定复现；解出帧内容随执行流变化（真实 trace 指纹）；眼心信噪比 ~200×。详见 `stage4-datapath/05-v2-stm32-trace.md`
+- **诚实观察**：V2 眼图不连续（数据稀疏 + 固定窗口的拍频假象），tap 27-29 簇最可信；待收尾改「定帧数计时」消除涨落。
+- [ ] 把 traceIF 帧接进 TPIU demux→OrbFlow→UDP 送 PC（V2 收尾 / 接 V3）
+- [ ] lost_cnt 暴露
 - [ ] traceIF 采样前端接真实 trace 引脚（V1 的 tap 落地）
 - [ ] trace_lost_cnt 接入 OrbFlow 并从 UDP 暴露
 - [ ] 低速端到端解出可控 payload

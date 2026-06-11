@@ -30,7 +30,11 @@
 
 module trace_eyescan #(
     parameter WIN_BITS = 18,                  // frames-counting window per tap
-    parameter [127:0] GOLDEN = 128'h123402030405060708090a0b0c0d0e0f
+    parameter [127:0] GOLDEN = 128'h123402030405060708090a0b0c0d0e0f,
+    parameter EXT_SRC = 0                     // 1 = external source (STM32):
+                                              //   don't drive txd_out, and
+                                              //   count ANY decoded frame as
+                                              //   good (real trace varies)
 ) (
     input  wire        rst,
 
@@ -100,23 +104,31 @@ module trace_eyescan #(
                 .D1(1'b1), .D2(1'b0), .R(1'b0), .S(1'b0));
 
     // 4 data lanes: lane i carries byte bit i (rising/D1) and bit 4+i (falling/D2)
+    // In EXT_SRC mode the FPGA must NOT drive the pattern (STM32 drives the
+    // trace pins), so the ODDRs emit 0 — but note txd_out are SEPARATE pins
+    // from trace_data_in here, used only for loopback self-test.
     genvar i;
     generate
         for (i = 0; i < 4; i = i + 1) begin : g_txd
             ODDR #(.DDR_CLK_EDGE("SAME_EDGE"), .SRTYPE("ASYNC"))
             u_oddr_d (.Q(txd_out[i]), .C(clk_tx), .CE(1'b1),
-                      .D1(pat_byte[i]), .D2(pat_byte[4+i]), .R(1'b0), .S(1'b0));
+                      .D1(EXT_SRC ? 1'b0 : pat_byte[i]),
+                      .D2(EXT_SRC ? 1'b0 : pat_byte[4+i]), .R(1'b0), .S(1'b0));
         end
     endgenerate
 
     // ==================================================================
     // Frame validity (trace_clk): detect FrAvail toggle, compare Frame.
+    // Loopback mode: good = frame equals the known GOLDEN.
+    // EXT_SRC mode (STM32): content is unpredictable, so ANY decoded frame
+    // counts as good — the metric becomes "how many frames did traceIF lock
+    // and emit at this tap"; phase-correct taps yield a high, stable count.
     // ==================================================================
     reg fr_q;
     wire frame_strobe = fr_avail ^ fr_q;
     always @(posedge trace_clk) fr_q <= fr_avail;
-    wire frame_good = frame_strobe & (frame == GOLDEN);
-    wire frame_bad  = frame_strobe & (frame != GOLDEN);
+    wire frame_good = EXT_SRC ? frame_strobe : (frame_strobe & (frame == GOLDEN));
+    wire frame_bad  = EXT_SRC ? 1'b0         : (frame_strobe & (frame != GOLDEN));
 
     // ==================================================================
     // Scan FSM (trace_clk): per tap, load, settle, count good/bad frames
