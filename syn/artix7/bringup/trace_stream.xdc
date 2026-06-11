@@ -19,6 +19,11 @@ set_property IOSTANDARD LVCMOS33 [get_ports trace_clk_in]
 set_property IOSTANDARD LVCMOS33 [get_ports {trace_data_in[*]}]
 # STM32 TPIU /16 prescale -> trace_clk is low; 10ns period is a safe upper bound
 create_clock -period 10.000 -name trace_clk_in [get_ports trace_clk_in]
+# trace_clk_in (D17) feeds a BUFIO/BUFR (BUFR_IO mode in trace_capture_a7).
+# D17 is not in the BUFR's clock region for all placements; allow the
+# dedicated-route demotion (trace_clk is slow /16, so the sub-optimal route
+# is fine here).
+set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -hierarchical -filter {NAME =~ *trace_clk_ibuf*}]
 
 # RGMII (RTL8211E), BANK 15
 set_property PACKAGE_PIN K18 [get_ports phy_rx_clk]

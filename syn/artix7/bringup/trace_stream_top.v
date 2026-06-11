@@ -19,7 +19,9 @@
 
 module trace_stream_top #(
     parameter [4:0] TAP   = 5'd28,    // V2 eye centre
-    parameter       DEPTH = 16384     // captured bytes (16 KB)
+    parameter       DEPTH = 61440     // captured bytes (60 KB = 3840 frames);
+                                      // keep < 65536 so 16-bit ext_addr also
+                                      // reaches the status bytes at DEPTH..+2
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -105,12 +107,16 @@ module trace_stream_top #(
         .traceDina(trace_a), .traceDinb(trace_b), .traceClkin(trace_clk),
         .width(2'b11), .edgeOutput(), .FrAvail(fr_avail), .Frame(frame)
     );
-    reg fr_q;
-    wire frame_strobe = fr_avail ^ fr_q;
-    always @(posedge trace_clk or posedge sys_rst) begin
-        if (sys_rst) fr_q <= 1'b0;
-        else         fr_q <= fr_avail;
+    // Isolate FrAvail (which has an async reset in traceIF) from the BRAM
+    // write-enable path with a reset-less flop, then form the toggle strobe
+    // from reset-less flops only. This keeps the BRAM ENARDEN off any
+    // async-reset register (clears DRC REQP-1840).
+    reg fr_iso, fr_q;
+    always @(posedge trace_clk) begin
+        fr_iso <= fr_avail;     // reset-less isolation
+        fr_q   <= fr_iso;
     end
+    wire frame_strobe = fr_iso ^ fr_q;
 
     // one-shot capture: store whole 128-bit frames (one BRAM write per
     // decoded frame, race-free). Serialize to bytes at UDP readout.
@@ -124,9 +130,13 @@ module trace_stream_top #(
     always @(posedge trace_clk) begin
         if (wr_en) capmem[wr_ptr[FAW-1:0]] <= frame;
     end
-    always @(posedge trace_clk or posedge sys_rst) begin
-        if (sys_rst) wr_ptr <= 0;
-        else if (wr_en) wr_ptr <= wr_ptr + 1'b1;
+    // wr_ptr uses SYNCHRONOUS reset: it drives the BRAM write address, and an
+    // async reset on that path triggers DRC REQP-1839 (possible RAM
+    // corruption). sys_rst is already a synchronized signal in trace_clk's
+    // sibling domains, so a sync reset here is safe and clean.
+    always @(posedge trace_clk) begin
+        if (sys_rst)      wr_ptr <= 0;
+        else if (wr_en)   wr_ptr <= wr_ptr + 1'b1;
     end
 
     // UDP readout: ext_addr is a byte address. frame = ext_addr>>4, byte =
