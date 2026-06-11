@@ -165,3 +165,29 @@ orbuculum 解不出、TPIU 解帧打散到几十个 tag(`No handler for tag 42/1
 2. **FPGA 原样送 nibble 流,PC 用 traceIF 算法解**(已用 Python 验证可行,841 帧)。
 
 然后把帧去掉 TPIU formatter 封装喂 orbuculum/orbmortem 还原 PC 流。
+
+---
+
+## 第六轮:FPGA 改吐 traceIF 帧 + 建非交互 ETM 解码器,定位到"格式/工作负载"层
+
+**FPGA 改动**:`trace_stream_top` 不再吐原始 nibble,改吐 **traceIF 组装好的 16 字节帧**(traceIF 已在 FPGA 验证、字节对齐、去了 TPIU 同步)。capmem 改成 128-bit/帧、一帧一写(race-free),读出口按字节序列化。综合 0 error 上板,抓到 15529/16384 非 idle 字节。
+
+**PC 解码工具**:写了非交互 `etmdecode.c`(链 orbuculum traceDecoder 库),能 pump 文件出 ADDR/ATOM 事件。
+
+**实测与卡点(诚实)**:
+- traceIF 帧喂 orbuculum TPIU demux,仍打散到 tag 106/42/34,stream 2 只占 677 字节——**字节对齐了但 TPIU demux 仍不收敛到单流**。
+- 把原始 nibble 流各种变换(swap/rev/相位)直接喂 etmdecode 当 raw ETM3.5:`syncCount=0`,从不锁 A-sync;地址解出来像 `0x20b180fc`(RAM 段)而非 `0x080xxxxx`(flash),且全 16KB 只找到 **2 个 A-sync、8 处 triple-zero**。
+
+**关键判断**:A-sync/同步结构太稀疏(16KB 才几处),加上 TPIU demux 不收敛,指向两个可能的深层问题(超出字节序范畴):
+1. **STM32 TPIU 是否真处于 formatter 模式**:`FFCR=0x102` 的位定义需对照 RM0090 复核;单一 trace 源(仅 ETM 无 ITM)时 STM32 可能 bypass formatter,那样应按 raw ETM 解(但 raw 又锁不上 A-sync)。
+2. **工作负载太"安静"**:LVGL 程序若多在紧循环,ETM 分支包极少,16KB 窗口大部分是开销/同步,真正可解的指令流密度低。
+
+**已确凿(不被上面动摇)**:
+- 物理链路 + 采样健康(traceIF 121 syncs / 841 帧;V1 14-tap 眼)。
+- trace 里有真实执行 PC(代码地址扫描命中 `lv_draw_sw_blend_basic` 等真函数)。
+- 解码工具链就绪(orbuculum + etmdecode 编译可用,proj_new.axf 符号可加载)。
+
+**下一步(需方法论而非穷举字节序)**:
+1. 对照 **RM0090 §38(DBGMCU/TPIU)** 确认 formatter 模式与单源 ETM 的输出格式;用 `FFCR` 正确位重配。
+2. 跑一个**已知、繁忙**的工作负载(大循环调多个函数),增大可解指令流密度,再抓。
+3. 或先用 **J-Link + SEGGER STM32F429 样例工程**(r13)做一次 official 4-pin ETM,拿到一份**确定正确**的参考 trace 字节流,跟我们 FPGA 抓的逐字节对比,直接定位格式差异。

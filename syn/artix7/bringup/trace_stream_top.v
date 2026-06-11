@@ -94,51 +94,53 @@ module trace_stream_top #(
         .idelayctrl_rdy(idelayctrl_rdy)
     );
 
-    // raw byte stream = {trace_b, trace_a} per trace_clk (the TPIU bytes)
-    wire [7:0] raw_byte = {trace_b, trace_a};
-
-    // traceIF only used as a link-health gate: start capturing once sync seen
+    // traceIF assembles byte-aligned 16-byte TPIU frames (drops 0x7fff idle,
+    // resolves sync) — exactly what orbuculum's TPIU demux expects. We dump
+    // these frames, NOT raw nibbles, so the PC gets a clean byte-aligned
+    // stream regardless of DDR nibble phase.
     wire        fr_avail;
-    wire [127:0] frame_unused;
+    wire [127:0] frame;
     traceIF #(.MAXBUSWIDTH(4)) u_traceif (
         .rst(sys_rst | ~idelayctrl_rdy),
         .traceDina(trace_a), .traceDinb(trace_b), .traceClkin(trace_clk),
-        .width(2'b11), .edgeOutput(), .FrAvail(fr_avail), .Frame(frame_unused)
+        .width(2'b11), .edgeOutput(), .FrAvail(fr_avail), .Frame(frame)
     );
-    reg fr_q, sync_seen;
+    reg fr_q;
+    wire frame_strobe = fr_avail ^ fr_q;
     always @(posedge trace_clk or posedge sys_rst) begin
-        if (sys_rst) begin fr_q <= 0; sync_seen <= 0; end
-        else begin
-            fr_q <= fr_avail;
-            if (fr_avail ^ fr_q) sync_seen <= 1'b1;   // a frame decoded => synced
-        end
+        if (sys_rst) fr_q <= 1'b0;
+        else         fr_q <= fr_avail;
     end
 
-    // one-shot capture BRAM (trace_clk write, clk125 read). Clean simple-
-    // dual-port pattern (no reset on the array) so it infers as block RAM.
-    localparam AW = $clog2(DEPTH);
+    // one-shot capture: store whole 128-bit frames (one BRAM write per
+    // decoded frame, race-free). Serialize to bytes at UDP readout.
+    localparam NFR = DEPTH/16;        // number of frames
+    localparam FAW = $clog2(NFR);
     (* ram_style = "block" *)
-    reg [7:0] capmem [0:DEPTH-1];
-    reg [AW:0] wr_ptr;          // extra bit to detect full
-    wire full = wr_ptr[AW];
-    wire wr_en = sync_seen && !full;
+    reg [127:0] capmem [0:NFR-1];
+    reg [FAW:0] wr_ptr;               // extra bit = full
+    wire full = wr_ptr[FAW];
+    wire wr_en = frame_strobe && !full;
     always @(posedge trace_clk) begin
-        if (wr_en) capmem[wr_ptr[AW-1:0]] <= raw_byte;
+        if (wr_en) capmem[wr_ptr[FAW-1:0]] <= frame;
     end
     always @(posedge trace_clk or posedge sys_rst) begin
         if (sys_rst) wr_ptr <= 0;
         else if (wr_en) wr_ptr <= wr_ptr + 1'b1;
     end
 
-    // UDP readout: ext_addr (16-bit) indexes capmem; beyond DEPTH return
-    // status (DEPTH and full flag) so the PC knows size/ready.
+    // UDP readout: ext_addr is a byte address. frame = ext_addr>>4, byte =
+    // ext_addr[3:0]. Serialize MSB-first to match how traceIF packs Frame.
     wire [15:0] ext_addr;
-    reg  [7:0]  cap_rd;
-    always @(posedge clk125) cap_rd <= capmem[ext_addr[AW-1:0]];
-    wire [7:0] ext_data = (ext_addr < DEPTH) ? cap_rd :
-                          (ext_addr == DEPTH+0) ? DEPTH[7:0] :
-                          (ext_addr == DEPTH+1) ? DEPTH[15:8] :
-                          (ext_addr == DEPTH+2) ? {7'b0, full} : 8'h00;
+    reg  [127:0] frd;
+    always @(posedge clk125) frd <= capmem[ext_addr[FAW+3:4]];
+    wire [3:0] bsel = ext_addr[3:0];
+    wire [7:0] cap_byte = frd[8*(15 - bsel) +: 8];
+    localparam [15:0] NB = DEPTH;     // captured byte count = NFR*16
+    wire [7:0] ext_data = (ext_addr < NB)        ? cap_byte :
+                          (ext_addr == NB+0)     ? NB[7:0] :
+                          (ext_addr == NB+1)     ? NB[15:8] :
+                          (ext_addr == NB+2)     ? {7'b0, full} : 8'h00;
 
     fpga_core_net #(.TARGET("XILINX")) u_eth (
         .clk(clk125), .clk90(clk125_90), .rst(sys_rst),
