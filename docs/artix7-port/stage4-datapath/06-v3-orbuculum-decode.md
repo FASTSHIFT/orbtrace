@@ -107,3 +107,33 @@ J-Trace 支持列表有 F429 → ETM 指令 trace 在这芯片**确实能 work**
 ## 建议下一步(换路线,别再死磕 ETM 寄存器)
 1. **ITM + DWT PC 采样**(最务实):ITM/DWT 不依赖 ETM TraceEnable,DWT 周期采 PC + ITM 输出,走同样的 TPIU 4-bit 并行口出来。FPGA 采样链、抓取、Orbuculum 全不用变,只换 STM32 侧配置(`gdbinit-jlink` 那套 DWT/ITM 寄存器)。能验通"真实数据→Orbuculum→`orbtop` 出函数热度",**坐实整条 PC 侧符号还原链路**。这不是完整指令流,但是当前能拿到的最高价值结果。
 2. 若坚持 ETM 完整指令流:需要换**全 JTAG/SWD 传输 + 支持 trace 的调试器**(如 J-Link/ULINKpro),或对照 Keil "Enable 4-Pin Trace (ETM) on STM32F4xx" 官方流程逐项核(它是 vendor 验证过的),重点查我们寄存器都对了之后仍 ETMSR bit2=0 的那个隐藏前提。
+
+---
+
+## ★ 真根因(第四轮,坐实):不是 ETM,是 FPGA capture 冻结在上电快照(蓝方自己的 bug)
+
+去 WFI 固件 + 红方 r12 的 bisection 一起把真相逼出来了,但真正的根因**红方和蓝方都没料到**:
+
+**`trace_stream_top` 的 capture 是 one-shot**:`sync_seen` 一旦在 FPGA 烧录后第一次锁到 sync 就永久置位,16KB 填满即冻结。而每次都是"先烧 FPGA、再配 STM32 trace 源"——所以 capture 抓的永远是**上电那一刻的 TPIU idle 快照**,STM32 之后发的真实 trace 根本没进 buffer。每次 dump 读到的都是同一份冻结的旧 idle,于是 ETM-on/off/DWT-on 看起来"一模一样全 idle"。**那些"配置全对却 idle"全是 capture 时序假象。**
+
+**正确时序:先配 STM32 trace 源,再(重)烧 FPGA 让 capture 重新 arm。** 按此顺序实测:
+
+| 实验(先配源,后 re-arm FPGA) | 非 idle 字节 | 结论 |
+|------|------|------|
+| DWT/ITM PC 采样 | **16361 / 16384** | TPIU→引脚→采样→抓取**整条链路健康** |
+| **ETM 指令 trace** | **16130 / 16384** | **ETM 一直在工作!** |
+
+- DWT 流样本:`08 08 8d 86 88 ca 88 18 00 33 ff f7 ff f7 ff 57 c5 08 ...`
+- ETM 流样本:`45 45 c9 ce 2d ff 57 0d 89 8a 03 00 19 00 06 40 53 05 89 56 ...`（含大量 ETM 包 + TPIU 同步 `ff 57`/`ff f7`）
+
+**WFI 去掉、ETM 寄存器(ETMCR=0x980 / TEEVR=0x6f / TECR1=0)其实早就配对了。** 之前所有"卡点在寄存器层之下""ETMSR bit2=0 是谜"的判断都被这个 capture bug 污染了——ETMSR bit2=0 只是 halt 态测量假象(r12 §1 已提示这个陷阱),运行态 ETM 一直正常。
+
+### 教训
+- r12 的逻辑收敛(TPIU 发 idle ⇒ 链路健康)本身没错,但**双方都默认"capture 抓的是当前数据"——恰是这个没被验证的前提错了**,正中 r12 自己警告的"被默认成立、从未独立验证的前提"。
+- one-shot capture 调试必须确认**触发时刻 vs 数据产生时刻**的先后。
+
+### 待修(FPGA)
+- capture 改成**可重复触发**:加 UDP re-arm 命令,或持续滚动 capture(ring + 连续推流),不必每次重烧 FPGA。
+
+## 下一步:真解码
+数据已是真实 ETM TPIU 流。喂 Orbuculum `orbmortem -e proj.axf -P ETM3.5` 还原 PC/函数流(orbmortem 是 ncurses 交互工具,建议有人在场跑)。
