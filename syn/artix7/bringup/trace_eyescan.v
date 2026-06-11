@@ -84,16 +84,20 @@ module trace_eyescan #(
     // Checker (trace_clk). rx_byte must equal prev+1; attribute per lane.
     // ==================================================================
     wire [7:0] rx_byte = {trace_b, trace_a};
-    reg  [7:0] rx_prev;
     reg        primed;
-    wire [7:0] pred = rx_prev + 8'd1;
 
-    // per-lane mismatch this cycle (lane i owns bit i and bit 4+i)
+    // Fully-registered checker (removes any combinational skew between the
+    // sample and its predecessor): capture rx_byte into two pipeline stages
+    // and compare stage1 == stage2 + 1, attributing mismatches per lane.
+    reg [7:0]  rx_d1, rx_d2;
+    wire [7:0] pred = rx_d2 + 8'd1;
+
+    // per-lane mismatch this cycle (lane i owns bit i (rising) and 4+i (falling))
     wire [3:0] lane_err;
     generate
         for (i = 0; i < 4; i = i + 1) begin : g_chk
             assign lane_err[i] = primed &
-                ((trace_a[i] ^ pred[i]) | (trace_b[i] ^ pred[4+i]));
+                ((rx_d1[i] ^ pred[i]) | (rx_d1[4+i] ^ pred[4+i]));
         end
     endgenerate
 
@@ -103,11 +107,32 @@ module trace_eyescan #(
     integer L;
     always @(posedge trace_clk) begin
         if (rst) begin
-            primed  <= 1'b0;
-            rx_prev <= 8'd0;
+            primed <= 1'b0;
+            rx_d1  <= 8'd0;
+            rx_d2  <= 8'd0;
         end else begin
-            rx_prev <= rx_byte;
-            primed  <= 1'b1;
+            rx_d1 <= rx_byte;
+            rx_d2 <= rx_d1;
+            primed <= 1'b1;
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // Raw-sample capture: after scan_done (IDELAY parked at best_tap),
+    // record 32 CONSECUTIVE rx_byte samples so the PC can SEE what the link
+    // actually delivers (vs guessing). Frozen once full.
+    // ------------------------------------------------------------------
+    reg [7:0] raw_buf [0:31];
+    reg [5:0] raw_idx;       // counts 0..32, stops at 32
+    reg       raw_full;
+    always @(posedge trace_clk) begin
+        if (rst) begin
+            raw_idx  <= 6'd0;
+            raw_full <= 1'b0;
+        end else if (scan_done && !raw_full) begin
+            raw_buf[raw_idx[4:0]] <= rx_byte;
+            if (raw_idx == 6'd31) raw_full <= 1'b1;
+            else                  raw_idx  <= raw_idx + 6'd1;
         end
     end
 
@@ -134,9 +159,29 @@ module trace_eyescan #(
     reg [9:0]  settle;
     reg        clr_cnt;
 
-    // results table: 256 bytes (32 taps * 4 lanes * 2 bytes), simple regs
+    // results table: 128 bytes (32 taps * 4 lanes * 1 byte, error count
+    // saturating at 255) + diagnostics at 128..131:
+    //   128 = live raw rx_byte (last sample)
+    //   129 = per-bit "ever toggled" activity mask over the whole scan
+    //         (bit n set => trace bit n changed at least once)
+    //   130 = best_tap, 131 = {eye_found, scan_done, 6'b0}
     (* ram_style = "distributed" *)
-    reg [7:0] table_mem [0:255];
+    reg [7:0] table_mem [0:131];
+
+    // per-tap sample snapshots (ground truth): snap_d2[t]/snap_d1[t] are two
+    // consecutive sampled bytes captured at tap t during the sweep.
+    reg [7:0] snap_d2 [0:31];
+    reg [7:0] snap_d1 [0:31];
+
+    // diagnostics: activity mask (trace_clk domain)
+    reg [7:0] act_mask;
+    always @(posedge trace_clk) begin
+        if (rst) begin
+            act_mask <= 8'd0;
+        end else if (primed) begin
+            act_mask <= act_mask | (rx_d1 ^ rx_d2); // bits that changed
+        end
+    end
 
     // track best tap = the one with the smallest summed error (prefer 0)
     reg [17:0] best_sum;
@@ -197,15 +242,16 @@ module trace_eyescan #(
                     end
                 end
                 S_STORE: begin
-                    // latch per-lane errors into the table for this tap
-                    table_mem[{cur_tap,3'd0}]        <= err_cnt[0][15:8];
-                    table_mem[{cur_tap,3'd0}|8'd1]   <= err_cnt[0][7:0];
-                    table_mem[{cur_tap,3'd0}|8'd2]   <= err_cnt[1][15:8];
-                    table_mem[{cur_tap,3'd0}|8'd3]   <= err_cnt[1][7:0];
-                    table_mem[{cur_tap,3'd0}|8'd4]   <= err_cnt[2][15:8];
-                    table_mem[{cur_tap,3'd0}|8'd5]   <= err_cnt[2][7:0];
-                    table_mem[{cur_tap,3'd0}|8'd6]   <= err_cnt[3][15:8];
-                    table_mem[{cur_tap,3'd0}|8'd7]   <= err_cnt[3][7:0];
+                    // latch per-lane errors (saturate to 255) into the table
+                    table_mem[{cur_tap,2'd0}]      <= (err_cnt[0]==16'd0) ? 8'd0 : (err_cnt[0][15:8]!=0 ? 8'd255 : err_cnt[0][7:0]);
+                    table_mem[{cur_tap,2'd0}|8'd1] <= (err_cnt[1]==16'd0) ? 8'd0 : (err_cnt[1][15:8]!=0 ? 8'd255 : err_cnt[1][7:0]);
+                    table_mem[{cur_tap,2'd0}|8'd2] <= (err_cnt[2]==16'd0) ? 8'd0 : (err_cnt[2][15:8]!=0 ? 8'd255 : err_cnt[2][7:0]);
+                    table_mem[{cur_tap,2'd0}|8'd3] <= (err_cnt[3]==16'd0) ? 8'd0 : (err_cnt[3][15:8]!=0 ? 8'd255 : err_cnt[3][7:0]);
+                    // per-tap sample snapshot (ground truth): the two pipeline
+                    // bytes at this tap, so the PC can see directly whether the
+                    // sampled data at this tap is a clean +1 ramp.
+                    snap_d2[cur_tap] <= rx_d2;
+                    snap_d1[cur_tap] <= rx_d1;
                     if (cur_sum < best_sum) begin
                         best_sum <= cur_sum;
                         best_tap <= cur_tap;
@@ -223,6 +269,11 @@ module trace_eyescan #(
                 end
                 S_DONE: begin
                     scan_done <= 1'b1;
+                    // diagnostics
+                    table_mem[128] <= rx_byte;
+                    table_mem[129] <= act_mask;
+                    table_mem[130] <= {3'b0, best_tap};
+                    table_mem[131] <= {eye_found, scan_done, 6'b0};
                     // park IDELAY at the best tap so the link is usable
                     tap      <= best_tap;
                     tap_load <= 1'b1;
@@ -244,7 +295,12 @@ module trace_eyescan #(
     // (e.g. loopback jumpers missing so trace_clk is dead and the FSM,
     // clocked by trace_clk, never advances).
     // ------------------------------------------------------------------
-    assign rd_data = scan_done ? table_mem[rd_addr] : 8'hFF;
+    assign rd_data = ~scan_done           ? 8'hFF :
+                     (rd_addr >= 8'd132 && rd_addr <= 8'd163) ? raw_buf[rd_addr - 8'd132] :
+                     (rd_addr >= 8'd164 && rd_addr <= 8'd195) ? snap_d2[rd_addr - 8'd164] :
+                     (rd_addr >= 8'd196 && rd_addr <= 8'd227) ? snap_d1[rd_addr - 8'd196] :
+                     (rd_addr <= 8'd131)  ? table_mem[rd_addr] :
+                                            8'h00;
 
 endmodule
 
