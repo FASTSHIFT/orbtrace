@@ -94,7 +94,18 @@ module fpga_core_net #
      */
     output wire       dbg_rx_good_frame,
     output wire       dbg_rx_bad_fcs,
-    output wire       dbg_tx_axis_tvalid
+    output wire       dbg_tx_axis_tvalid,
+
+    /*
+     * External readout source (Stage-4 V1): when a UDP frame arrives on
+     * port EXT_PORT (5001), the reply payload bytes come from this external
+     * source instead of an echo. ext_addr is the in-frame byte position
+     * (so the PC reads back an addressed table); ext_data is the byte at
+     * that address. Used to stream the eye-scan results table out over UDP.
+     * Tie ext_data=0 if unused.
+     */
+    output wire [7:0] ext_addr,
+    input  wire [7:0] ext_data
 );
 
 // AXI between MAC and Ethernet modules
@@ -269,11 +280,13 @@ assign tx_ip_payload_axis_tuser = 0;
 // back. See docs/artix7-port/PLAN_STAGE4.md (V0).
 // ------------------------------------------------------------------
 wire golden_cond = rx_udp_dest_port == 16'd5000;
-wire match_cond = (rx_udp_dest_port == 16'd1234) || golden_cond;
+wire ext_cond    = rx_udp_dest_port == 16'd5001;
+wire match_cond = (rx_udp_dest_port == 16'd1234) || golden_cond || ext_cond;
 wire no_match = !match_cond;
 
-// latched "this frame targets the golden port", aligned with match_cond_reg
+// latched "this frame targets the golden/ext port", aligned with match_cond_reg
 reg golden_reg = 0;
+reg ext_reg = 0;
 
 // payload byte position within the current frame (counts FIFO-input beats)
 reg [15:0] golden_idx = 0;
@@ -287,6 +300,10 @@ always @(posedge clk) begin
             golden_idx <= golden_idx + 1'b1;
     end
 end
+
+// external readout addressing: present the in-frame byte position so the
+// external source (eye table) can return the addressed byte.
+assign ext_addr = golden_idx[7:0];
 
 // GOLDEN pattern: a 4-byte TPIU full-sync prefix (FF FF FF 7F) ONCE at the
 // start of the frame, then a monotonic ramp 0xC0,0xC1,... that continues
@@ -312,6 +329,7 @@ always @(posedge clk) begin
         match_cond_reg <= 0;
         no_match_reg <= 0;
         golden_reg <= 0;
+        ext_reg <= 0;
     end else begin
         if (rx_udp_payload_axis_tvalid) begin
             if ((!match_cond_reg && !no_match_reg) ||
@@ -319,11 +337,13 @@ always @(posedge clk) begin
                 match_cond_reg <= match_cond;
                 no_match_reg <= no_match;
                 golden_reg <= golden_cond;
+                ext_reg <= ext_cond;
             end
         end else begin
             match_cond_reg <= 0;
             no_match_reg <= 0;
             golden_reg <= 0;
+            ext_reg <= 0;
         end
     end
 end
@@ -346,7 +366,9 @@ assign tx_fifo_udp_payload_axis_tready = tx_udp_payload_axis_tready;
 assign tx_udp_payload_axis_tlast = tx_fifo_udp_payload_axis_tlast;
 assign tx_udp_payload_axis_tuser = tx_fifo_udp_payload_axis_tuser;
 
-assign rx_fifo_udp_payload_axis_tdata = golden_reg ? golden_byte : rx_udp_payload_axis_tdata;
+assign rx_fifo_udp_payload_axis_tdata = ext_reg    ? ext_data :
+                                        golden_reg ? golden_byte :
+                                                     rx_udp_payload_axis_tdata;
 assign rx_fifo_udp_payload_axis_tvalid = rx_udp_payload_axis_tvalid && match_cond_reg;
 assign rx_udp_payload_axis_tready = (rx_fifo_udp_payload_axis_tready && match_cond_reg) || no_match_reg;
 assign rx_fifo_udp_payload_axis_tlast = rx_udp_payload_axis_tlast;

@@ -115,7 +115,9 @@ module net_test_top (
         .uart_txd(),
         .dbg_rx_good_frame(rx_good_frame),
         .dbg_rx_bad_fcs(rx_bad_fcs),
-        .dbg_tx_axis_tvalid(tx_valid)
+        .dbg_tx_axis_tvalid(tx_valid),
+        .ext_addr(),
+        .ext_data(8'h00)
     );
 
     assign phy_mdio = 1'bz;
