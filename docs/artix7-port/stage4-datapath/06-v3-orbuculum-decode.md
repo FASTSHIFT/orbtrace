@@ -137,3 +137,31 @@ J-Trace 支持列表有 F429 → ETM 指令 trace 在这芯片**确实能 work**
 
 ## 下一步:真解码
 数据已是真实 ETM TPIU 流。喂 Orbuculum `orbmortem -e proj.axf -P ETM3.5` 还原 PC/函数流(orbmortem 是 ncurses 交互工具,建议有人在场跑)。
+
+---
+
+## ★★ 第五轮:数据是好的,乱在"PC 端拼字节",不在 SI/速度(离线重放坐实)
+
+orbuculum 解不出、TPIU 解帧打散到几十个 tag(`No handler for tag 42/127`)后,做了关键的**离线分层实验**回答"是 FPGA 软件问题还是杜邦线 SI":
+
+**方法**:把 FPGA 抓到的原始 nibble 流(`/tmp/trace_etm.bin`,每字节 = `{trace_b 高 nibble, trace_a 低 nibble}`)**喂进 traceIF.v 的真实移位算法**(V1/V2 已上板验证过的那套:`construct <= {dinb,dina,construct[35:8]}` + 找 `0x7FFFFFFF` 同步字)。
+
+**结果**:
+- **FE-sync 命中 121 次**(traceIF 稳定锁到 TPIU 同步字)
+- **解出 841 个完整 ETM 帧**,内容是真 ETM 包(`55 a8 6a c4 8c 98 ...`),非 idle
+
+**结论(分层判定)**:
+- 若是杜邦线 SI / 阻抗不匹配 / 超速采样错 → 采样的 nibble 本身就错乱,traceIF **不可能**稳定锁 121 个同步字 + 解出 841 个结构完整帧。
+- traceIF 能干净解出 ⇒ **采样样本正确,物理层 + 速度没问题**。乱的原因是 **PC 端 `trace_dump` 用固定相位 `{trace_b,trace_a}` 拼字节、且没有 TPIU 同步搜索**,与 traceIF 的移位顺序不一致 → 纯软件问题。
+
+**附带回答**:
+- **V1 自环**:跑 100MHz DDR(200Mbps/lane),traceIF 逐字节解对 golden + 14-tap 眼 → FPGA 采样逻辑在 100M 验证过。
+- **STM32 当前 trace 速度**:并行同步口 TRACECLK 直绑 HCLK(~168MHz);`TPIU_ACPR` 仅对 SWO 异步有效。降速需降 HCLK 本身(切 HSI 16M 或调 HPRE),理论可到 MHz 级——但数据已证明好,无需降速。
+- **分离 SI vs 软件的通用手段**:拿验证过的算法离线重放原始采样,不用反复烧板。
+
+### 正确修法
+不在 PC 端瞎拼字节。两条:
+1. **FPGA 直接输出 traceIF 解好的帧**(traceIF 在 FPGA 里已例化),PC 拿到的就是干净 16 字节帧;或
+2. **FPGA 原样送 nibble 流,PC 用 traceIF 算法解**(已用 Python 验证可行,841 帧)。
+
+然后把帧去掉 TPIU formatter 封装喂 orbuculum/orbmortem 还原 PC 流。
