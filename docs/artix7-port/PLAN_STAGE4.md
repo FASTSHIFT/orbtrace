@@ -96,14 +96,14 @@ graph TD
 - [x] PC 端收包比对脚本（golden 对拍，`v0_golden_check.py`）
 - [x] **实测通过**：len 8/32/64/100/128/200，128B×500 迭代 0 mismatch / 0 lost；过程中 V0 抓到一个真实位置计数 bug（sync 前缀每 32B 重复）并修复。详见 `stage4-datapath/01-v0-golden-egress.md`
 
-### V1 · 物理采样回环（自发自收，验时序不验内容）
-- **输入**：不依赖 STM32——FPGA 自己用 IO 发已知 pattern 绕板一圈接回 trace 输入引脚（或用 STM32 GPIO toggle 已知慢速方波，配置已会）。
-- **出口**：traceIF 解出的 word + **bad-sync 计数器**从 UDP 读出。
-- **判据**：扫 IDELAY tap 0–31 × 4 lane，每点测「解出 == 已知 pattern」正确率，画眼图，找眼心，定最佳 tap。
-- **目的**：把 deskew 方案（`proposals/12`）落地第一步，产出最佳 tap。**这是真命门的第一次正面接触**，低速先做。
-- [ ] IDELAYE2 + tap 写入通道（VIO 或 UDP→CSR）
-- [ ] PC 端眼图扫描脚本（tap × 正确率）
-- [ ] 产出每 lane 眼心 tap
+### V1 · 物理采样回环（自发自收，验时序不验内容）✅
+- **输入**：不依赖 STM32——FPGA 自己发已知 TPIU 帧 pattern，板上跳线绕回 trace 输入引脚（GPIO1 内部回环）。
+- **判据（对齐 orbtrace）**：环回数据喂上游 `traceIF.v`，扫 IDELAY tap 0–31，看每 tap 「traceIF 解出的帧 == golden 且无坏帧」，找眼心。
+- **目的**：把 deskew 方案（`proposals/12`）落地第一步，产出最佳 tap。真命门的第一次正面接触。
+- [x] IDELAYE2 + tap 写入通道（trace_eyescan FSM 扫 tap）
+- [x] PC 端眼图读出脚本（`eyescan_read.py`，UDP :5001）
+- [x] **实测通过**：tap 18-31 共 14 个 tap 干净开眼，best_tap=24，traceIF 解出 `1234…0f` 逐字节正确。
+- **关键产出**：① 判据必须用 orbtrace 的 traceIF（sync 锁定 + isREsync 自动处理上升/下降沿），别自造 bit 校验器；② **源同步采样时钟必须用 BUFR_IO 而非 BUFG**（上板坐实 HG-2）；③ 诊断纪律：iverilog 仿真先定位「逻辑对、是物理相位问题」再上板。详见 `stage4-datapath/03-v1-eyescan-loopback.md`
 
 ### V2 · 接真实 STM32 ETM（低速）
 - **输入**：STM32 ETM 配**低 trace_clk**，跑可控执行流（如空 while 里 toggle 变量）。

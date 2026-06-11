@@ -96,7 +96,7 @@ module eyescan_top (
     wire [4:0]  tap;
     wire        tap_load;
 
-    trace_capture_a7 #(.CLK_BUF("BUFG")) u_capture (
+    trace_capture_a7 #(.CLK_BUF("BUFR_IO")) u_capture (
         .rst           (sys_rst),
         .ref_200m      (clk200),
         .trace_clk_p   (trace_clk_in),
@@ -113,24 +113,43 @@ module eyescan_top (
     );
 
     // ------------------------------------------------------------------
-    // Eye-scan engine: pattern gen + checker + tap sweep + results table.
+    // traceIF (UPSTREAM, sim-proven): locks the 0x7FFF_FFFF sync word and
+    // emits decoded 128-bit frames. This is the validity judge for the
+    // eye-scan, replacing the home-grown bit checker.
+    // ------------------------------------------------------------------
+    wire         fr_avail;
+    wire [127:0] frame;
+    traceIF #(.MAXBUSWIDTH(4)) u_traceif (
+        .rst        (sys_rst | ~idelayctrl_rdy),
+        .traceDina  (trace_a),
+        .traceDinb  (trace_b),
+        .traceClkin (trace_clk),
+        .width      (2'b11),       // 4-bit
+        .edgeOutput (),
+        .FrAvail    (fr_avail),
+        .Frame      (frame)
+    );
+
+    // ------------------------------------------------------------------
+    // Eye-scan engine: pattern gen + tap sweep + per-tap frame tally,
+    // judged from traceIF's FrAvail/Frame.
     // ------------------------------------------------------------------
     wire [7:0] ext_addr;
     wire [7:0] ext_data;
     wire       scan_done, eye_found;
     wire [4:0] best_tap;
 
-    trace_eyescan #(.WIN_BITS(20)) u_eye (
+    trace_eyescan #(.WIN_BITS(18)) u_eye (
         .rst           (sys_rst),
         .clk_tx        (clk100),
         .txclk_out     (txclk_pat),
         .txd_out       (txd_pat),
-        .trace_clk     (trace_clk),
-        .trace_a       (trace_a),
-        .trace_b       (trace_b),
-        .idelayctrl_rdy(idelayctrl_rdy),
         .tap           (tap),
         .tap_load      (tap_load),
+        .idelayctrl_rdy(idelayctrl_rdy),
+        .trace_clk     (trace_clk),
+        .fr_avail      (fr_avail),
+        .frame         (frame),
         .rd_addr       (ext_addr),
         .rd_data       (ext_data),
         .scan_done     (scan_done),

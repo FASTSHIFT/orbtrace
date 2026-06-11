@@ -12,6 +12,9 @@ set rtl       $repo_root/syn/artix7/rtl
 # Stage-2 capture front-end (IDELAYE2 + IDDR + IDELAYCTRL)
 read_verilog $rtl/trace_capture_a7.v
 
+# upstream traceIF.v (sync-word alignment + frame decode) — the eye-scan judge
+read_verilog $repo_root/verilog/traceIF.v
+
 # V1 eye-scan engine + top + local eth core fork
 read_verilog $bdir/trace_eyescan.v
 read_verilog $bdir/fpga_core_net.v

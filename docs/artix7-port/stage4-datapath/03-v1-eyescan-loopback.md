@@ -87,35 +87,34 @@ cd .. && python3 eyescan_read.py --ip 192.168.10.42   # 读眼图，给出 best 
 
 ## 当前状态
 
-- [x] RTL（`trace_eyescan.v` + `eyescan_top.v`）+ 约束 + 综合：时序收敛（WNS/WHS 正），0 DRC error
-- [x] UDP 读出路径实测可用（echo:1234 回归 OK；表读 :5001 响应）
+- [x] RTL + 约束 + 综合：时序收敛，0 DRC error
+- [x] UDP 读出路径实测可用
 - [x] 「没插跳线 → 全 0xFF 报 scan-never-ran」防伪阳性已实测确认
-- [x] 插好跳线（GPIO1 内部回环，JTAG 边界扫描已确认 5 对连接正确）后**扫描真的跑起来**
-- [x] **链路本身被证明能完美工作**：停在 best_tap 时，连续 32 个原始样本是干净的 +1 ramp（`d5 d6 d7 … f0 f1 f2`），8 bit 全部翻转（activity mask=0xff）
-- [⚠] **眼图判定有问题待解**：见下
+- [x] 插好跳线（GPIO1 内部回环，JTAG 边界扫描确认 5 对连接正确）
+- [x] **V1 完成：眼图扫出来了** —— tap 18~31 共 **14 个 tap 干净解码**，eye 中心 = tap 24，traceIF 解出帧 `123402030405060708090a0b0c0d0e0f` 逐字节正确。
 
-## 实测发现（诚实记录）
+## 走对的路：用 orbtrace 自己的 traceIF 做判据 + BUFR_IO 时钟
 
-插好跳线、扫描跑通后，得到一个**尚未解释清楚的矛盾**：
+第一版我自己发明了「+1 ramp 逐 bit 误码计数」做判据，踩了 DDR 上升/下降相位的坑（raw 看着是干净 ramp，误码却乱报），反复几轮没收敛。**回头参考 orbtrace 原始方案才找对路：**
 
-| 证据 | 说明 |
-|------|------|
-| 原始样本缓冲（best_tap） | **完美 +1 ramp**，8 bit 全对 → 链路硬件没问题 |
-| 每 tap 快照 `snap_d2->snap_d1` | 几乎每个 tap 都是干净 +1（62→63, 82→83 …） |
-| 误码表 | **L0 仅 tap4~8 为 0，L1/L2/L3 在所有 32 tap 全饱和(255)** |
+1. **判据换成 orbtrace 的 `traceIF.v`**：pattern 发生器发真正的 TPIU 帧（`FF FF FF 7F` 同步字 + 16 字节已知 payload），环回喂给上游 `traceIF.v`。traceIF 自己锁 `0x7FFF_FFFF` 同步字、用 `isREsync` 自动区分上升/下降沿对齐——**我之前手算 IDDR Q1/Q2 相位的坑，traceIF 内部本来就解决了**。tap 判据 = 「该 tap 下 traceIF 解出的帧 == golden 且无坏帧」。
 
-矛盾点：原始 ramp 干净 + 每 tap 快照干净，按理 4 条 lane 误码都该 0；但误码计数器说 L1-3 全错。**说明链路是好的，是「窗口内自由比较计数」这条判定路径有 bug 或对源同步相位的理解还差一层**（怀疑 `SAME_EDGE_PIPELINED` IDDR 的 Q1/Q2 上升/下降相位与 tap 的交互，导致重组字节"看着像 ramp"但 bit 位置判定为错）。
+2. **诊断纪律：先仿真定位，再上板**。反复上板试错几轮后，停下来写了纯逻辑 iverilog 仿真（`sim/eyescan_pattern_tb.v`）：pattern 发生器 → 理想 DDR 采样 → traceIF，**理想采样下完美解出 `1234…0f`**。这证明逻辑对、接法对，**硬件的 nibble 错位是物理采样相位问题，不是逻辑 bug**——把排查范围一下子缩小了。
 
-诚实结论：**V1 证明了「FPGA 采样链能采到完美数据」（raw ramp 干净），但「逐 tap 眼图自动判定」这套误码逻辑还没调对，best_tap 自动选择暂不可信。** 这是逻辑/方法问题，不是板子/连线问题（连线已被 JTAG 边界扫描独立验证）。
+3. **根因 = BUFG 时钟插入延迟**。硬件上（用 BUFG）traceIF 能锁 sync，但奇数字节高 nibble 错（falling 沿采在过渡区），32 tap 全扫不到干净点。换成 **`trace_capture_a7` 的 `BUFR_IO`** 时钟方案（区域局部时钟、skew 小，正是项目早期 r11 HG-2 敏感性研究预言的源同步正确选择）后：**tap 18-31 共 14 个 tap 干净开眼**。一个参数定乾坤。
 
-### 已排除
-- 连线错：JTAG 边界扫描确认 5 对全对（D17↔C13, F13↔B13, E14↔A13, D14↔A14, E16↔C14）
-- 死 lane / 没接通：activity mask=0xff，8 bit 全翻转过
-- 数据源错：raw 缓冲是教科书级 +1 ramp
+### 完整诊断链（全实测，非猜测）
+| 步骤 | 手段 | 结论 |
+|------|------|------|
+| 1 | JTAG 边界扫描 | 5 对连线正确 |
+| 2 | iverilog 仿真 | 逻辑/接法正确（理想采样完美解码） |
+| 3 | 硬件 BUFG | sync 锁定但 falling nibble 错 → 物理时钟相位问题 |
+| 4 | 换 BUFR_IO | **眼睛开，14-tap 宽余量，best_tap=24** |
 
-### 待办（下次接手）
-- 重新推敲 checker 的 DDR 相位语义：用每 tap 多拍 burst 快照在 PC 端判 ramp 连续性，替代 FPGA 端自由计数；或改用 PRBS + 自同步校验器
-- 或：直接信任 raw 缓冲法——固定扫 tap、每 tap 抓一段 raw 到 PC 判，把判定整个挪到 PC（FPGA 只采样不判）
+## 设计边界（诚实声明）
+- 当前 pattern 速率 = 100MHz DDR（200Mbps/lane），保守低速首跑，证明采样链 + 判据 + tap 校准全链路正确。满速命门留 V4。
+- 自环眼图（板内 GPIO1↔GPIO1 短路径）≠ 接 STM32 的真实链路眼图，但 14-tap 余量说明采样架构本身健康。
+- **关键工程结论：源同步采样必须用 BUFR_IO 而非 BUFG**（已上板坐实，不再是 HG-2 的纸面推断）。
 
 ## 设计边界（诚实声明）
 
