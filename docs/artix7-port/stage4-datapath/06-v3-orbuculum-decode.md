@@ -57,3 +57,29 @@ graph LR
 - 用 OpenOCD 原生 `etm config` / `etm_dummy` 或 J-Link 的 `SWO`/trace 驱动,借成熟实现处理 ETM3.5 使能握手;
 - 或换"ITM + DWT PC 采样"路线(`gdbinit-jlink` 那套):ITM 不需要 ETM 比较器,DWT 周期性采 PC,Orbuculum 的 `orbtop` 直接出函数热度——虽不是完整指令流,但能先验证"符号还原"整条 PC 侧链路;
 - 确认这颗 STM32F429 ETM 是否真支持指令 trace 输出(部分 F4 的 ETM 精简版能力有限)。
+
+## 查文档后的进展(第二轮诊断)
+
+J-Trace 支持列表有 F429 → ETM 指令 trace 在这芯片**确实能 work**,是使能序列问题。查了权威文档:
+
+**权威寄存器图(ARM CoreSight ETM-M4 TRM, DDI0440,正是 F429 的 ETM):**
+| 地址 | 寄存器 | 复位值 |
+|------|--------|--------|
+| 0xE0041000 | ETMCR | 0x00000411(**bit0=1 = 默认 powerdown**) |
+| 0xE0041004 | ETMCCR | 0x8C802000 |
+| 0xE0041020 | ETMTEEVR | RW |
+| 0xE0041024 | ETMTECR1 | RW |
+| **0xE0041028** | **ETMFFLR** | RW（注意 FIFOFULL Level 在 **0x028**) |
+
+**已知可用序列(PetteriAimonen/STM32_Trace_Example,STM32F4 实测过):**
+- ETMCR = `0xd80`(stall + report all branches),先 setbits `0x400` 进 prog 模式
+- **ETMTECR1 = `0x01000000`**(bit24 = trace always enabled)—— 我原来写 `0x20000001` 是错的
+- ETMFFRR=`0x01000000`、ETMFFLR=24
+- mcuoneclipse 补充:F407 需 **ETMCR=`0xd90`**(设 trace port internal width)
+
+**已照此修正 `etm_enable.cfg`。但仍卡:**
+- 修正后 ETMCR=0x980 ✓、TEEVR=0x6f ✓,但 **ETMTECR1 写 0x01000000 读回仍是 0**(prog 模式下、ETMSR=0x02 ready 时写也不生效)。
+- 重抓 16KB 仍 100% idle。
+- ETMCR 复位值 0x411 的 **bit0=1=powerdown**;我们写的值 bit0=0 已清 powerdown,理论上 OK。
+
+**当前最可疑**:ETMTECR1 写不进 = 可能 ETM 的 trace 时钟/电源域没真正给(写 ETMCR 那个域能写、写 TraceEnable 逻辑那个域写不进),或 STM32 还需额外的 trace 时钟使能(RCC/DBGMCU 层)。**下一步该试 OpenOCD 原生 `etm` 驱动**(它知道这类握手),或对照 RM0090 的 DBGMCU trace 时钟章节。**或先走 ITM+DWT 路线把 PC 侧解码链路验通**(不依赖 ETM TraceEnable)。
