@@ -256,9 +256,53 @@ assign tx_ip_payload_axis_tvalid = 0;
 assign tx_ip_payload_axis_tlast = 0;
 assign tx_ip_payload_axis_tuser = 0;
 
-// Loop back UDP
-wire match_cond = rx_udp_dest_port == 1234;
+// ------------------------------------------------------------------
+// V0 (Stage-4) hook: FPGA-originated golden frame egress test.
+//   - UDP port 1234 : original loopback/echo (network regression)
+//   - UDP port 5000 : reply with an FPGA-internal GOLDEN frame instead
+//                     of the received bytes. Proves FPGA-sourced bytes
+//                     traverse the UDP egress byte-exact on real silicon
+//                     (the foundation every later trace stage stands on).
+// We reuse ALL the verified echo header/length/handshake machinery and
+// only substitute the payload DATA at the FIFO input. So the PC sends
+// exactly GOLDEN_LEN bytes to :5000 and must get GOLDEN_LEN golden bytes
+// back. See docs/artix7-port/PLAN_STAGE4.md (V0).
+// ------------------------------------------------------------------
+wire golden_cond = rx_udp_dest_port == 16'd5000;
+wire match_cond = (rx_udp_dest_port == 16'd1234) || golden_cond;
 wire no_match = !match_cond;
+
+// latched "this frame targets the golden port", aligned with match_cond_reg
+reg golden_reg = 0;
+
+// payload byte position within the current frame (counts FIFO-input beats)
+reg [15:0] golden_idx = 0;
+always @(posedge clk) begin
+    if (rst) begin
+        golden_idx <= 0;
+    end else if (rx_fifo_udp_payload_axis_tvalid && rx_fifo_udp_payload_axis_tready) begin
+        if (rx_fifo_udp_payload_axis_tlast)
+            golden_idx <= 0;
+        else
+            golden_idx <= golden_idx + 1'b1;
+    end
+end
+
+// GOLDEN pattern: a 4-byte TPIU full-sync prefix (FF FF FF 7F) ONCE at the
+// start of the frame, then a monotonic ramp 0xC0,0xC1,... that continues
+// across the whole frame (wraps at 256). The ramp catches byte
+// duplication / drops / off-by-one; the one-shot sync prefix makes the
+// frame recognisable on the wire and mirrors a real TPIU frame header.
+reg [7:0] golden_byte;
+always @(*) begin
+    case (golden_idx)
+        16'd0: golden_byte = 8'hFF;
+        16'd1: golden_byte = 8'hFF;
+        16'd2: golden_byte = 8'hFF;
+        16'd3: golden_byte = 8'h7F;
+        default: golden_byte = 8'hC0 + golden_idx[7:0];
+    endcase
+end
 
 reg match_cond_reg = 0;
 reg no_match_reg = 0;
@@ -267,16 +311,19 @@ always @(posedge clk) begin
     if (rst) begin
         match_cond_reg <= 0;
         no_match_reg <= 0;
+        golden_reg <= 0;
     end else begin
         if (rx_udp_payload_axis_tvalid) begin
             if ((!match_cond_reg && !no_match_reg) ||
                 (rx_udp_payload_axis_tvalid && rx_udp_payload_axis_tready && rx_udp_payload_axis_tlast)) begin
                 match_cond_reg <= match_cond;
                 no_match_reg <= no_match;
+                golden_reg <= golden_cond;
             end
         end else begin
             match_cond_reg <= 0;
             no_match_reg <= 0;
+            golden_reg <= 0;
         end
     end
 end
@@ -299,7 +346,7 @@ assign tx_fifo_udp_payload_axis_tready = tx_udp_payload_axis_tready;
 assign tx_udp_payload_axis_tlast = tx_fifo_udp_payload_axis_tlast;
 assign tx_udp_payload_axis_tuser = tx_fifo_udp_payload_axis_tuser;
 
-assign rx_fifo_udp_payload_axis_tdata = rx_udp_payload_axis_tdata;
+assign rx_fifo_udp_payload_axis_tdata = golden_reg ? golden_byte : rx_udp_payload_axis_tdata;
 assign rx_fifo_udp_payload_axis_tvalid = rx_udp_payload_axis_tvalid && match_cond_reg;
 assign rx_udp_payload_axis_tready = (rx_fifo_udp_payload_axis_tready && match_cond_reg) || no_match_reg;
 assign rx_fifo_udp_payload_axis_tlast = rx_udp_payload_axis_tlast;

@@ -9,6 +9,11 @@
 // replies to ICMP echo (ping), and loops back UDP on port 1234. FPGA IP is
 // set to 192.168.10.42 (edit fpga_core_net.v local_ip to match your LAN).
 //
+// Stage-4 V0 hook: UDP port 5000 replies with an FPGA-internal GOLDEN frame
+// (4-byte TPIU sync FF FF FF 7F + ramp) instead of echoing, proving
+// FPGA-sourced bytes traverse the UDP egress byte-exact. Port 1234 keeps
+// the plain echo for network regression. See PLAN_STAGE4.md (V0).
+//
 // Board: A7-Lite (XC7A35T). 50 MHz osc on J19. RGMII on the on-board ETH
 // (RTL8211E), pins from A7_lite.xdc.
 

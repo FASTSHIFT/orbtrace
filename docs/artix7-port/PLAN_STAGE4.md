@@ -87,13 +87,14 @@ graph TD
 
 阶梯顺序刻意为：**先摘数字段（V0）和工具链（V3 可提前），把物理命门（V1/V4）单独拎出来眼图判收，最后才让真实不可控输入（V2）进来。** 任何一关挂了，未知量唯一。
 
-### V0 · 数字回环（不接 STM32，纯 FPGA 自产自销）
+### V0 · 数字回环（不接 STM32，纯 FPGA 自产自销）✅
 - **输入**：FPGA 内部一个 **golden TPIU 帧发生器**（常量 ROM：同步字 `0xFFFF_FFFF`/`0x7FFF_FFFF` + 已知 ITM 包），直接喂进 traceIF 下游，**绕过物理采样**。
 - **出口**：走已验证的 UDP 把帧发到 PC。
 - **判据**：PC 收到的字节 == 塞进去的 golden（逐字节）。
 - **目的**：验证「组帧 → UDP 出口」这条 RTL 在真硅片上字节无误，把这段从未知里摘掉。纯数字，最稳，**为后面所有阶段打地基**。
-- [ ] golden 帧发生器 RTL + 接入 net_test 出口
-- [ ] PC 端收包比对脚本（golden 对拍）
+- [x] golden 帧发生器 RTL + 接入 net_test 出口（端口 5000；端口 1234 echo 保留为网络回归）
+- [x] PC 端收包比对脚本（golden 对拍，`v0_golden_check.py`）
+- [x] **实测通过**：len 8/32/64/100/128/200，128B×500 迭代 0 mismatch / 0 lost；过程中 V0 抓到一个真实位置计数 bug（sync 前缀每 32B 重复）并修复。详见 `stage4-datapath/01-v0-golden-egress.md`
 
 ### V1 · 物理采样回环（自发自收，验时序不验内容）
 - **输入**：不依赖 STM32——FPGA 自己用 IO 发已知 pattern 绕板一圈接回 trace 输入引脚（或用 STM32 GPIO toggle 已知慢速方波，配置已会）。
