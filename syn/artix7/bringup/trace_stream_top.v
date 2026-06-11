@@ -1,27 +1,25 @@
 // trace_stream_top
 // ================
-// Stage-4 V3 step 1: fix the IDELAY tap (from V2's eye centre) and stream the
-// REAL decoded trace frames out over UDP so the PC can inspect/decode them.
+// Stage-4 V3: fix the IDELAY tap (V2 eye centre) and capture a contiguous
+// block of the RAW trace byte stream (the TPIU bytes that traceIF consumes:
+// {trace_b, trace_a} per trace_clk) into a deep BRAM, one-shot. The PC reads
+// the whole block out over UDP :5001 and saves it to a file for offline
+// decode by Orbuculum (orbmortem -P ETM3.5 -e proj.axf).
 //
-//   STM32 ETM pins ── trace_capture_a7 (BUFR_IO, tap=TAP) ── traceIF
-//        |                                                      |
-//        |                                            FrAvail + Frame(128b)
-//        v                                                      v
-//   (board jumpers, GPIO1)                         frame ring buffer (trace_clk)
-//                                                              |
-//                                          UDP :5001 readout (ext hook in eth)
+//   STM32 ETM ── trace_capture_a7 (BUFR_IO, tap=TAP) ── {trace_b,trace_a}
+//                                                             |
+//                                          one-shot fill -> capture BRAM (DEPTH)
+//                                                             |
+//                                            UDP :5001 paged readout (16-bit addr)
 //
-// PC sends any frame to :5001 -> reply = the last N captured 128-bit frames
-// (N*16 bytes), newest-last. See trace_stream_read.py.
-//
-// No pattern generator here (STM32 drives the pins). Tap is a build-time
-// parameter (default 28, the V2 eye centre).
+// Capture starts after IDELAYCTRL ready + tap load, and freezes once full so
+// the PC reads a stable snapshot. Re-arm by reconfiguring (reset).
 
 `default_nettype none
 
 module trace_stream_top #(
-    parameter [4:0] TAP   = 5'd28,   // V2 eye centre
-    parameter       NFRM  = 8        // ring depth (frames); UDP reply = NFRM*16 B
+    parameter [4:0] TAP   = 5'd28,    // V2 eye centre
+    parameter       DEPTH = 16384     // captured bytes (16 KB)
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -36,17 +34,15 @@ module trace_stream_top #(
     inout  wire        phy_mdio,
     output wire        phy_mdc,
 
-    // Trace capture IN (from STM32 PE2..PE6)
     input  wire        trace_clk_in,
     input  wire [3:0]  trace_data_in,
 
     output wire        led0,   // idelayctrl ready
-    output wire        led1    // toggles while frames arrive (activity)
+    output wire        led1    // capture full (steady) / filling (off)
 );
 
     wire rst = ~rst_n;
 
-    // ---- MMCM: 125 / 125@90 / 200 / 100 ----
     wire clkfb, clk125_u, clk125_90_u, clk200_u, clk100_u, mmcm_locked;
     MMCME2_BASE #(
         .CLKIN1_PERIOD(20.0), .CLKFBOUT_MULT_F(20.0), .DIVCLK_DIVIDE(1),
@@ -61,10 +57,10 @@ module trace_stream_top #(
         .LOCKED(mmcm_locked), .RST(rst), .PWRDWN(1'b0)
     );
     wire clk125, clk125_90, clk200, clk100;
-    BUFG b0(.I(clk125_u),    .O(clk125));
+    BUFG b0(.I(clk125_u), .O(clk125));
     BUFG b1(.I(clk125_90_u), .O(clk125_90));
-    BUFG b2(.I(clk200_u),    .O(clk200));
-    BUFG b3(.I(clk100_u),    .O(clk100));
+    BUFG b2(.I(clk200_u), .O(clk200));
+    BUFG b3(.I(clk100_u), .O(clk100));
 
     reg [3:0] rst_sync = 4'hf;
     always @(posedge clk100 or posedge rst)
@@ -72,12 +68,11 @@ module trace_stream_top #(
         else     rst_sync <= {rst_sync[2:0], ~mmcm_locked};
     wire sys_rst = rst_sync[3];
 
-    // ---- capture front-end: BUFR_IO, fixed tap ----
+    // capture front-end (BUFR_IO, fixed tap)
     wire        trace_clk;
     wire [3:0]  trace_a, trace_b;
     wire        idelayctrl_rdy;
 
-    // one-shot tap load after IDELAYCTRL ready
     reg [3:0] ld_sync = 4'h0;
     reg       loaded  = 1'b0;
     reg       tap_load = 1'b0;
@@ -91,67 +86,59 @@ module trace_stream_top #(
     end
 
     trace_capture_a7 #(.CLK_BUF("BUFR_IO")) u_capture (
-        .rst           (sys_rst),
-        .ref_200m      (clk200),
-        .trace_clk_p   (trace_clk_in),
-        .trace_data_p  (trace_data_in),
-        .tap_data0     (TAP), .tap_data1(TAP), .tap_data2(TAP), .tap_data3(TAP),
-        .tap_load      (tap_load),
-        .trace_clk     (trace_clk),
-        .trace_a       (trace_a),
-        .trace_b       (trace_b),
+        .rst(sys_rst), .ref_200m(clk200),
+        .trace_clk_p(trace_clk_in), .trace_data_p(trace_data_in),
+        .tap_data0(TAP), .tap_data1(TAP), .tap_data2(TAP), .tap_data3(TAP),
+        .tap_load(tap_load),
+        .trace_clk(trace_clk), .trace_a(trace_a), .trace_b(trace_b),
         .idelayctrl_rdy(idelayctrl_rdy)
     );
 
-    // ---- traceIF: decode frames ----
-    wire         fr_avail;
-    wire [127:0] frame;
+    // raw byte stream = {trace_b, trace_a} per trace_clk (the TPIU bytes)
+    wire [7:0] raw_byte = {trace_b, trace_a};
+
+    // traceIF only used as a link-health gate: start capturing once sync seen
+    wire        fr_avail;
+    wire [127:0] frame_unused;
     traceIF #(.MAXBUSWIDTH(4)) u_traceif (
-        .rst        (sys_rst | ~idelayctrl_rdy),
-        .traceDina  (trace_a),
-        .traceDinb  (trace_b),
-        .traceClkin (trace_clk),
-        .width      (2'b11),
-        .edgeOutput (),
-        .FrAvail    (fr_avail),
-        .Frame      (frame)
+        .rst(sys_rst | ~idelayctrl_rdy),
+        .traceDina(trace_a), .traceDinb(trace_b), .traceClkin(trace_clk),
+        .width(2'b11), .edgeOutput(), .FrAvail(fr_avail), .Frame(frame_unused)
     );
-
-    // ---- frame ring buffer (trace_clk domain) ----
-    // Store the most recent NFRM frames as a flat NFRM*16-byte memory,
-    // readable byte-wise by the PC. frame_strobe = FrAvail toggle.
-    reg fr_q;
-    wire frame_strobe = fr_avail ^ fr_q;
-    always @(posedge trace_clk) fr_q <= fr_avail;
-
-    localparam NB = NFRM*16;            // bytes
-    (* ram_style = "distributed" *)
-    reg [7:0] ring [0:NB-1];
-    reg [$clog2(NFRM)-1:0] wr_frm;
-    integer k;
-    reg [31:0] frame_count;
-    always @(posedge trace_clk) begin
-        if (sys_rst) begin
-            wr_frm <= 0;
-            frame_count <= 0;
-        end else if (frame_strobe) begin
-            // write 16 bytes of `frame` (MSB first) into slot wr_frm
-            for (k = 0; k < 16; k = k + 1)
-                ring[wr_frm*16 + k] <= frame[8*(15-k) +: 8];
-            wr_frm <= wr_frm + 1'b1;
-            frame_count <= frame_count + 1'b1;
+    reg fr_q, sync_seen;
+    always @(posedge trace_clk or posedge sys_rst) begin
+        if (sys_rst) begin fr_q <= 0; sync_seen <= 0; end
+        else begin
+            fr_q <= fr_avail;
+            if (fr_avail ^ fr_q) sync_seen <= 1'b1;   // a frame decoded => synced
         end
     end
 
-    // ---- UDP readout via ext hook ----
-    wire [7:0] ext_addr, ext_data;
-    // addr 0..NB-1 -> ring bytes ; NB..NB+3 -> frame_count (LE)
-    assign ext_data = (ext_addr < NB)        ? ring[ext_addr] :
-                      (ext_addr == NB+0)     ? frame_count[7:0]   :
-                      (ext_addr == NB+1)     ? frame_count[15:8]  :
-                      (ext_addr == NB+2)     ? frame_count[23:16] :
-                      (ext_addr == NB+3)     ? frame_count[31:24] :
-                      (ext_addr == NB+4)     ? {3'b0, wr_frm}     : 8'h00;
+    // one-shot capture BRAM (trace_clk write, clk125 read). Clean simple-
+    // dual-port pattern (no reset on the array) so it infers as block RAM.
+    localparam AW = $clog2(DEPTH);
+    (* ram_style = "block" *)
+    reg [7:0] capmem [0:DEPTH-1];
+    reg [AW:0] wr_ptr;          // extra bit to detect full
+    wire full = wr_ptr[AW];
+    wire wr_en = sync_seen && !full;
+    always @(posedge trace_clk) begin
+        if (wr_en) capmem[wr_ptr[AW-1:0]] <= raw_byte;
+    end
+    always @(posedge trace_clk or posedge sys_rst) begin
+        if (sys_rst) wr_ptr <= 0;
+        else if (wr_en) wr_ptr <= wr_ptr + 1'b1;
+    end
+
+    // UDP readout: ext_addr (16-bit) indexes capmem; beyond DEPTH return
+    // status (DEPTH and full flag) so the PC knows size/ready.
+    wire [15:0] ext_addr;
+    reg  [7:0]  cap_rd;
+    always @(posedge clk125) cap_rd <= capmem[ext_addr[AW-1:0]];
+    wire [7:0] ext_data = (ext_addr < DEPTH) ? cap_rd :
+                          (ext_addr == DEPTH+0) ? DEPTH[7:0] :
+                          (ext_addr == DEPTH+1) ? DEPTH[15:8] :
+                          (ext_addr == DEPTH+2) ? {7'b0, full} : 8'h00;
 
     fpga_core_net #(.TARGET("XILINX")) u_eth (
         .clk(clk125), .clk90(clk125_90), .rst(sys_rst),
@@ -169,15 +156,8 @@ module trace_stream_top #(
     assign phy_mdio = 1'bz;
     assign phy_mdc  = 1'b0;
 
-    // ---- LEDs ----
-    reg [26:0] cnt = 0;
-    always @(posedge clk100) cnt <= cnt + 1'b1;
-    // led1 reflects frame activity: light if any frame has arrived
-    reg seen;
-    always @(posedge trace_clk or posedge sys_rst)
-        if (sys_rst) seen <= 1'b0; else if (frame_strobe) seen <= 1'b1;
     assign led0 = ~idelayctrl_rdy;
-    assign led1 = ~(seen & cnt[24]);
+    assign led1 = ~full;     // off while filling, on (steady low) when full
 
 endmodule
 

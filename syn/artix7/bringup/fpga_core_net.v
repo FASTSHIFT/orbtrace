@@ -104,7 +104,7 @@ module fpga_core_net #
      * that address. Used to stream the eye-scan results table out over UDP.
      * Tie ext_data=0 if unused.
      */
-    output wire [7:0] ext_addr,
+    output wire [15:0] ext_addr,
     input  wire [7:0] ext_data
 );
 
@@ -290,20 +290,32 @@ reg ext_reg = 0;
 
 // payload byte position within the current frame (counts FIFO-input beats)
 reg [15:0] golden_idx = 0;
+// paged readout base: the first two received payload bytes of the request
+// set a 16-bit base address, so the PC can page through a buffer larger
+// than one UDP payload. ext_addr = base + position. (Reply bytes 0..1 are
+// therefore not meaningful data; the PC discards them.)
+reg [15:0] ext_base = 0;
 always @(posedge clk) begin
     if (rst) begin
         golden_idx <= 0;
+        ext_base   <= 0;
     end else if (rx_fifo_udp_payload_axis_tvalid && rx_fifo_udp_payload_axis_tready) begin
         if (rx_fifo_udp_payload_axis_tlast)
             golden_idx <= 0;
         else
             golden_idx <= golden_idx + 1'b1;
+        if (golden_idx == 16'd0) ext_base[7:0]  <= rx_udp_payload_axis_tdata;
+        if (golden_idx == 16'd1) ext_base[15:8] <= rx_udp_payload_axis_tdata;
     end
 end
 
-// external readout addressing: present the in-frame byte position so the
-// external source (eye table) can return the addressed byte.
-assign ext_addr = golden_idx[7:0];
+// external readout addressing: base (from request bytes 0..1) + position.
+// Data starts at request position 2 (after the 2 base bytes), so by then
+// ext_base is fully latched and ext_addr is contiguous from `base`.
+//   reply[p] (p>=2) = source[ base + (p-2) ]
+// The PC sets base, then uses reply bytes 2.. as source[base..].
+wire [15:0] ext_pos = (golden_idx >= 16'd2) ? (golden_idx - 16'd2) : 16'd0;
+assign ext_addr = ext_base + ext_pos;
 
 // GOLDEN pattern: a 4-byte TPIU full-sync prefix (FF FF FF 7F) ONCE at the
 // start of the frame, then a monotonic ramp 0xC0,0xC1,... that continues

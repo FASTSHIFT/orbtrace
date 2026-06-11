@@ -136,7 +136,7 @@ module eyescan_top #(
     // Eye-scan engine: pattern gen + tap sweep + per-tap frame tally,
     // judged from traceIF's FrAvail/Frame.
     // ------------------------------------------------------------------
-    wire [7:0] ext_addr;
+    wire [15:0] ext_addr;
     wire [7:0] ext_data;
     wire       scan_done, eye_found;
     wire [4:0] best_tap;
@@ -152,7 +152,7 @@ module eyescan_top #(
         .trace_clk     (trace_clk),
         .fr_avail      (fr_avail),
         .frame         (frame),
-        .rd_addr       (ext_addr),
+        .rd_addr       (ext_addr[7:0]),
         .rd_data       (ext_data),
         .scan_done     (scan_done),
         .best_tap      (best_tap),
