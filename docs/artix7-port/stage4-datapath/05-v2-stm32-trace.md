@@ -60,5 +60,25 @@ tap  1 | 5106
 > 待 V2 收尾可改进:测量改成"固定帧数计时"而非"固定时间计帧",消除数据稀疏带来的涨落;或拉长窗口多次平均。
 
 ## 下一步
-- 用 best_tap=28 固化采样,把 traceIF 解出的帧接进 TPIU demux → OrbFlow → UDP,送到 PC;
+- 用 best_tap=28 固化采样,把 traceIF 解出的帧接进 TPIU demux → OrbFlow → UDP,送到 PC; **← 已做(见下)**
 - **V3**:编译 Orbuculum,PC 端实时解码这条真实 trace 流,对出 STM32 实际执行的函数/PC 流(端到端 PoC 收口)。
+
+---
+
+## V3 第一步:固定 tap 流式送帧到 PC（已通过）
+
+用 V2 眼心 `tap=28` 固化采样,新建 `trace_stream_top.v`:STM32 ETM → `trace_capture_a7`(BUFR_IO, tap=28)→ `traceIF` 解帧 → 环形缓冲(最近 8 帧)→ UDP :5001 读出 + 32-bit frame_count。
+
+实测(`trace_stream_read.py`):
+- **frame_count 持续单调增**:3 秒内 33,980,286 → 35,191,379,约 **40 万帧/秒**,真实活流。
+- 8 个 slot 都是真实 TPIU 数据,含可辨识结构:`7f`/`7fff`(TPIU 同步/对齐)、`0b84`/`027f`/`01cc`(ITM channel `0b` + 包)。
+- 内容随执行流不断变化,非固定 golden。
+
+构建/运行:
+```bash
+cd build && TAP=28 vivado -mode batch -source ../run_trace_stream.tcl
+# 烧 trace_stream.bit
+python3 ../trace_stream_read.py --ip 192.168.10.42 --watch   # 看帧率
+```
+
+**至此「真实被测对象 → FPGA 采样+解帧 → 网络送到 PC」整条链打通。** 剩下是 PC 端用 Orbuculum 把这些 TPIU 帧解成函数/PC 执行流（V3 收口）。
