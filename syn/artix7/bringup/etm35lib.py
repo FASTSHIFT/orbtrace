@@ -361,3 +361,145 @@ def tpiu_sync_frames(stream: bytes) -> list[bytes]:
             frames.append(frame)
             buf = 1
     return frames
+
+
+# ----------------------------------------------------------------------------
+# V4: realigning region decoder. When the plain region walk derails on an
+# unclassifiable byte (the sub-byte misalignment of a 4-bit port, IHI0014Q
+# §7.10.4), try the 8 bit-shifts of the remaining bytes and resume from the
+# first shift that yields a run of classifiable packets. This extends the
+# short anchored regions toward continuous flow without any hardware change.
+# ----------------------------------------------------------------------------
+def _classify(c: int) -> str:
+    """Classify an ETM3.5 IDLE-state header byte. 'unknown' if not a valid
+    packet header (used as the realign trigger)."""
+    if c & 1:
+        return "branch"
+    if c == 0x00:
+        return "async"
+    if c == 0x04:
+        return "cyccnt"
+    if c == 0x08:
+        return "isync"
+    if c == 0x70:
+        return "isync_cyc"
+    if c == 0x0C:
+        return "trigger"
+    if c == 0x3C:
+        return "vmid"
+    if (c & 0xFB) == 0x42:
+        return "timestamp"
+    if c == 0x66:
+        return "ignore"
+    if c == 0x6E:
+        return "contextid"
+    if c == 0x76:
+        return "exc_exit"
+    if c == 0x7E:
+        return "exc_entry"
+    if (c & 0x81) == 0x80:
+        return "pheader"
+    return "unknown"
+
+
+def _classifiable_run(data: bytes, start: int, n: int = 6) -> int:
+    """Count how many consecutive bytes from `start` look like valid packet
+    headers (skipping each packet's body crudely by 1 byte). A high count means
+    this alignment is plausible. Used to score candidate bit-shifts."""
+    i = start
+    good = 0
+    while i < len(data) and good < n:
+        k = _classify(data[i])
+        if k == "unknown":
+            break
+        good += 1
+        # crude skip: branch/cyccnt/timestamp consume continuation bytes
+        if k in ("branch", "cyccnt", "timestamp"):
+            i += 1
+            while i < len(data) and (data[i - 1] & 0x80) and i - start < 6:
+                i += 1
+        elif k == "isync":
+            i += 6
+        else:
+            i += 1
+    return good
+
+
+def decode_region_realign(data: bytes, start: int, base_addr: int,
+                          max_bytes: int = 4096, min_run: int = 3):
+    """Like decode_region, but on hitting an 'unknown' byte, try bit-shifts to
+    realign and continue. Returns (events, consumed_bytes, realign_count)."""
+    events = []
+    realigns = 0
+    work = data[start:start + max_bytes]
+    i = 0
+    base = base_addr
+    while i < len(work):
+        c = work[i]
+        k = _classify(c)
+        if k == "branch":
+            n = 1
+            while i + n < len(work) and (work[i + n - 1] & 0x80) and n < 5:
+                n += 1
+            events.append(FlowEvent("branch", base))
+            i += n
+            continue
+        if k == "pheader":
+            ph = _phdr_atoms(c)
+            if ph is not None:
+                events.append(FlowEvent("atoms", base, eatoms=ph[0], natoms=ph[1]))
+            i += 1
+            continue
+        if k == "isync":
+            s = parse_isync_at(work, i)
+            if s is not None:
+                events.append(FlowEvent("isync", s.addr))
+                base = s.addr
+                i += 6
+                continue
+            # malformed isync -> treat as derail below
+            k = "unknown"
+        if k == "async":
+            break          # next A-sync; caller re-anchors
+        if k in ("trigger", "vmid", "ignore", "contextid", "exc_exit", "exc_entry"):
+            i += 1
+            continue
+        if k in ("cyccnt", "timestamp"):
+            i += 1
+            while i < len(work) and (work[i - 1] & 0x80):
+                i += 1
+            continue
+        # unknown -> attempt sub-byte realignment on the remaining bytes
+        rest = work[i:]
+        best = None
+        for sh in range(1, 8):
+            shifted = bit_shift(rest, sh)
+            run = _classifiable_run(shifted, 0)
+            if run >= min_run and (best is None or run > best[1]):
+                best = (sh, run, shifted)
+        if best is None:
+            break
+        realigns += 1
+        work = best[2]
+        i = 0
+    return events, i, realigns
+
+
+def decode_all_realign(data: bytes):
+    """Anchor on every I-sync and extend each region with sub-byte realignment.
+    Returns (events, total_realigns).
+
+    NOTE on trust level: the I-sync 'isync' events are guaranteed-correct
+    absolute PCs. The 'atoms'/'branch' events recovered after a realignment are
+    PLAUSIBLE (they pass the ETM3.5 header classifier in the realigned phase)
+    but are NOT independently corroborated unless a later flash-address I-sync
+    re-anchors. Treat anchors as ground truth and realigned flow as indicative.
+    """
+    events = []
+    total_realigns = 0
+    for s in find_isyncs(data):
+        events.append(FlowEvent("isync", s.addr))
+        region, _, ra = decode_region_realign(data, s.offset + 6, s.addr)
+        events.extend(region)
+        total_realigns += ra
+    return events, total_realigns

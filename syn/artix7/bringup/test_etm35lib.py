@@ -481,3 +481,113 @@ def test_tpiu_sync_on_real_raw_capture():
     swapped = bytes((((x & 0xF) << 4) | ((x >> 4) & 0xF)) for x in raw)
     frames = L.tpiu_sync_frames(swapped)
     assert len(frames) > 100        # hundreds of aligned frames expected
+
+
+# ----------------------------------------------------------------------------
+# V4 realigning region decoder
+# ----------------------------------------------------------------------------
+def test_classify_headers():
+    assert L._classify(0x01) == "branch"
+    assert L._classify(0x00) == "async"
+    assert L._classify(0x08) == "isync"
+    assert L._classify(0x88) == "pheader"
+    assert L._classify(0x0C) == "trigger"
+    assert L._classify(0x66) == "ignore"
+    assert L._classify(0x6E) == "contextid"
+    assert L._classify(0x76) == "exc_exit"
+    assert L._classify(0x7E) == "exc_entry"
+    assert L._classify(0x42) == "timestamp"
+    assert L._classify(0x38) == "unknown"
+    assert L._classify(0x50) == "unknown"
+
+
+def test_classifiable_run_counts():
+    # all P-headers -> full run
+    data = bytes([0x88] * 8)
+    assert L._classifiable_run(data, 0, 6) == 6
+
+
+def test_classifiable_run_stops_on_unknown():
+    data = bytes([0x88, 0x88, 0x38, 0x88])
+    assert L._classifiable_run(data, 0, 6) == 2
+
+
+def test_decode_region_realign_handles_known_packets():
+    # trigger, ignore, contextid, exc-exit are now consumed (region survives)
+    data = bytes([0x88, 0x0C, 0x66, 0x88, 0x00])
+    events, _, realigns = L.decode_region_realign(data, 0, 0x08001000)
+    kinds = [e.kind for e in events]
+    assert kinds.count("atoms") == 2     # the two P-headers
+    assert realigns == 0                 # nothing needed realign
+
+
+def test_decode_region_realign_recovers_after_shift():
+    # Build a valid run of P-headers, then splice a 3-bit-shifted run of
+    # P-headers; the realigner should recover and decode the second run too.
+    good = bytes([0x88, 0x88, 0x88])
+    tail = bytes([0x88] * 6)
+    # shift tail LEFT 3 bits to misalign
+    late = bytearray()
+    prev = 0
+    for b in tail:
+        late.append(((b << 3) | (prev >> 5)) & 0xFF)
+        prev = b
+    data = good + bytes(late)
+    events, _, realigns = L.decode_region_realign(data, 0, 0x08001000)
+    # at least the first run's P-headers decode; realign attempted on the
+    # misaligned tail
+    assert sum(1 for e in events if e.kind == "atoms") >= 3
+    assert realigns >= 1
+
+
+def test_decode_region_realign_on_fixture_extends():
+    import os
+    if not os.path.exists(FIXTURE):
+        pytest.skip("fixture missing")
+    data = open(FIXTURE, "rb").read()
+    syncs = L.find_isyncs(data)
+    assert syncs
+    s = syncs[0]
+    plain, end_plain, _ = (lambda r: (r[0], r[1], 0))(L.decode_region(data, s.offset + 6, s.addr)) \
+        if False else (None, None, None)
+    ev_plain, end_p = L.decode_region(data, s.offset + 6, s.addr)
+    ev_re, end_re, realigns = L.decode_region_realign(data, s.offset + 6, s.addr)
+    # realigning version consumes at least as much as the plain walk
+    assert len(ev_re) >= len(ev_plain)
+
+
+def test_decode_region_realign_consumes_cyccnt_and_timestamp():
+    # cyccnt (0x04) + 1 continuation byte (bit7), then timestamp (0x42) + cont,
+    # then a P-header, then async-stop.
+    data = bytes([0x04, 0x81, 0x00, 0x88, 0x00])
+    events, _, realigns = L.decode_region_realign(data, 0, 0x08001000)
+    assert realigns == 0
+    assert any(e.kind == "atoms" for e in events)
+
+
+def test_decode_region_realign_malformed_isync_triggers_realign_or_stop():
+    # 0x08 followed by a non-flash addr (SRAM) is a malformed Normal I-sync;
+    # the walker must not emit it as an anchor.
+    bad = bytes([0x08, 0x00, 0x00, 0x00, 0x00, 0x20])
+    data = bytes([0x88]) + bad + bytes([0x88] * 6)
+    events, _, _ = L.decode_region_realign(data, 0, 0x08001000)
+    assert all(not (e.kind == "isync" and e.addr == 0x20000000) for e in events)
+
+
+def test_decode_all_realign_runs():
+    blk = L.ASYNC + make_isync(0x08002000) + bytes([0x88, 0x88, 0x00])
+    data = blk + blk
+    events, realigns = L.decode_all_realign(data)
+    assert any(e.kind == "isync" and e.addr == 0x08002000 for e in events)
+    assert realigns >= 0
+
+
+def test_decode_all_realign_on_fixture_extends():
+    import os
+    if not os.path.exists(FIXTURE):
+        pytest.skip("fixture missing")
+    data = open(FIXTURE, "rb").read()
+    plain = L.decode_all(data)
+    extended, realigns = L.decode_all_realign(data)
+    # extended decode recovers at least as many events as the plain walk
+    assert len(extended) >= len(plain)

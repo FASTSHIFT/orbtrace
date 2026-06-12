@@ -40,17 +40,24 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("captures", nargs="+")
     ap.add_argument("--elf", default=os.environ.get("ELF", "/tmp/axf/proj_new.axf"))
+    ap.add_argument("--realign", action="store_true",
+                    help="extend regions with sub-byte realignment (V4; flow "
+                         "is indicative, only I-sync anchors are ground truth)")
     a = ap.parse_args()
 
     all_events = []
     for f in a.captures:
         data = open(f, "rb").read()
-        ev = L.decode_all(data)
+        if a.realign:
+            ev, realigns = L.decode_all_realign(data)
+        else:
+            ev, realigns = L.decode_all(data), 0
         isyncs = [e for e in ev if e.kind == "isync"]
         exec_atoms = sum(e.eatoms for e in ev if e.kind == "atoms")
         branches = sum(1 for e in ev if e.kind == "branch")
+        extra = f"  realigns={realigns}" if a.realign else ""
         print(f"{f}: {len(data)}B  I-sync anchors={len(isyncs)}  "
-              f"exec-atoms={exec_atoms}  branches={branches}")
+              f"exec-atoms={exec_atoms}  branches={branches}{extra}")
         all_events.extend(ev)
 
     pcs = sorted({e.addr for e in all_events if e.kind == "isync"})
