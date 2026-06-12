@@ -125,8 +125,11 @@ graph TD
 - [x] **根因定位**：裸 TPIU 帧喂 orbuculum 打散到杂 tag，因 FPGA 侧少做了 orbtrace 后 6 级管线；orbuculum 期望 OFLOW 格式（见 `stage4-datapath/06/07`）
 - [x] **A 路线**：FPGA 侧补全 traceIF→tpiu_demux→checksum→cobs→super_framer，输出原生 OFLOW（`trace_orbflow_top.v`，iverilog elaboration 通过；待上板）
 - [x] 工程化固化：`build.sh`/`program.sh`/`etm_enable.sh`/`capture.sh`/`decode.sh` + QSPI flash 固化（`flash_program.tcl`，IS25LP128F）
-- [ ] 上板：orbcat `-p OFLOW -t 1` 解出单流（A-2）
-- [ ] 与 STM32 已知程序行为对拍（orbmortem，A-3）
+- [x] **上板 A/B 实测推翻 A 路线**：OrbFlow（过 tpiu_demux）解出 **0** I-sync 锚点（demux 把裸 ETM 流搅毁）；trace_stream（只到 traceIF 帧、不过 demux）稳定 **14-15** 锚点 → 真 PC。坐实**我们的裸流不能过 tpiu_demux**（见 `stage4-datapath/10` §8）。
+- [x] **确定正确路线（消去法）**：FPGA 出 traceIF 字节流 → PC 端 `etm35lib` **直接按 ARM 规范锚定 I-sync**（绕过 tpiu_demux，对应 orbtrace bypass 语义）。
+- [x] **端到端实测通过**：`trace_run.sh`(配 ETM→re-arm trace_stream→dump→`etm_decode_cli.py`)上板解出 **真实函数链**（`HAL::HAL_Update`/`draw_label`/`draw_x_ticks`/`lv_theme_default_init`/`lv_timer_handler` 等,带 file:line),与 LVGL widgets demo 吻合。
+- [x] **工具链测试**：`etm35lib` 53 用例 100% 行覆盖 + 真实抓取回归 fixture；ARM 规范(IHI0014Q/DDI0440C)交叉核对(`08`)。
+- 收尾(可选增强)：per-A-sync 子字节重对齐 + region 续解延长连续流；OrbFlow seq number + UDP 丢包统计(V4)。
 
 ### V4 · 升速逼满速命门 + UDP 鲁棒性
 - **升速**：逐步抬 trace_clk 到目标速率，看 V1 眼图余量、lost_cnt、UDP 丢包/乱序随速率的退化曲线。
