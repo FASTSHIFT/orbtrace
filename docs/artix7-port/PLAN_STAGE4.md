@@ -131,13 +131,16 @@ graph TD
 - [x] **工具链测试**：`etm35lib` 53 用例 100% 行覆盖 + 真实抓取回归 fixture；ARM 规范(IHI0014Q/DDI0440C)交叉核对(`08`)。
 - 收尾(可选增强)：per-A-sync 子字节重对齐 + region 续解延长连续流；OrbFlow seq number + UDP 丢包统计(V4)。
 
-### V4 · 升速逼满速命门 + UDP 鲁棒性
+### V4 · 连续流增强 + 升速命门 + UDP 鲁棒性
+- **子字节重对齐(已完成)**：`etm35lib.decode_region_realign`/`decode_all_realign` 在错位处试 1..7 bit 移位续解,实测把解码事件延长最多 3.3×(`stage4-datapath/11`)。**诚实边界**:I-sync 锚点是真值,重对齐延长流是指示性(无独立佐证)。CLI `--realign` opt-in。
+- [x] per-A-sync 子字节重对齐 + region 续解(63 用例/98% 覆盖)
 - **升速**：逐步抬 trace_clk 到目标速率，看 V1 眼图余量、lost_cnt、UDP 丢包/乱序随速率的退化曲线。
 - **UDP 鲁棒性**（回应「UDP 怎么防丢包/乱序」）：先**加 seq number 进 OrbFlow 帧**，PC 端统计丢失/乱序率，**用数据说话**该不该上重传 / FEC，而不是拍脑袋提前做。
 - **判据**：在某个可量化的 trace_clk 上限内，lost_cnt==0 且 PC 解码无错；超过则记录退化点作为工具能力边界。
 - [ ] OrbFlow 帧加 seq number
 - [ ] PC 端丢包/乱序统计
 - [ ] 升速退化曲线 + 工具能力边界数字
+- **根治字节对齐(硬件方向)**：4-bit 口非字节对齐是 PC 端 trick 无法根治的;要让延长流也变铁证,需 FPGA 侧做真正的 TPIU formatter 重封装(像 ORBTrace),让流天然字节对齐。列为后续硬件增强。
 
 ---
 
