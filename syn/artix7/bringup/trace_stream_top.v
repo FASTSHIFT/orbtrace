@@ -19,9 +19,16 @@
 
 module trace_stream_top #(
     parameter [4:0] TAP   = 5'd28,    // V2 eye centre
-    parameter       DEPTH = 61440     // captured bytes (60 KB = 3840 frames);
+    parameter       DEPTH = 61440,    // captured bytes (60 KB = 3840 frames);
                                       // keep < 65536 so 16-bit ext_addr also
                                       // reaches the status bytes at DEPTH..+2
+    parameter       CAP_RAW = 0       // 0: capture traceIF 16-byte frames;
+                                      // 1: capture RAW nibble bytes
+                                      // {trace_b[3:0],trace_a[3:0]} per
+                                      // trace_clk (pre-traceIF) so the PC can
+                                      // run orbtrace TPIUSync/TPIUDemux on the
+                                      // true pin stream and settle whether the
+                                      // STM32 formatter framing is present.
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -96,10 +103,6 @@ module trace_stream_top #(
         .idelayctrl_rdy(idelayctrl_rdy)
     );
 
-    // traceIF assembles byte-aligned 16-byte TPIU frames (drops 0x7fff idle,
-    // resolves sync) — exactly what orbuculum's TPIU demux expects. We dump
-    // these frames, NOT raw nibbles, so the PC gets a clean byte-aligned
-    // stream regardless of DDR nibble phase.
     wire        fr_avail;
     wire [127:0] frame;
     traceIF #(.MAXBUSWIDTH(4)) u_traceif (
@@ -118,39 +121,60 @@ module trace_stream_top #(
     end
     wire frame_strobe = fr_iso ^ fr_q;
 
-    // one-shot capture: store whole 128-bit frames (one BRAM write per
-    // decoded frame, race-free). Serialize to bytes at UDP readout.
-    localparam NFR = DEPTH/16;        // number of frames
-    localparam FAW = $clog2(NFR);
-    (* ram_style = "block" *)
-    reg [127:0] capmem [0:NFR-1];
-    reg [FAW:0] wr_ptr;               // extra bit = full
-    wire full = wr_ptr[FAW];
-    wire wr_en = frame_strobe && !full;
-    always @(posedge trace_clk) begin
-        if (wr_en) capmem[wr_ptr[FAW-1:0]] <= frame;
-    end
-    // wr_ptr uses SYNCHRONOUS reset: it drives the BRAM write address, and an
-    // async reset on that path triggers DRC REQP-1839 (possible RAM
-    // corruption). sys_rst is already a synchronized signal in trace_clk's
-    // sibling domains, so a sync reset here is safe and clean.
-    always @(posedge trace_clk) begin
-        if (sys_rst)      wr_ptr <= 0;
-        else if (wr_en)   wr_ptr <= wr_ptr + 1'b1;
-    end
-
-    // UDP readout: ext_addr is a byte address. frame = ext_addr>>4, byte =
-    // ext_addr[3:0]. Serialize MSB-first to match how traceIF packs Frame.
     wire [15:0] ext_addr;
-    reg  [127:0] frd;
-    always @(posedge clk125) frd <= capmem[ext_addr[FAW+3:4]];
-    wire [3:0] bsel = ext_addr[3:0];
-    wire [7:0] cap_byte = frd[8*(15 - bsel) +: 8];
-    localparam [15:0] NB = DEPTH;     // captured byte count = NFR*16
-    wire [7:0] ext_data = (ext_addr < NB)        ? cap_byte :
+    wire [7:0]  ext_data;
+    localparam [15:0] NB = DEPTH;
+
+    generate
+    if (CAP_RAW) begin : g_raw
+        // ---- RAW nibble capture: one byte {trace_b,trace_a} per trace_clk ----
+        localparam RAW_AW = $clog2(DEPTH);
+        (* ram_style = "block" *)
+        reg [7:0] rawmem [0:DEPTH-1];
+        reg [RAW_AW:0] rwr;
+        wire rfull = rwr[RAW_AW];
+        wire [7:0] nib = {trace_b, trace_a};
+        always @(posedge trace_clk) begin
+            if (!rfull) rawmem[rwr[RAW_AW-1:0]] <= nib;
+        end
+        always @(posedge trace_clk) begin
+            if (sys_rst)      rwr <= 0;
+            else if (!rfull)  rwr <= rwr + 1'b1;
+        end
+        reg [7:0] rrd;
+        always @(posedge clk125) rrd <= rawmem[ext_addr[RAW_AW-1:0]];
+        assign ext_data = (ext_addr < NB)        ? rrd :
+                          (ext_addr == NB+0)     ? NB[7:0] :
+                          (ext_addr == NB+1)     ? NB[15:8] :
+                          (ext_addr == NB+2)     ? {7'b0, rfull} : 8'h00;
+        assign led1 = ~rfull;
+    end else begin : g_frame
+        // ---- traceIF 16-byte frame capture (default) ----
+        localparam NFR = DEPTH/16;
+        localparam FAW = $clog2(NFR);
+        (* ram_style = "block" *)
+        reg [127:0] capmem [0:NFR-1];
+        reg [FAW:0] wr_ptr;
+        wire full = wr_ptr[FAW];
+        wire wr_en = frame_strobe && !full;
+        always @(posedge trace_clk) begin
+            if (wr_en) capmem[wr_ptr[FAW-1:0]] <= frame;
+        end
+        always @(posedge trace_clk) begin
+            if (sys_rst)      wr_ptr <= 0;
+            else if (wr_en)   wr_ptr <= wr_ptr + 1'b1;
+        end
+        reg [127:0] frd;
+        always @(posedge clk125) frd <= capmem[ext_addr[FAW+3:4]];
+        wire [3:0] bsel = ext_addr[3:0];
+        wire [7:0] cap_byte = frd[8*(15 - bsel) +: 8];
+        assign ext_data = (ext_addr < NB)        ? cap_byte :
                           (ext_addr == NB+0)     ? NB[7:0] :
                           (ext_addr == NB+1)     ? NB[15:8] :
                           (ext_addr == NB+2)     ? {7'b0, full} : 8'h00;
+        assign led1 = ~full;
+    end
+    endgenerate
 
     fpga_core_net #(.TARGET("XILINX")) u_eth (
         .clk(clk125), .clk90(clk125_90), .rst(sys_rst),
@@ -169,7 +193,7 @@ module trace_stream_top #(
     assign phy_mdc  = 1'b0;
 
     assign led0 = ~idelayctrl_rdy;
-    assign led1 = ~full;     // off while filling, on (steady low) when full
+    // led1 is driven inside the CAP_RAW generate blocks (full/rfull).
 
 endmodule
 

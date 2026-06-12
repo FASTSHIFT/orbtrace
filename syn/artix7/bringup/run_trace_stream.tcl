@@ -60,8 +60,10 @@ read_xdc $bdir/trace_stream.xdc
 
 set tap 28
 if {[info exists ::env(TAP)]} { set tap $::env(TAP) }
-puts "============ TAP = $tap ============"
-synth_design -top trace_stream_top -part $part -generic TAP=$tap
+set capraw 0
+if {[info exists ::env(CAP_RAW)]} { set capraw $::env(CAP_RAW) }
+puts "============ TAP = $tap  CAP_RAW = $capraw ============"
+synth_design -top trace_stream_top -part $part -generic TAP=$tap -generic CAP_RAW=$capraw
 opt_design
 place_design
 route_design
