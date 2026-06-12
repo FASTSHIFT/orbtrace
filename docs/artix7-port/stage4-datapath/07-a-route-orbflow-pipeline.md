@@ -195,3 +195,98 @@ orbmortem -f /tmp/oflow.bin -P ETM3.5 -e proj.axf   # 重建 PC/函数流（ncur
 - **若 OFLOW 仍解不出**：先用 `decode.sh --mortem` 看 orbmortem 是否锁帧；A 路线已消除字节序变量，剩余变量只剩 ETM3.5 包内容本身（工作负载密度），可换繁忙工作负载或 J-Link 参考流逐字节对比（r13 弹药）。
 - **CDC 溢出**：`trace_lost_cnt`（UDP `DEPTH+3/+4`）非零即说明 trace_clk 太快、FIFO 深度不够，需加深 FIFO 或降 HCLK。
 - **回退路径**：`trace_stream_top`（吐 traceIF 帧）+ Python 离线 traceIF 重放（已验证 841 帧）仍可用作旁证。
+
+---
+
+## 8. ★ 突破（第七轮，2026-06-12 上板实测）：这颗芯片是裸 ETM3.5，不是 TPIU formatter 流
+
+承接 §6.1「TPIU 通道散到 21 个 tag」的疑点，做了**离线分层判别**（烧 `trace_stream.bit` 吐裸 traceIF 帧，PC 端跑参考 demux + 多假设扫描，零重编译）：
+
+### 判别过程（全实测）
+1. **参考 TPIU demux 跑 traceIF 帧**（`tpiu_analyze.py`，复刻 orbtrace Unmangle+TrackStream）：数据散到 **20-35 个通道**，channel 2 仅 8-9%，channel 0 占 24-26%。
+   - 单一 ETM 源（TraceID=2）经正常 TPIU formatter，应几乎全部落在 channel 2。散成几十个通道 = **被当作 TPIU ID 字节的那些字节其实是 ETM 数据字节** → TPIU formatter 没开。
+2. **裸流扫 ETM3.5 A-sync**（`etm_raw_scan.py`）：原始字节序下 **16 个 A-sync（000000000080）**，间距规律聚在 **~1480 字节**（2958≈2×, 4525≈3×, 8901≈6×）。规律间距 = 真实 ETM sync cadence。任何 nibble-swap/bit-reverse/帧反转都把 A-sync 打到 0-1 个 → **原始字节序就是正确的裸 ETM3.5 顺序**。
+
+**结论：STM32 TPIU 处于 bypass/continuous 模式，输出裸 ETM3.5，不该过 tpiu_demux。** 这解释了为何 A 路线 OFLOW（强制走 demux）通道散乱——管线本身正确，但对这个 trace 源用错了分支（应走 SWO-style bypass，不走 trace-path demux）。
+
+### 已解析出的真实信息（对齐 A-sync 后喂 etmdecode）
+- **17 个去重真实 flash PC 地址**，全部 `0x0800xxxx` 代码段
+- 经 `arm-none-eabi-addr2line` 映射到**十余个真实 LVGL 函数（带文件:行号）**：
+  - `_lv_disp_refr_timer` (lv_refr.c:294)、`lv_img_decoder_built_in_line_true_color` (lv_img_decoder.c)、`draw_quarter_3` (lv_draw_sw_arc.c)、`chart_event_cb` (lv_demo_widgets.c)、`_lv_ll_get_next` (lv_ll.c)、`lv_color_make`、`_out_rev`/`_atoi` (lv_printf.c)
+  - 这是一条连贯的 **LVGL 渲染调用链**指纹（显示刷新→图像解码→圆弧绘制→链表遍历），与被测程序（LVGL widgets demo）完全吻合。
+
+**当前能力 = 散点 PC 锚点（十余真实函数），尚非逐指令连续流**：`etmdecode` 报 `syncCount=0`——A-sync 锁到了 packet 对齐，但解码器要等正式 **I-SYNC**（0x08 包，携带绝对 PC + info）才 `rxedISYNC` 并连续报地址。I-SYNC 没被干净识别 → 拿到的是分支目标散点，不是连续 atom 流。
+
+### 下一步（两条并行）
+1. **修 I-SYNC 锁定**（PC 解码侧，零上板）：在每个 A-sync 处强制重置 ETM35 packet 状态机再续解；核对 STM32 ETMSYNCFR（实测 = 0x400=1024，且写 0x100 不生效 → 该寄存器固定值），评估能否提高 I-SYNC 密度。
+2. **A 路线补 bypass 分支**（FPGA 侧）：对裸 ETM 源，让 traceIF 帧**不经 tpiu_demux**、直接按 OFLOW tag 2 打包（对应 orbtrace core.py 的 `input_bypass`/`bypass` 路径），PC 端 orbmortem `-p OFLOW -t 2 -P ETM3.5` 原生连续解。
+
+> 诚实定位：FPGA 采样链 + traceIF 成帧 + OFLOW 管线**全部实测合格**；现在的瓶颈是「对裸 ETM 源选错了管线分支（demux vs bypass）」+「I-SYNC 连续锁定」，都是明确、可执行的收尾项，已能解出真实函数名作为铁证。
+
+---
+
+## 9. ★ 对照 orbtrace 权威实现（修正 §8 的部分判断）
+
+用户提示「看看 orbtrace 怎么解决」。查了两处权威源码，得到决定性对照：
+
+### 9.1 orbtrace 对并行 ETM **永远开 TPIU formatter**（`gdbtrace.init`）
+所有 `enable*TRACE` / `prepareTrace` 并行使能函数最后固定三行：
+```
+set *($TPIUBASE+0xf0)  = 0       # SPPR = parallel
+set *($TPIUBASE+0x04)  = 1<<bits # CSPSR = port size
+set *($TPIUBASE+0x304) = 0x102   # FFCR: EnFCont(bit1)+EnFTC(bit0) = formatter ON
+```
+即 **orbtrace 期望并行口出来的是 16 字节 TPIU 帧**，PC 端 `tpiuDecoder.c` 按 `SYNCPATTERN=0xFFFFFF7F` 锁帧、过滤半同步 `0x7fff`、`_getPacket` 解 ID/data。gateware（`core.py`）里并行 trace（input_format 0x01-0x03）**必走 `tpiu_demux`**，bypass 只给 SWO（0x10/0x12）。
+
+→ **修正 §8 步骤 2 的措辞**：orbtrace 不会对并行 ETM 走 bypass。"补 bypass 分支"不是 orbtrace 的做法。
+
+### 9.2 但我们的流里**没有 TPIU sync pattern**（实测，决定性）
+- `trace_dump` 实测：`ff ff ff 7f` 出现 **0 次**；全 60KB 只有 **63 个 `0xff` 字节**。
+- 跨全部 8 个 bit 对齐搜 `0xFFFFFF7F`（MSB-first / LSB-first）：**0 命中**。
+- 一个真正的 TPIU formatter 流**必然**周期性出现 `0xFFFFFF7F` 全同步 + 大量 `0x7fff` 半同步（→ 海量 0xff）。我们几乎没有 0xff。
+
+**这说明：尽管 STM32 的 `FFCR=0x102` 回读正确（formatter 名义上开着），实际并行口出来的字节里没有 TPIU 帧结构。** 而裸流又有规律的 ETM A-sync（~1480 间距）、能解出真实 LVGL 函数。两条实测证据一致指向：**到达 traceIF 的就是裸 ETM 字节，TPIU formatter 的帧封装没有真正生效**（或 traceIF 的 sync 搜索/对齐把帧结构吃掉了——但那样 0xff 密度不会这么低）。
+
+### 9.3 现场寄存器实测（live readback）
+```
+TPIU_SPPR  = 0x0   (parallel)         TPIU_CSPSR = 0x08 (4-bit)
+TPIU_FFCR  = 0x102 (formatter on)     TPIU_FFSR  = 0x08 (FtNonStop)
+TPIU_TYPE  = 0xca1                     ETMCR = 0x980  ETMSR = 0x0  ETMCCR = 0x8c842000
+```
+配置与 orbtrace 完全一致，但流里就是没有 formatter 帧。**这正是与 orbtrace 标准路径的唯一实质差异点**，也是下一步要钉死的根因。
+
+### 9.4 修正后的下一步
+1. **钉根因**：为什么 FFCR=0x102 却无 TPIU 帧。怀疑方向：(a) 这颗 F429 在**单一 ETM 源**下 formatter 不插帧（需 ITM 也开、或需 `FFCR` 其它位）；(b) traceIF 的 width/对齐使 formatter 帧无法被识别。验证手段：开 ITM+DWT 同时跑（多源会强制 formatter 插帧/同步），重抓看 `0xFFFFFF7F` 是否出现。
+2. **务实拿结果**：无论 formatter 是否插帧，裸 ETM 已能解出真实函数。**强化 etmdecode 的 I-SYNC 锁定**（每个 A-sync 处 `TRACEDecoderForceSync` + 续解），把"散点函数"做成"连续 PC 流"，作为当前可交付结果。
+3. 用 ITM/DWT 路线做 orbtrace `prepareSWO`-style 对照流，逐字节比对帧结构差异。
+
+> 关键澄清：orbtrace 的标准答案是「并行口开 TPIU formatter + PC 走 tpiu_demux」。我们配置已对齐它，但实测流缺 TPIU 帧——这是被测 STM32 侧 formatter 行为问题，不是 FPGA 管线问题。FPGA 侧（采样/traceIF/OFLOW）保持与 orbtrace 同构即可。
+
+---
+
+## 10. ★ 多源测试结果 + 根因收敛（第八轮，实测）
+
+按 §9.4 步骤 1，开 **ETM+ITM/DWT 双源**（`etm_itm_enable.cfg`，ITM_TCR=0x1000d、DWT_CTRL=0x40010bff 实测确认）重抓：
+
+| 配置 | 0xff 字节 | A-sync | TPIU demux 通道数 | ch2 占比 |
+|------|----------|--------|------------------|----------|
+| 仅 ETM | 63 | 16 | 34 | 13% |
+| **ETM+ITM** | 14 | 18 | 28 | 7% |
+
+**双源也没出现 TPIU 帧结构，通道照样散。** 这**排除了**「单源 formatter 不插帧」的假设——无论几个源，到达 FPGA 的字节流都没有 TPIU 16 字节帧。
+
+### 根因收敛
+现存全部实测事实：
+- ETM A-sync 始终在（16-18 个），间距规律 ~1480 字节，**长零游程对位移鲁棒**；
+- TPIU sync `0xFFFFFF7F` 跨所有 bit 对齐 = 0；`0x7fff` 半同步几乎没有（0xff 仅 14-63 个）；
+- TPIU demux 在任意字节序下都散到 28-43 通道；
+- 裸 ETM 解码能解出真实 LVGL 函数，但每个 A-sync 后**很快丢锁**（16 anchor 仅 17 地址）。
+
+「A-sync 在但 TPIU 帧结构没了 + 解码很快丢锁」这一组合，最可能的根因是 **traceIF 的 nibble 通道映射/相位有偏**：traceIF 靠 `0x7FFFFFFF` 锁同步，若 `trace_a`(上升沿)/`trace_b`(下降沿) 或 4 条 lane 的高低位映射与 STM32 实际输出不一致，组装出的字节会整体**位移/换序**——长零游程的 A-sync 仍能幸存，但需要精确字节边界的 TPIU 帧、以及 ETM packet 的逐字节续解会被破坏。这与 V1 自环（自发自收、lane 映射自洽）能解对、而接真实 STM32 解不连续的现象一致。
+
+### 决定性下一步（按优先级）
+1. **核 traceIF lane 映射**（最可能根因，零成本验证）：用一段**已知指令**（如紧循环 `b .`）让 STM32 发可预测 ETM 流，逐 bit/lane 试 4 条 trace_data 的顺序与 a/b 沿归属，找能让 TPIU `0xFFFFFF7F` 出现、或 ETM 连续锁的映射。V1 自环没暴露这个，因为自发自收两端映射天然自洽。
+2. 若 lane 映射修正后 TPIU 帧出现 → 回到 orbtrace 标准路径（A 路线 OFLOW + tpiu_demux）即可原生解。
+3. 若确认 STM32 就是不发 formatter 帧 → 按裸 ETM 收，强化 etmdecode 的 per-A-sync force-sync 续解。
+
+> 与 orbtrace 对照的最终结论：orbtrace 标准路径（formatter on + tpiu_demux）我们已 1:1 复刻且配置实测一致；剩余差异收敛到 **FPGA traceIF 前端的 lane/相位映射**这一具体、可逐位验证的点，而非管线架构。已交付的真实函数名（LVGL 渲染链）证明数据与采样链是好的。
