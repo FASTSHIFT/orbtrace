@@ -327,3 +327,37 @@ ETM3.5 解码器锁定需要两级同步包：
 3. **务实交付**：当前已能稳定解出 LVGL 渲染链的真实函数集（散点）。若要连续 PC 流,核心是拿到密集 I-SYNC,与 FPGA/采样无关。
 
 > 一句话:**采样链已被实测证清白（32-tap 全开眼）,瓶颈 100% 在 STM32 ETM 输出的同步包密度 + TPIU 帧结构,即被测对象侧的 trace 源配置。不用改 LVGL,要调的是 STM32 的 ETM/TPIU 寄存器。**
+
+---
+
+## 12. ★ 深挖：force-sync 续解 + 根因再定位（第十轮，实测）
+
+### 逐字节核实数据本身（全实测）
+- **traceIF 的 0x7FFFFFFF 帧同步字在 60KB 里只出现 1 次** → traceIF 开头锁一次后自由跑,吐的"16 字节帧"其实是连续 ETM 流切片(字节连续、正确),**没有 TPIU formatter 帧**(再次坐实裸 ETM)。
+- 撤销 traceIF 的 16-bit 字节交换 → A-sync 归零 → **当前字节序就是对的**,排除字节序问题。
+- 0xff 仅 3 个、0x7fff 半同步几乎没有 → traceIF 没有误删 ETM 字节,排除"丢包损坏"。
+- 手解 ETM3.5 包文法:A-sync 后是 105 个 P-header(`0x88/0x8c/0x84`,Format-1,2 atom 执行)+ 63 个 branch + 稀疏 I-SYNC → **数据是合法 ETM3.5 packet**。
+- **ETMSYNCFR(0x1E0) 实测只读固定 0x400=1024**,写不动 → A-sync 周期硬件固定(实测间距 ~1500 字节,吻合)。
+
+### 关键修复:force-sync 续解(etmdecode2.c)
+stock 解码器要在 IDLE 态撞到 I-SYNC(0x08)才 `rxedISYNC` 报地址;一旦在变长包上脱轨就一直 lost 到下次自对齐。**新写 `etmdecode2.c`:自己扫 A-sync,每个 A-sync 调 `TRACEDecoderForceSync` 让引擎干净重入 IDLE**,再续解。
+
+| 解码器 | sync | flash PC 命中 | 解出函数 |
+|--------|------|--------------|----------|
+| stock etmdecode | **0** | 17 | ~10 |
+| **etmdecode2 (force-sync)** | **71** | **180(55 去重)** | **23+** |
+
+**单次 60KB:sync 0→18,flash 命中 17→43。多 capture 合并:解出 23+ 个真实 LVGL 函数**,覆盖图像解码(`lv_img_decoder_built_in_*`)、主题初始化(`lv_theme_default_init`)、下拉/平铺控件(`lv_dropdown_*`/`lv_tileview_*`)、链表(`_lv_ll_*`)、显示刷新(`_lv_disp_refr_timer`)——一组连贯的 LVGL widgets demo 执行足迹。
+
+### 根因再定位(收敛)
+- 每个 A-sync 处能干净 force-sync(sync=71、lostSync=0),但 A-sync **之间** ~1500 字节内解码会脱轨(180 flash 命中 / 61476 地址事件,绝大多数仍是相对地址垃圾)。
+- 9/18 个 A-sync 后跟 `0x88`(=`0x08|0x80`,I-SYNC 多了 bit7);其余 9 个跟值各异——**不是单一固定 lane 卡死**,而是**inter-sync 段里零星 bit 错**:A-sync(长零)皮实扛得住,变长 ETM 包一遇错就脱轨,直到下个 A-sync 救回。
+
+**最终判定**:数据 = 合法裸 ETM3.5,采样相位 OK(32-tap 全开眼),但**真实 STM32 trace_clk 速率下 inter-sync 段有零星 bit 错**(SI 余量在这个速率/杜邦线下不足以做到逐字节零错)。这与 V1 自环(固定 pattern、眼宽)能逐字节全对、而真实高熵 ETM 流暴露零星错的现象一致。
+
+### 下一步(按收益排序)
+1. **降 STM32 trace_clk**:trace_clk 现绑 HCLK(~168MHz→DDR 336Mbps/lane)。降 HCLK 或加 TRACECLK 分频,把每比特展宽,zero inter-sync 错 → 连续 PC 流。这是最可能一击见效的(纯 STM32 侧,不改 LVGL、不改 FPGA)。
+2. **缩短走线/改善 SI**:杜邦线换短/加地线回流;或上板载 trace 连接器。
+3. 解码侧 force-sync 已交付(`etmdecode2.c` + `etm_recover2.sh`),作为容错兜底。
+
+> 收敛结论:链路三段(采样 / traceIF 成帧 / 解码)全部打通并实测;**唯一剩余瓶颈是真实速率下 inter-sync 段的零星比特错**,根因在物理速率/SI,解法是**降 trace_clk**(STM32 侧寄存器,不碰程序)。已用 force-sync 解出 23+ 真实函数作为阶段性铁证。
