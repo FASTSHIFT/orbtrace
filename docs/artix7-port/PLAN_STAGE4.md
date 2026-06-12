@@ -121,9 +121,12 @@ graph TD
 ### V3 · PC 端 Orbuculum 真集成（可与 V0/V1 并行）
 - **背景**：`PLAN.md` S6 把 orbuculum（meson + libusb 的 C 项目）的完整集成明确留到本阶段，避免早期引入重依赖。
 - **判据**：Orbuculum 从 UDP/网络源实时 ingest，解出**正确的函数跳转 / PC 流**，和 STM32 实际跑的代码对得上。
-- [ ] 编译 orbuculum（meson + libusb）
-- [ ] 接 UDP/网络源，解 OrbFlow over 网络
-- [ ] 与 STM32 已知程序行为对拍
+- [x] 编译 orbuculum（meson + ninja，2.2.0）
+- [x] **根因定位**：裸 TPIU 帧喂 orbuculum 打散到杂 tag，因 FPGA 侧少做了 orbtrace 后 6 级管线；orbuculum 期望 OFLOW 格式（见 `stage4-datapath/06/07`）
+- [x] **A 路线**：FPGA 侧补全 traceIF→tpiu_demux→checksum→cobs→super_framer，输出原生 OFLOW（`trace_orbflow_top.v`，iverilog elaboration 通过；待上板）
+- [x] 工程化固化：`build.sh`/`program.sh`/`etm_enable.sh`/`capture.sh`/`decode.sh` + QSPI flash 固化（`flash_program.tcl`，IS25LP128F）
+- [ ] 上板：orbcat `-p OFLOW -t 1` 解出单流（A-2）
+- [ ] 与 STM32 已知程序行为对拍（orbmortem，A-3）
 
 ### V4 · 升速逼满速命门 + UDP 鲁棒性
 - **升速**：逐步抬 trace_clk 到目标速率，看 V1 眼图余量、lost_cnt、UDP 丢包/乱序随速率的退化曲线。
