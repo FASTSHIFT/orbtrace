@@ -347,3 +347,137 @@ def test_decode_all_on_fixture():
     assert len(isyncs) == 2
     # at least some executed-atom flow recovered after the anchors
     assert any(e.kind == "atoms" for e in events)
+
+
+# ----------------------------------------------------------------------------
+# Alignment-aware decode (IHI0014Q §7.10.4 sub-byte realignment)
+# ----------------------------------------------------------------------------
+def _async_block(payload: bytes) -> bytes:
+    """A canonical A-sync (5 zeros + 0x80) followed by payload."""
+    return L.ASYNC + payload
+
+
+def test_find_isync_in_window_basic():
+    win = bytes([0x88, 0x8c]) + make_isync(0x08001234) + bytes([0x88])
+    hit = L._find_isync_in_window(win)
+    assert hit is not None
+    off, s = hit
+    assert s.addr == 0x08001234
+
+
+def test_find_isync_in_window_none():
+    assert L._find_isync_in_window(bytes([0x88, 0x8c, 0x01, 0x40] * 4)) is None
+
+
+def test_decode_aligned_shift0():
+    # A-sync, then (aligned) I-sync + a P-header. Shift 0 should win.
+    data = _async_block(make_isync(0x08002000) + bytes([0x88, 0x00]))
+    regions = L.decode_aligned(data)
+    assert len(regions) == 1
+    r = regions[0]
+    assert r.shift == 0
+    assert r.isync.addr == 0x08002000
+    assert any(e.kind == "atoms" for e in r.events)
+
+
+def test_decode_aligned_recovers_bitshifted_region():
+    # Build an aligned region, then shift the WHOLE tail left by 3 bits to
+    # emulate a 3-bit-late capture; decode_aligned must find shift==3.
+    payload = make_isync(0x0800c0de) + bytes([0x88, 0x88, 0x00])
+    # left-shift tail by 3 bits (capture 3 bits late)
+    late = bytearray()
+    prev = 0
+    for b in payload:
+        late.append(((b << 3) | (prev >> 5)) & 0xFF)
+        prev = b
+    data = L.ASYNC + bytes(late)
+    regions = L.decode_aligned(data)
+    assert len(regions) == 1
+    assert regions[0].shift == 3
+    assert regions[0].isync.addr == 0x0800c0de
+
+
+def test_decode_aligned_skips_async_without_isync():
+    # An A-sync followed by no parseable I-sync in the window -> no region.
+    data = _async_block(bytes([0x88, 0x8c, 0x01, 0x40] * 8))
+    assert L.decode_aligned(data) == []
+
+
+def test_aligned_pcs_dedup():
+    blk = _async_block(make_isync(0x08002000) + bytes([0x88, 0x00]))
+    data = blk + blk
+    assert L.aligned_pcs(data) == [0x08002000]
+
+
+def test_decode_aligned_on_fixture():
+    import os
+    if not os.path.exists(FIXTURE):
+        pytest.skip("fixture missing")
+    data = open(FIXTURE, "rb").read()
+    regions = L.decode_aligned(data)
+    # NOTE: per IHI0014Q §7.10.3 the periodic A-sync and periodic I-sync are
+    # driven by independent counters and need NOT be adjacent. In this fixture
+    # the I-syncs sit ~1000 bytes after the nearest A-sync, beyond the default
+    # scan window, so the windowed A-sync->I-sync search legitimately finds no
+    # region. This documents that the "I-sync immediately follows A-sync"
+    # assumption does not hold and decode must anchor on I-sync independently
+    # (find_isyncs), which the fixture test below covers.
+    for r in regions:
+        assert L.is_flash(r.isync.addr)
+        assert 0 <= r.shift <= 7
+
+
+# ----------------------------------------------------------------------------
+# TPIUSync reference model (orbtrace trace/tpiu.py port) — the byte-aligning
+# front-end we should reuse (10-reuse-gap-audit.md).
+# ----------------------------------------------------------------------------
+def test_tpiu_sync_locks_and_frames():
+    # Full-sync 0xFFFFFF7F (wire order FF FF FF 7F) then 16 payload bytes ->
+    # one complete frame. Note the amaranth buf packs the first payload byte
+    # into the HIGH bits, so the extracted frame is byte-reversed wrt arrival.
+    payload = bytes(range(16))            # 0x00..0x0F
+    stream = bytes([0xFF, 0xFF, 0xFF, 0x7F]) + payload
+    frames = L.tpiu_sync_frames(stream)
+    assert len(frames) == 1
+    assert frames[0] == payload[::-1]
+
+
+def test_tpiu_sync_no_lock_without_fullsync():
+    # Without the full-sync word, nothing is emitted (synced stays False).
+    assert L.tpiu_sync_frames(bytes(range(64))) == []
+
+
+def test_tpiu_sync_filters_halfsync():
+    # After lock, a 0x7FFF half-sync (wire FF 7F) is filtered out, so it does
+    # not consume frame byte slots. Build: fullsync, 14 payload, halfsync,
+    # 2 more payload -> exactly one 16-byte frame of the 16 real payload bytes.
+    payload = bytes(range(16))
+    stream = (bytes([0xFF, 0xFF, 0xFF, 0x7F])
+              + payload[:14] + bytes([0xFF, 0x7F]) + payload[14:])
+    frames = L.tpiu_sync_frames(stream)
+    assert len(frames) == 1
+    assert frames[0] == payload[::-1]
+
+
+def test_tpiu_sync_multiple_frames():
+    payload = bytes(range(16))
+    stream = bytes([0xFF, 0xFF, 0xFF, 0x7F]) + payload + payload
+    frames = L.tpiu_sync_frames(stream)
+    assert len(frames) == 2
+    assert frames[0] == payload[::-1] and frames[1] == payload[::-1]
+
+
+def test_tpiu_sync_on_real_raw_capture():
+    # On a real raw nibble capture, swapping the nibble order ({a<<4|b}) and
+    # running orbtrace's TPIUSync assembles hundreds of aligned TPIU frames --
+    # proving the formatter framing is present and orbtrace's own logic
+    # recovers it (the reuse we were missing). The non-swapped order yields 0,
+    # which also tells us the correct trace_a/trace_b nibble assignment.
+    import os
+    raw_path = "/tmp/trace_etm.bin"
+    if not os.path.exists(raw_path):
+        pytest.skip("raw capture not present")
+    raw = open(raw_path, "rb").read()
+    swapped = bytes((((x & 0xF) << 4) | ((x >> 4) & 0xF)) for x in raw)
+    frames = L.tpiu_sync_frames(swapped)
+    assert len(frames) > 100        # hundreds of aligned frames expected

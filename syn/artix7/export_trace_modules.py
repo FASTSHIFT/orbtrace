@@ -12,7 +12,7 @@ from amaranth.back import verilog
 
 from orbtrace.trace.orbflow import ChecksumAppender, SuperFramer
 from orbtrace.trace.cobs import COBSEncoder
-from orbtrace.trace.tpiu import TPIUDemux
+from orbtrace.trace.tpiu import TPIUDemux, TPIUSync
 
 
 def _wrap_packet8(dut_factory, name, has_bypass=False, bypass_width=8):
@@ -85,6 +85,35 @@ def _wrap_tpiu_demux():
     return W
 
 
+def _wrap_tpiu_sync():
+    """TPIUSync: input is an 8-bit stream, output is ArrayLayout(8,16) (a
+    128-bit TPIU frame). Flatten the frame to a 128-bit signal on the boundary.
+    This is the byte-aligning front-end: it locks 0xFFFFFF7F, filters 0x7FFF
+    half-syncs, and emits aligned 16-byte frames (IHI0014Q / TPIU formatter)."""
+    class W(Elaboratable):
+        def __init__(self):
+            self.in_valid = Signal(); self.in_ready = Signal()
+            self.in_data  = Signal(8)
+            self.reset_sync = Signal()
+            self.out_valid = Signal(); self.out_ready = Signal()
+            self.out_frame = Signal(128)
+        def elaborate(self, platform):
+            m = Module()
+            m.submodules.dut = dut = TPIUSync()
+            m.d.comb += [
+                dut.input.valid.eq(self.in_valid),
+                self.in_ready.eq(dut.input.ready),
+                dut.input.payload.eq(self.in_data),
+                dut.reset_sync.eq(self.reset_sync),
+                self.out_valid.eq(dut.output.valid),
+                dut.output.ready.eq(self.out_ready),
+            ]
+            for i in range(16):
+                m.d.comb += self.out_frame[i*8:(i+1)*8].eq(dut.output.payload[i])
+            return m
+    return W
+
+
 def export(WCls, name, ports_attrs):
     w = WCls()
     ports = [getattr(w, a) for a in ports_attrs]
@@ -114,6 +143,10 @@ def main():
            ['in_valid','in_ready','in_frame',
             'bp_valid','bp_ready','bp_data','bypass_sel',
             'out_valid','out_ready','out_data','out_last'])
+    # TPIUSync (byte-aligning front-end: lock 0xFFFFFF7F, filter 0x7FFF)
+    export(_wrap_tpiu_sync(), 'tpiu_sync',
+           ['in_valid','in_ready','in_data','reset_sync',
+            'out_valid','out_ready','out_frame'])
 
 
 if __name__ == '__main__':

@@ -253,3 +253,111 @@ def decode_all(data: bytes):
         region, _ = decode_region(data, s.offset + 6, s.addr)
         events.extend(region)
     return events
+
+
+# ----------------------------------------------------------------------------
+# Alignment-aware decode (design plan improvement #1, IHI0014Q §7.10.4).
+#
+# A 4-bit (sub-byte) port is not guaranteed byte-aligned: a single capture
+# glitch offsets all subsequent bytes by N bits until the next A-sync, where
+# the decompressor MUST realign. orbuculum does not do this. Here, at each
+# A-sync we try all 8 bit-shifts of the following window and pick the shift
+# that exposes a valid Normal I-sync, then decode that region in that
+# alignment. This converts the "scattered anchors" into per-region aligned
+# decode without any hardware/clock change.
+# ----------------------------------------------------------------------------
+@dataclass
+class AlignedRegion:
+    async_offset: int      # byte offset of the A-sync 0x80 terminator
+    shift: int             # bit-shift (0..7) that aligned this region
+    isync: ISync           # the I-sync that anchored it (addresses are absolute)
+    events: list           # FlowEvent list for the region (incl. the isync)
+
+
+def _find_isync_in_window(window: bytes, max_scan: int = 24):
+    """Search the first max_scan bytes of `window` for a Normal I-sync header
+    that parses to a flash address. Returns (offset, ISync) or None."""
+    limit = min(len(window) - 5, max_scan)
+    for off in range(max(0, limit)):
+        if window[off] != ISYNC_HEADER:
+            continue
+        s = parse_isync_at(window, off)
+        if s is not None:
+            return off, s
+    return None
+
+
+def decode_aligned(data: bytes, scan: int = 24, region_bytes: int = 4096):
+    """Full-stream alignment-aware decode.
+
+    For each A-sync, try shifts 0..7 of the following bytes; the first shift
+    whose window contains a valid I-sync wins. Decode that region from the
+    I-sync in the chosen alignment. Returns a list[AlignedRegion].
+    """
+    regions = []
+    for a_off in find_asyncs(data):
+        tail = data[a_off + 1:]                 # bytes after the 0x80
+        chosen = None
+        for sh in range(8):
+            shifted = bit_shift(tail, sh) if sh else tail
+            hit = _find_isync_in_window(shifted, scan)
+            if hit is not None:
+                off, s = hit
+                chosen = (sh, off, s, shifted)
+                break
+        if chosen is None:
+            continue
+        sh, off, s, shifted = chosen
+        events = [FlowEvent("isync", s.addr)]
+        region, _ = decode_region(shifted, off + 6, s.addr, region_bytes)
+        events.extend(region)
+        regions.append(AlignedRegion(async_offset=a_off, shift=sh,
+                                      isync=s, events=events))
+    return regions
+
+
+def aligned_pcs(data: bytes) -> list[int]:
+    """Distinct absolute PCs recovered via alignment-aware decode (I-sync +
+    any embedded re-anchors in each aligned region)."""
+    pcs = set()
+    for r in decode_aligned(data):
+        for e in r.events:
+            if e.kind == "isync":
+                pcs.add(e.addr)
+    return sorted(pcs)
+
+
+# ----------------------------------------------------------------------------
+# TPIUSync reference model (faithful port of orbtrace trace/tpiu.py TPIUSync).
+#
+# This is the byte-aligning front-end orbtrace uses (and that we had NOT been
+# reusing — see 10-reuse-gap-audit.md). It consumes a byte stream, locks the
+# TPIU full-sync 0xFFFFFF7F, filters 0x7FFF half-syncs, and emits aligned
+# 16-byte TPIU frames. buf is a 129-bit register initialised to 1; the single
+# sentinel '1' bit walks up as bytes shift in and reaches bit128 after exactly
+# 16 payload bytes, at which point a frame is complete.
+# ----------------------------------------------------------------------------
+def tpiu_sync_frames(stream: bytes) -> list[bytes]:
+    """Assemble 16-byte TPIU frames from a byte stream, orbtrace-faithfully.
+
+    Returns a list of 16-byte frames (each as bytes, payload[0]..payload[15]).
+    """
+    buf = 1                      # 129-bit, init 1 (sentinel in bit0)
+    synced = False
+    frames = []
+    for p in stream:
+        # Cat(payload, buf): payload occupies the low 8 bits.
+        cat = (buf << 8) | p
+        if (cat & 0xFFFFFFFF) == 0xFFFFFF7F:
+            synced = True
+            buf = 1
+        elif (cat & 0xFFFF) == 0xFF7F:
+            buf >>= 8
+        else:
+            buf = (buf << 8) | p
+        # output.valid = buf[128] & synced; on accept buf resets to 1.
+        if synced and (buf >> 128) & 1:
+            frame = bytes((buf >> (8 * i)) & 0xFF for i in range(16))
+            frames.append(frame)
+            buf = 1
+    return frames
