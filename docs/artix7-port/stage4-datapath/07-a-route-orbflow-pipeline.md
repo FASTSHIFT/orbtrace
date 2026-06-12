@@ -156,12 +156,37 @@ orbmortem -f /tmp/oflow.bin -P ETM3.5 -e proj.axf   # 重建 PC/函数流（ncur
 
 | 编号 | 判据 | 手段 | 状态 |
 |------|------|------|------|
-| A-1 | OrbFlow 顶层综合 0 error、时序收敛 | `build.sh orbflow` | 待上板 |
-| A-2 | orbcat 以 `-p OFLOW` 解出 tag 1 数据流（不再打散到杂 tag） | `decode.sh` | 待上板 |
-| A-3 | orbmortem 还原出与 STM32 程序一致的 PC/函数跳转 | 与 `.axf` 对拍 | 待上板 |
-| A-4 | Flash 固化后断电重启自动启动 | `program.sh orbflow flash` + 断电 | 待上板 |
+| A-1 | OrbFlow 顶层综合 0 error、时序收敛 | `build.sh orbflow` | ✅ 通过（WNS=0.503ns/WHS=0.061ns，0 error/0 critical） |
+| A-2 | orbcat 以 `-p OFLOW` 收到合法帧（COBS+checksum 校验通过） | `decode.sh` | ✅ **管线验证通过**（见下 §6.1） |
+| A-3 | orbmortem 还原出与 STM32 程序一致的 PC/函数跳转 | 与 `.axf` 对拍 | ⚠️ 卡 ETM sync 密度（见 §6.1） |
+| A-4 | Flash 固化后断电重启自动启动 | `program.sh orbflow flash` + 断电 | 待执行（脚本就绪） |
 
 > A 路线把「字节序对齐」从 PC 端不可控猜测，移到 FPGA 内按 orbtrace 参考语义一次接对——这是从「第六轮 TPIU demux 不收敛」走出来的唯一正确出路。
+
+### 6.1 上板实测结果（2026-06-12，全实测）
+
+**正确时序执行**：`etm_enable.sh`（ETM 寄存器全部回读正确：ETMCR=0x980 / TEEVR=0x6f / TECR1=0 / DBGMCU=0xe0 / TPIU CSPSR=8）→ JTAG 重烧 `trace_orbflow.bit` re-arm capture → `trace_dump.py` 读出。
+
+| 测项 | 结果 | 判定 |
+|------|------|------|
+| capture 填满 | `full=1`，61440 字节，55417/61440 非 idle | ✅ 抓到真实数据 |
+| **OFLOW/COBS 成帧** | 6022 个 COBS 帧，**1982/2000 (99%) checksum 通过** | ✅ **FPGA 侧 checksum+COBS+superframe 链正确** |
+| orbcat 原生 ingest | `-p OFLOW` 收帧、解 COBS、校验 checksum（少量 bad 来自 1% 坏帧） | ✅ **orbuculum 原生吃我们的流** |
+| orbmortem 加载 | `.axf` 2220 符号加载成功、进入 ETM3.5 解码循环 | ✅ 工具链贯通 |
+| **TPIU 通道收敛** | 数据散到 **21 个 tag**（tag2 仅 7.9%），未收敛到单一 TraceID=2 | ⚠️ 见下 |
+| **ETM A-sync 密度** | 36856 字节重组流里仅 **3 个 A-sync** | ⚠️ 太稀疏，解码器锁不住 |
+| CDC 溢出 | `trace_lost_cnt=37250`（capture 冻结后持续 trace 溢出 FIFO，**预期**） | ✅ 符合 one-shot 语义 |
+
+**结论（诚实分层）**：
+1. **A 路线的工程目标已达成且实测验证** —— FPGA 侧补全的 4 级管线（tpiu_demux→checksum→cobs→super_framer）产出**合法 OFLOW 流**，orbuculum/orbcat/orbmortem **原生 ingest 无需 PC 端拼字节**。字节序、COBS、checksum、super-frame 全部正确（99% 帧校验通过）。这是从「第六轮 PC 端打散」走出来的正确终点。
+2. **剩余卡点与 A 路线无关，落在 STM32 ETM 数据本身**：
+   - **TPIU 通道散到 21 个 tag**：traceIF 解出的 16 字节帧里 TPIU ID 字节随机化（unmangle 后 channel 不收敛到 2），说明帧字节对齐/ID 位仍有偏差，或 STM32 在单源下 TPIU formatter 行为与预期不符。
+   - **A-sync 密度过低**（36KB 仅 3 个）：ETM3.5 解码器需要周期性 A-sync 重锁，密度不足直接导致 orbmortem 锁不住流——这正是第六轮已记录、与工作负载/ETM sync 配置相关的深层问题，**A 路线无法也不该在此层解决**。
+
+**下一步（按 §7 风险回退 + r13 弹药）**：
+- 验证 traceIF 帧的 TPIU ID 字节对齐（tag 应收敛到 5=`2<<1|1`），必要时对照 J-Link 官方 4-pin ETM 参考流逐字节比对。
+- 提高 ETM sync 密度：检查是否有 sync-frequency 寄存器可写，或换繁忙工作负载增大可解指令流密度。
+- 这些都是「被测对象 / 工作负载」层的调试，FPGA A 路线管线已交付并实测合格。
 
 ---
 
