@@ -170,3 +170,86 @@ def traceif_assemble(nibble_bytes: bytes) -> bytes:
                     out.append(pkt & 0xFF)
                     out.append((pkt >> 8) & 0xFF)
     return bytes(out)
+
+
+# ----------------------------------------------------------------------------
+# Region decoder: from an I-sync anchor, walk P-headers + branch packets to
+# extend the recovered trace until the parse derails. Grounded in IHI0014Q
+# §7.3.4 (P-headers), §7.3.5 (branch packets). Cortex-M is Thumb-only, so
+# branch addresses use the Thumb address-mode bit layout.
+# ----------------------------------------------------------------------------
+@dataclass
+class FlowEvent:
+    kind: str          # 'isync' | 'atoms' | 'branch'
+    addr: int          # current/target PC (thumb bit stripped) where meaningful
+    eatoms: int = 0    # executed atoms (P-header)
+    natoms: int = 0    # not-executed atoms
+
+
+def _phdr_atoms(c: int):
+    """Decode a non-cycle-accurate P-header byte. Returns (eatoms, natoms) or
+    None if not a P-header. IHI0014Q §7.3.4."""
+    if (c & 0b10000001) != 0b10000000:
+        return None
+    if (c & 0b10000011) == 0b10000000:        # Format-1
+        eatoms = (c & 0x3C) >> 2
+        natoms = 1 if (c & (1 << 6)) else 0
+        return eatoms, natoms
+    if (c & 0b11110011) == 0b10000010:        # Format-2
+        eatoms = ((c & (1 << 2)) == 0) + ((c & (1 << 3)) == 0)
+        natoms = 2 - eatoms
+        return eatoms, natoms
+    return None
+
+
+def decode_region(data: bytes, start: int, base_addr: int, max_bytes: int = 4096):
+    """Walk packets from `start` (just after an I-sync) until a byte we can't
+    classify cleanly, returning the FlowEvents recovered. This is a best-effort
+    forward extension from a known-good anchor; it deliberately stops at the
+    first ambiguous byte rather than emitting garbage (the next anchor will
+    re-establish the absolute PC).
+    """
+    events = []
+    i = start
+    end = min(len(data), start + max_bytes)
+    while i < end:
+        c = data[i]
+        # branch packet (bit0 = 1): consume continuation bytes (bit7 set), max 5
+        if c & 1:
+            n = 1
+            while i + n < end and (data[i + n - 1] & 0x80) and n < 5:
+                n += 1
+            events.append(FlowEvent("branch", base_addr))
+            i += n
+            continue
+        ph = _phdr_atoms(c)
+        if ph is not None:
+            events.append(FlowEvent("atoms", base_addr, eatoms=ph[0], natoms=ph[1]))
+            i += 1
+            continue
+        if c == 0x00:
+            # could be start of next A-sync; stop and let caller re-anchor
+            break
+        if c == ISYNC_HEADER:
+            s = parse_isync_at(data, i)
+            if s is not None:
+                events.append(FlowEvent("isync", s.addr))
+                base_addr = s.addr
+                i += 6
+                continue
+            break
+        # unknown / can't classify cleanly -> stop (don't emit garbage)
+        break
+    return events, i
+
+
+def decode_all(data: bytes):
+    """Anchor on every I-sync and extend each region. Returns list of FlowEvent.
+    The set of 'isync' addresses are guaranteed-correct absolute PCs; 'atoms'
+    and 'branch' events give the executed-instruction flow between anchors."""
+    events = []
+    for s in find_isyncs(data):
+        events.append(FlowEvent("isync", s.addr, ))
+        region, _ = decode_region(data, s.offset + 6, s.addr)
+        events.extend(region)
+    return events

@@ -266,3 +266,84 @@ def test_real_capture_async_present():
     # A-syncs (>=5 zeros + 0x80) must be present at roughly the sync cadence.
     asyncs = L.find_asyncs(data)
     assert len(asyncs) >= 1
+
+
+# ----------------------------------------------------------------------------
+# P-header decode (IHI0014Q §7.3.4) and region/flow decode
+# ----------------------------------------------------------------------------
+def test_phdr_format1():
+    # 0x88 = 0b10001000 -> Format-1: eatoms=(0x88&0x3C)>>2=2, natoms=0
+    assert L._phdr_atoms(0x88) == (2, 0)
+
+
+def test_phdr_format1_with_natom():
+    # bit6 set -> 1 natom. 0xC0 = 0b11000000 -> eatoms=0, natoms=1
+    assert L._phdr_atoms(0xC0) == (0, 1)
+
+
+def test_phdr_format2():
+    # 0x82 = 0b10000010 matches Format-2 mask 0b11110011==0b10000010
+    res = L._phdr_atoms(0x82)
+    assert res is not None
+    assert sum(res) == 2          # Format-2 always totals 2 atoms
+
+
+def test_phdr_not_a_header():
+    assert L._phdr_atoms(0x01) is None     # branch (bit0=1)
+    assert L._phdr_atoms(0x08) is None     # I-sync header
+    assert L._phdr_atoms(0x00) is None     # A-sync zero
+
+
+def test_decode_region_atoms_and_branch():
+    # I-sync addr base, then a Format-1 P-header (0x88, 2 exec), then a branch
+    # packet (0x01, single byte), then a 0x00 to stop.
+    base = 0x08001000
+    data = bytes([0x88, 0x01, 0x00])
+    events, end = L.decode_region(data, 0, base)
+    kinds = [e.kind for e in events]
+    assert kinds == ["atoms", "branch"]
+    assert events[0].eatoms == 2
+    assert end == 2               # stopped at the 0x00
+
+
+def test_decode_region_stops_on_unknown():
+    # 0x66 (Ignore packet) is not classified by our minimal walker -> stop.
+    base = 0x08001000
+    events, end = L.decode_region(bytes([0x66, 0x88]), 0, base)
+    assert events == []
+    assert end == 0
+
+
+def test_decode_region_follows_embedded_isync():
+    base = 0x08001000
+    s = make_isync(0x0800c0de)
+    data = bytes([0x88]) + s + bytes([0x88, 0x00])
+    events, _ = L.decode_region(data, 0, base)
+    # first atoms, then the embedded isync re-anchors, then atoms
+    assert events[0].kind == "atoms"
+    assert any(e.kind == "isync" and e.addr == 0x0800c0de for e in events)
+
+
+def test_decode_region_stops_on_bad_isync_header():
+    # A 0x08 byte that is NOT a valid Normal I-sync (non-flash addr) must stop
+    # the region walk rather than be mis-followed.
+    base = 0x08001000
+    bad = bytes([0x08, 0x00, 0x00, 0x00, 0x00, 0x20])  # addr 0x20000000 (SRAM)
+    data = bytes([0x88]) + bad
+    events, end = L.decode_region(data, 0, base)
+    assert events[0].kind == "atoms"
+    # walk stops at the bogus 0x08 (not classified as a valid I-sync)
+    assert all(e.kind != "isync" for e in events)
+    assert end == 1
+
+
+def test_decode_all_on_fixture():
+    import os
+    if not os.path.exists(FIXTURE):
+        pytest.skip("fixture missing")
+    data = open(FIXTURE, "rb").read()
+    events = L.decode_all(data)
+    isyncs = [e for e in events if e.kind == "isync"]
+    assert len(isyncs) == 2
+    # at least some executed-atom flow recovered after the anchors
+    assert any(e.kind == "atoms" for e in events)
