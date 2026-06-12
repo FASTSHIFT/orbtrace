@@ -425,3 +425,44 @@ STM32F429 并行口 TRACECLK = HCLK（无独立分频,ACPR 仅 SWO）。**不 re
 3. HCLK 已还原 /1。
 
 > 降速实验的价值是**否证**：排除了 SI/速率这条线（省得继续纠结杜邦线/眼图），把根因牢牢钉在 **ETM I-SYNC 锚点稀缺**——这是 ETM 寄存器配置层的事,下一步往那里走。
+
+---
+
+## 15. ★★★ 对照 ETM 官方规范 IHI0014Q（第十三轮）：根因 = 解码器没做 I-sync 锚点提取 + 4-bit 口非字节对齐
+
+下载了 ARM 官方 **IHI0014Q《Embedded Trace Macrocell Architecture Specification ETMv1.0–v3.5》**（存 `docs/artix7-port/refs/`），逐节核对 §7.10 Synchronization，纠正了前几轮的多个推断。
+
+### 规范关键事实（逐条实测对照）
+
+**① §7.10.4 — A-sync 后跟 P-header 是【正确】的,不是错误**
+> 规范原文例:byte 对齐系统里 A-sync 后跟一个 E P-header 表示为 `00 00 00 00 00 80 84`。
+
+我们抓到的"A-sync 后跟 `0x88/0x8c`(P-header)"**完全符合规范**。前几轮把它当 "bit7 错误" 是误判——`0x84/0x88/0x8c` 就是合法 P-header,A-sync 之后本就该跟任意 header。
+
+**② §7.10.4 Note — 4-bit 口【不保证字节对齐】(直接命中我们)**
+> "The trace is normally byte-aligned if ... The width of TRACEDATA is a multiple of 8 bits, **that is, not a 4-bit port**."
+> "if it captures one cycle incorrectly ... then **all subsequent captures are offset**. ... the decompressor must **realign all data following the A-sync sequence**."
+
+我们正是 **4-bit 口**。规范明确:4-bit 口非字节对齐,一次 TRACECTL 抖动会让**后续所有字节整体偏移**,解码器**必须在每个 A-sync 后重新对齐**。orbuculum 解码器和我的 etmdecode 都**没做这个 per-A-sync 重对齐**。
+
+**③ §7.10.5 + Fig7-42 — I-sync 携带 4 字节【绝对、未压缩】PC**
+> "The instruction address is always four bytes and is not compressed."
+> ContextID 字节数由 ETMCR[15:14] 决定。我们 ETMCR=0x980 → bits[15:14]=00 → **0 个 ContextID 字节**。
+
+所以一个 Normal I-sync = `08 <info> <a0 a1 a2 a3>` 共 6 字节,a3=0x08(flash 段)。
+
+**④ §7.10.1 + ETMSYNCFR — 同步频率固定 1024,只读**
+规范确认 ETMv3.4+ 可实现为只读固定 1024——与我们实测 ETMSYNCFR=0x400 写不动一致。**A-sync/I-sync 周期硬件锁死 1024 字节,无法调密。**
+
+### 决定性验证:I-sync 锚点其实就在流里,解码器漏了
+按规范的精确 I-sync 签名(`08 <info> <4 字节地址>`,地址落 0x08xxxxxx)扫描真实抓取:
+- **每份 capture 稳定找到 14-17 个干净 I-sync,每个带合法绝对 PC**(0x802c6b4 / 0x80205e0 / 0x8005414 ...)。
+- 这些绝对 PC 映射到一组连贯真实函数:`lv_timer_handler`/`lv_timer_exec`(主循环)、`draw_x_ticks`、`meter2_timer_cb`、`HAL::DMA2D_MemCopy`、主题/样式/链表助手——正是 LVGL widgets demo 的执行核心。
+
+**结论修正(决定性)**:
+- 数据里**有充足的、带绝对 PC 的 I-sync 锚点**(每 1024 字节一个,符合 SYNCFR)。
+- 问题**不是** SI、不是速率、不是 I-sync 稀缺——是**解码器在 A-sync 之后没有按规范做字节重对齐 + 没有主动提取 I-sync 的 4 字节绝对地址**,导致变长包解析一偏就一直偏,撞不到 IDLE 态的 I-sync。
+- 这是**纯解码器侧**的问题(PC 端软件),FPGA 采样链、traceIF、抓取全部 OK。
+
+### 下一步(明确、纯 PC 侧)
+写一个对齐规范的解码器:**每个 A-sync 后,(a) 做 8 种 bit 重对齐找到 I-sync header,(b) 直接取其 4 字节绝对 PC 作锚点,(c) 从锚点用 P-header/branch 续解**。这能把"散点"变"连续 PC 流",且完全不依赖降速/改硬件。规范已读清,可以照着实现。
