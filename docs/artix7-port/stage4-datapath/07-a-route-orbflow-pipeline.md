@@ -290,3 +290,40 @@ TPIU_TYPE  = 0xca1                     ETMCR = 0x980  ETMSR = 0x0  ETMCCR = 0x8c
 3. 若确认 STM32 就是不发 formatter 帧 → 按裸 ETM 收，强化 etmdecode 的 per-A-sync force-sync 续解。
 
 > 与 orbtrace 对照的最终结论：orbtrace 标准路径（formatter on + tpiu_demux）我们已 1:1 复刻且配置实测一致；剩余差异收敛到 **FPGA traceIF 前端的 lane/相位映射**这一具体、可逐位验证的点，而非管线架构。已交付的真实函数名（LVGL 渲染链）证明数据与采样链是好的。
+
+---
+
+## 11. ★ 采样 vs 协议判别实验（第九轮，实测）：钉死是"协议/同步密度"而非"采样相位"
+
+按"重扫 IDELAY tap 眼图"的推荐步骤,跑了 EXT_SRC=1 真实 STM32 trace 的 32-tap 扫描 + 单 tap 多项实测。
+
+### 实验 1：真实 trace 的 32-tap 眼图（eyescan EXT_SRC=1）
+| 观察 | 数字 | 含义 |
+|------|------|------|
+| traceIF 在每个 tap 都锁帧 | 32/32 tap 都 ~13000-16000 帧 | **不是采样相位问题**——若是窄眼，应有些 tap 锁不上 |
+
+→ **关键否证**：如果是 candidate A（采样相位/SI 窄眼），32 个 tap 里应有明显的"开眼区/闭眼区"分布。实测**所有 tap 都能锁 ~15k 帧**，说明在当前 trace_clk 速率下眼是宽开的，**采样相位不是瓶颈**。
+
+### 实验 2：A-sync vs I-SYNC 密度（单 capture 内分析）
+ETM3.5 解码器锁定需要两级同步包：
+- **A-sync**（`00 00 00 00 00 80`，长零游程）：60KB 里 **18 个**，间距规律 ~1480。
+- **I-SYNC**（`0x08` 起始包，携带绝对 PC + info byte）：解码器靠它 `rxedISYNC` 才开始连续报地址。
+
+实测 A-sync 后紧跟的字节是 `0x88` 而非 `0x08`——**A-sync 之后没有规范的 I-SYNC 跟随**。整个 60KB 仅 781 个 `0x08` 字节（且多数是数据字节、非包首）。
+
+→ **这就是 syncCount=0 的直接原因**：解码器粗对齐（A-sync）成功，但拿不到 I-SYNC 锚点，所以报不出连续 PC，只能在 A-sync 后靠分支包蒙几个相对地址（17 个 flash 命中）。
+
+### 综合结论（采样 OK，卡在协议/同步）
+| Candidate | 判据 | 结论 |
+|-----------|------|------|
+| A 采样相位/SI | 32-tap 是否有开/闭眼分布 | **否决**：全 tap 都锁帧，眼宽开 |
+| B 协议/同步结构 | A-sync 后有无 I-SYNC | **坐实**：A-sync 规律在，但缺 I-SYNC，且无 TPIU formatter 帧 |
+
+**所以现状不是"采样有的好有的坏",是"采样基本都对（每 tap 都锁 15k 帧），但 ETM 数据流里缺少解码器需要的周期性 I-SYNC 锚点 + 缺 TPIU 帧结构,导致只能在 A-sync 后短暂蒙几个地址就失锁"。** 与 SPI 的本质差异再次显现:SPI 有 CS 给字节边界,这里连"哪个字节是包首"都要靠流内的 I-SYNC,而这颗 STM32 当前配置下 I-SYNC 太稀。
+
+### 下一步（都是 STM32 侧 trace 源配置，非 FPGA、非改 LVGL 程序）
+1. **提高 I-SYNC/同步频率**：ETMSYNCFR 实测固定 0x400=1024 写不动;但 ETM3.5 的 I-SYNC 周期也受其它位影响——核 DDI0440 找能缩短 I-SYNC 周期的途径,或确认这颗 ETM 的 sync 行为。
+2. **确认 TPIU formatter 为何不插帧**：FFCR=0x102 已设但流里无 `0xFFFFFF7F`。这是与 orbtrace 标准路径唯一实质差异,需对照 RM0090 §38 TPIU 复核单源 ETM 下 formatter 行为。
+3. **务实交付**：当前已能稳定解出 LVGL 渲染链的真实函数集（散点）。若要连续 PC 流,核心是拿到密集 I-SYNC,与 FPGA/采样无关。
+
+> 一句话:**采样链已被实测证清白（32-tap 全开眼）,瓶颈 100% 在 STM32 ETM 输出的同步包密度 + TPIU 帧结构,即被测对象侧的 trace 源配置。不用改 LVGL,要调的是 STM32 的 ETM/TPIU 寄存器。**
