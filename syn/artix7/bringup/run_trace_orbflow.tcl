@@ -70,8 +70,10 @@ read_xdc $bdir/trace_orbflow.xdc
 
 set tap 28
 if {[info exists ::env(TAP)]} { set tap $::env(TAP) }
-puts "============ TAP = $tap ============"
-synth_design -top trace_orbflow_top -part $part -generic TAP=$tap
+set swap 0
+if {[info exists ::env(SWAP_NIBBLES)]} { set swap $::env(SWAP_NIBBLES) }
+puts "============ TAP = $tap  SWAP_NIBBLES = $swap ============"
+synth_design -top trace_orbflow_top -part $part -generic TAP=$tap -generic SWAP_NIBBLES=$swap
 opt_design
 place_design
 route_design

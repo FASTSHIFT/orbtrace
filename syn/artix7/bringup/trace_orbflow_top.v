@@ -38,9 +38,15 @@
 
 module trace_orbflow_top #(
     parameter [4:0] TAP   = 5'd28,    // V2 eye centre
-    parameter       DEPTH = 61440     // captured OrbFlow bytes (keep < 65536
+    parameter       DEPTH = 61440,    // captured OrbFlow bytes (keep < 65536
                                       // so 16-bit ext_addr also reaches the
                                       // status bytes at DEPTH..+2)
+    parameter       SWAP_NIBBLES = 0  // 0: traceDina=trace_a (rising-edge);
+                                      // 1: swap trace_a/trace_b into traceIF.
+                                      // Reuse audit (doc 10) found the raw
+                                      // capture only assembles TPIU frames in
+                                      // the swapped nibble order, so this lets
+                                      // the next capture test both cheaply.
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -125,9 +131,11 @@ module trace_orbflow_top #(
     // ------------------------------------------------------------------
     wire        fr_avail;
     wire [127:0] frame;
+    wire [3:0]  tif_a = SWAP_NIBBLES ? trace_b : trace_a;
+    wire [3:0]  tif_b = SWAP_NIBBLES ? trace_a : trace_b;
     traceIF #(.MAXBUSWIDTH(4)) u_traceif (
         .rst(sys_rst | ~idelayctrl_rdy),
-        .traceDina(trace_a), .traceDinb(trace_b), .traceClkin(trace_clk),
+        .traceDina(tif_a), .traceDinb(tif_b), .traceClkin(trace_clk),
         .width(2'b11), .edgeOutput(), .FrAvail(fr_avail), .Frame(frame)
     );
 

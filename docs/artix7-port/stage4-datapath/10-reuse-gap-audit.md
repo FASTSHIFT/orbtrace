@@ -103,3 +103,22 @@ with m.Else():
 3. 这样 PC 端 orbcat/orbmortem 原生解,不用任何字节对齐 hack。
 
 > 行动①的最大收获不是"导出了 TPIUSync",而是用它**坐实了 nibble 接反这个真 bug** —— 这比子字节重对齐更根本,改一处接线就对。
+
+
+---
+
+## 7. 离线复算的边界 + 落地 SWAP_NIBBLES 参数(诚实记录)
+
+把 nibble-swap 后的原始流跑完整 TPIUSync→Unmangle→TrackStream 链:
+- TPIUSync 锁出 **820 帧**,但 Unmangle 后通道仍散到 ~40 个(ch58 占 40%,未收敛到单一)。
+- 复查 `0xFFFFFF7F` 间距:**不规则**(4/108/258/252/556...),不是周期 formatter 同步。间距=4 是 `ff 7f ff 7f` 半同步 idle 被误当全同步。
+- 帧内容大量 `75ff`/`75ffffff` —— TPIU 半同步 idle(`0x7FFF`)的 unmangle 残影。
+
+**诚实判断**:这份老抓取(`/tmp/trace_etm.bin`,16KB,共地前、旧顶层、且 STM32 当时多在 idle)**信息量不足以离线定论 framing**——它大部分是 TPIU 半同步 idle。nibble-swap 让"能不能锁帧"从 0→820 是真信号(说明 nibble 确实接反了一层),但"通道是否收敛"需要一份**真实繁忙、且 nibble 修正后**的新抓取才能判。
+
+**落地动作(低风险、为下次抓取铺路)**:给 `trace_orbflow_top` 加 `SWAP_NIBBLES` 参数(build 时 `SWAP_NIBBLES=1` 环境变量切换),把 traceIF 的 traceDina/traceDinb 互换。iverilog elaboration 通过。下次上板:
+1. `SWAP_NIBBLES=1 ./build.sh orbflow` 重新综合;
+2. 先配 ETM(让 STM32 跑繁忙负载)→ re-arm → 抓;
+3. 对比 swap=0/1 两版的 TPIU 帧收敛度,定论 nibble 接线。
+
+> 不硬下"nibble 接反就是全部根因"的结论——离线老数据只够证明 swap 影响锁帧,收敛性要新抓取验。参数已就位,下次上板一次测两版。
