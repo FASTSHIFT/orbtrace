@@ -122,3 +122,30 @@ with m.Else():
 3. 对比 swap=0/1 两版的 TPIU 帧收敛度,定论 nibble 接线。
 
 > 不硬下"nibble 接反就是全部根因"的结论——离线老数据只够证明 swap 影响锁帧,收敛性要新抓取验。参数已就位,下次上板一次测两版。
+
+
+---
+
+## 8. 上板 A/B 实测:SWAP_NIBBLES + OrbFlow 路径(决定性)
+
+综合了 `SWAP_NIBBLES=1` 的 OrbFlow 顶层(0 error,时序收敛),上板抓取对比:
+
+| 抓取 | 路径 | I-sync 锚点 | 结论 |
+|------|------|------------|------|
+| `capGND.bin`(trace_stream,swap=0) | traceIF 帧,**不过 tpiu_demux** | **14** | 能解出真 PC |
+| `capDIV16.bin`(trace_stream,swap=0) | 同上 | **15** | 能解出真 PC |
+| `oflow_swap.bin`(OrbFlow,swap=1) | traceIF→**tpiu_demux**→cobs | **0** | 全毁 |
+
+OrbFlow(swap=1)的 OFLOW 解出:tag 127 占 70%(全 1 通道,idle 残影),**重组后 0 个 I-sync** —— tpiu_demux 把可解的 ETM 数据**搅毁了**。
+
+### 两个决定性结论
+1. **nibble swap 不是 OrbFlow 路径的解**:swap=1 让 OFLOW 更糟(0 锚点 vs swap=0 路径的 14)。之前"820 帧只在 swap 序"是**原始 nibble 喂 TPIUSync**那条路的现象,和 OrbFlow 顶层(traceIF→tpiu_demux)是两条不同的路,不能混。
+2. **tpiu_demux 对我们这股流是错的组件**:`trace_stream`(只到 traceIF 帧、不过 demux)稳定 14-15 个 I-sync 锚点能解出真函数;一旦过 tpiu_demux 就归零。坐实:**我们的流不是 demux 期望的"对齐 TPIU formatter 帧",硬过 demux 只会毁数据。**
+
+### 修正路线(由消去法确定)
+**放弃"FPGA 侧串 tpiu_sync→tpiu_demux 产 OFLOW"这条对我们流不成立的路。** 正确做法:
+- FPGA 侧只到 **traceIF 帧**(`trace_stream_top`,已验证 14-15 锚点),把 traceIF 字节流直接经网口送 PC;
+- PC 端用 **`etm35lib` 直接锚定 I-sync**(已 100% 测试覆盖、能解真 PC),**跳过 tpiu_demux**。
+- 这对应 orbtrace core.py 的 **bypass 语义**(SWO 路径用的 `input_bypass`),只是我们对并行裸 ETM 也走"按 channel 1 直通、不 unmangle"的简化。
+
+> 复用审计的最终落点:**4 个管线模块里,tpiu_demux 对我们这股裸流不适用(实测过它就毁数据);真正该复用的是 traceIF(已用)+ PC 端按规范锚定 I-sync(etm35lib,已实现并测试)。** SWAP_NIBBLES 留作参数,但当前 swap=0 + 不过 demux 才是能出真 PC 的路径。
