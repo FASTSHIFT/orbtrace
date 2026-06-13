@@ -1,11 +1,12 @@
 # Build the Stage-4 V1 eye-scan bitstream (eyescan_top) for A7-Lite.
 #   source $XILINX_VIVADO/settings64.sh
-#   cd build && vivado -mode batch -source ../run_eyescan.tcl
+#   cd build && vivado -mode batch -source ../fpga_flow/run_eyescan.tcl
 # Output: eyescan.bit
 
 set part      xc7a35tfgg484-2
 set bdir      [file dirname [info script]]
-set repo_root [file normalize [file join $bdir .. .. ..]]
+set bringup   [file normalize [file join $bdir ..]]
+set repo_root [file normalize [file join $bdir .. .. .. ..]]
 set ex        $repo_root/syn/external/verilog-ethernet/example/NexysVideo/fpga
 set rtl       $repo_root/syn/artix7/rtl
 
@@ -16,9 +17,9 @@ read_verilog $rtl/trace_capture_a7.v
 read_verilog $repo_root/verilog/traceIF.v
 
 # V1 eye-scan engine + top + local eth core fork
-read_verilog $bdir/trace_eyescan.v
-read_verilog $bdir/fpga_core_net.v
-read_verilog $bdir/eyescan_top.v
+read_verilog $bringup/rtl/trace_eyescan.v
+read_verilog $bringup/rtl/fpga_core_net.v
+read_verilog $bringup/rtl/eyescan_top.v
 
 # verilog-ethernet MAC/IP/UDP library (from submodule)
 foreach s {
@@ -60,7 +61,7 @@ foreach s {
     read_verilog $ex/$s
 }
 
-read_xdc $bdir/eyescan.xdc
+read_xdc $bringup/rtl/eyescan.xdc
 
 # EXT_SRC: 0 = self-loopback pattern (V1), 1 = external STM32 trace (V2).
 set extsrc 0

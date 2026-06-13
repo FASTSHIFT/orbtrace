@@ -14,6 +14,7 @@
 set -eu
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$here/.." && pwd)"
 target="${1:-orbflow}"
 mode="${2:-jtag}"
 
@@ -40,13 +41,13 @@ if ! pgrep -x hw_server >/dev/null 2>&1; then
 fi
 
 if [ "$mode" = "flash" ]; then
-    if [ ! -f "$here/build/$mcs" ]; then echo "ERROR: build/$mcs missing (run build.sh first)"; exit 1; fi
+    if [ ! -f "$root/build/$mcs" ]; then echo "ERROR: build/$mcs missing (run build.sh first)"; exit 1; fi
     echo "==> FLASH fixation: build/$mcs -> QSPI (persists across power cycle)"
-    ( cd "$here/build" && MCS="$mcs" vivado -mode batch -source ../flash_program.tcl )
+    ( cd "$root/build" && MCS="$mcs" vivado -mode batch -source ../fpga_flow/flash_program.tcl )
 else
-    if [ ! -f "$here/build/$bit" ]; then echo "ERROR: build/$bit missing (run build.sh first)"; exit 1; fi
+    if [ ! -f "$root/build/$bit" ]; then echo "ERROR: build/$bit missing (run build.sh first)"; exit 1; fi
     echo "==> JTAG volatile load: build/$bit (gone on power cycle)"
     # reuse the generic net_test programmer, pointing it at our bit via env
-    ( cd "$here/build" && BITFILE="$bit" vivado -mode batch -source ../program_bit.tcl )
+    ( cd "$root/build" && BITFILE="$bit" vivado -mode batch -source ../fpga_flow/program_bit.tcl )
 fi
 echo "==> program done."

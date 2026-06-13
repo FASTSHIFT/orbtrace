@@ -1,13 +1,12 @@
-# Generic JTAG volatile download of a .bit to the A7-Lite over the on-board
-# FT232H (USB 0403:6014). Lost on power cycle. Bitfile from env BITFILE.
+# JTAG volatile download of net_test.bit to the A7-Lite over the on-board
+# FT232H (USB 0403:6014). Lost on power cycle.
 #
-#   cd build && BITFILE=trace_orbflow.bit vivado -mode batch -source ../program_bit.tcl
+#   source /path/to/Vivado/2021.1/settings64.sh
+#   cd build && vivado -mode batch -source ../fpga_flow/program_net_test.tcl
 #
-# Run from the directory containing the .bit.
+# Run from the directory containing net_test.bit (i.e. build/).
 
-set BITFILE "trace_orbflow.bit"
-if {[info exists ::env(BITFILE)]} { set BITFILE $::env(BITFILE) }
-if {![file exists $BITFILE]} { puts "ERROR: $BITFILE not found in [pwd]"; exit 1 }
+set BITFILE "net_test.bit"
 
 open_hw_manager
 

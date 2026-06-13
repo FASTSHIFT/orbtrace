@@ -10,7 +10,7 @@
 set -eu
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd "$here/../../../.." && pwd)"
+repo_root="$(cd "$here/../../../../.." && pwd)"
 orb="$repo_root/orbuculum/build"
 file="${1:-/tmp/oflow.bin}"
 mode="${2:-cat}"

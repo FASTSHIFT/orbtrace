@@ -3,14 +3,15 @@
 # native OFLOW byte stream (no PC-side byte-order guessing).
 #
 #   source $XILINX_VIVADO/settings64.sh
-#   cd build && vivado -mode batch -source ../run_trace_orbflow.tcl
+#   cd build && vivado -mode batch -source ../fpga_flow/run_trace_orbflow.tcl
 #
 # Output: trace_orbflow.bit (+ .mcs/.bin for QSPI flash fixation).
 # Env: TAP=<n> overrides IDELAY tap (default 28, V2 eye centre).
 
 set part      xc7a35tfgg484-2
 set bdir      [file dirname [info script]]
-set repo_root [file normalize [file join $bdir .. .. ..]]
+set bringup   [file normalize [file join $bdir ..]]
+set repo_root [file normalize [file join $bdir .. .. .. ..]]
 set ex        $repo_root/syn/external/verilog-ethernet/example/NexysVideo/fpga
 set rtl       $repo_root/syn/artix7/rtl
 set a7        $repo_root/syn/artix7
@@ -18,8 +19,8 @@ set a7        $repo_root/syn/artix7
 # capture front-end + traceIF + network core + new OrbFlow top
 read_verilog $rtl/trace_capture_a7.v
 read_verilog $repo_root/verilog/traceIF.v
-read_verilog $bdir/fpga_core_net.v
-read_verilog $bdir/trace_orbflow_top.v
+read_verilog $bringup/rtl/fpga_core_net.v
+read_verilog $bringup/rtl/trace_orbflow_top.v
 
 # orbtrace post-processing pipeline (Amaranth-exported, Stage-2 OOC-verified)
 read_verilog $a7/tpiu_demux.v
@@ -66,7 +67,7 @@ foreach s {
     read_verilog $ex/$s
 }
 
-read_xdc $bdir/trace_orbflow.xdc
+read_xdc $bringup/rtl/trace_orbflow.xdc
 
 set tap 28
 if {[info exists ::env(TAP)]} { set tap $::env(TAP) }

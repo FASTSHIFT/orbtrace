@@ -1,22 +1,19 @@
-# Build the Stage-4 V3 trace-stream bitstream (trace_stream_top) for A7-Lite.
+# Build the network bring-up bitstream (net_test_top) for A7-Lite.
 #   source $XILINX_VIVADO/settings64.sh
-#   cd build && vivado -mode batch -source ../run_trace_stream.tcl
-# Output: trace_stream.bit
-#
-# Fixes IDELAY tap (default 28, V2 eye centre) and streams decoded trace
-# frames out over UDP :5001.
+#   cd build && vivado -mode batch -source ../fpga_flow/run_net_test.tcl
+# Output: net_test.bit / .mcs
 
 set part      xc7a35tfgg484-2
 set bdir      [file dirname [info script]]
-set repo_root [file normalize [file join $bdir .. .. ..]]
+set bringup   [file normalize [file join $bdir ..]]
+set repo_root [file normalize [file join $bdir .. .. .. ..]]
 set ex        $repo_root/syn/external/verilog-ethernet/example/NexysVideo/fpga
-set rtl       $repo_root/syn/artix7/rtl
 
-read_verilog $rtl/trace_capture_a7.v
-read_verilog $repo_root/verilog/traceIF.v
-read_verilog $bdir/fpga_core_net.v
-read_verilog $bdir/trace_stream_top.v
-
+# verilog-ethernet stack (NexysVideo example). The example "core" (fpga_core)
+# is forked locally as rtl/fpga_core_net.v with A7-Lite IP + RGMII TX
+# timing fixes, so the submodule stays pristine. Everything else (MAC/IP/UDP
+# library) is read straight from the submodule.
+read_verilog $bringup/rtl/fpga_core_net.v
 foreach s {
     lib/eth/rtl/iddr.v
     lib/eth/rtl/oddr.v
@@ -56,17 +53,21 @@ foreach s {
     read_verilog $ex/$s
 }
 
-read_xdc $bdir/trace_stream.xdc
+read_verilog $bringup/rtl/net_test_top.v
+read_xdc      $bringup/rtl/net_test.xdc
 
-set tap 28
-if {[info exists ::env(TAP)]} { set tap $::env(TAP) }
-set capraw 0
-if {[info exists ::env(CAP_RAW)]} { set capraw $::env(CAP_RAW) }
-puts "============ TAP = $tap  CAP_RAW = $capraw ============"
-synth_design -top trace_stream_top -part $part -generic TAP=$tap -generic CAP_RAW=$capraw
+synth_design -top net_test_top -part $part
 opt_design
 place_design
 route_design
+
+report_utilization
 report_timing_summary -no_detailed_paths -no_header
-write_bitstream -force trace_stream.bit
-puts "============ TRACE STREAM BUILD DONE (tap=$tap) ============"
+
+write_bitstream -force net_test.bit
+write_cfgmem -force -format mcs -interface spix4 -size 16 \
+    -loadbit "up 0x0 net_test.bit" -file net_test.mcs
+
+puts "============ NET TEST BUILD DONE ============"
+puts " net_test.bit -> JTAG load; FPGA IP = 192.168.10.42"
+puts " Test: ping 192.168.10.42 ; UDP echo on port 1234"

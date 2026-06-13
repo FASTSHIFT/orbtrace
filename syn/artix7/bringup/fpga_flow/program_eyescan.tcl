@@ -1,5 +1,5 @@
 # JTAG volatile download of eyescan.bit (Stage-4 V1) to the A7-Lite.
-#   cd build && vivado -mode batch -source ../program_eyescan.tcl
+#   cd build && vivado -mode batch -source ../fpga_flow/program_eyescan.tcl
 set BITFILE "eyescan.bit"
 
 open_hw_manager

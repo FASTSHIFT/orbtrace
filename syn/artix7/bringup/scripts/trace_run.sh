@@ -35,4 +35,4 @@ else
 fi
 
 echo
-( cd "$here" && ELF="$ELF" python3 etm_decode_cli.py "$OUT" )
+( cd "$here/../decode" && ELF="$ELF" python3 etm_decode_cli.py "$OUT" )

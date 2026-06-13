@@ -5,7 +5,7 @@
 # the design from QSPI on every power-up.
 #
 #   source /path/to/Vivado/2021.1/settings64.sh
-#   cd build && vivado -mode batch -source ../flash_program.tcl
+#   cd build && vivado -mode batch -source ../fpga_flow/flash_program.tcl
 #
 # Run from the directory containing the .mcs. Override with env MCS=<file>.
 # Default: trace_orbflow.mcs

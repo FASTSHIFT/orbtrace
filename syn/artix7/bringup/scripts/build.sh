@@ -11,6 +11,7 @@
 set -eu
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+root="$(cd "$here/.." && pwd)"
 target="${1:-orbflow}"
 
 case "$target" in
@@ -24,12 +25,12 @@ if ! command -v vivado >/dev/null 2>&1; then
     exit 1
 fi
 
-mkdir -p "$here/build"
+mkdir -p "$root/build"
 echo "==> building $target (tap=${TAP:-28}) -> build/$bit"
-rm -f "$here/build/$bit"
-( cd "$here/build" && vivado -mode batch -source "../$tcl" )
+rm -f "$root/build/$bit"
+( cd "$root/build" && vivado -mode batch -source "../fpga_flow/$tcl" )
 
-if [ -f "$here/build/$bit" ]; then
+if [ -f "$root/build/$bit" ]; then
     echo "==> BUILD OK: build/$bit"
 else
     echo "==> BUILD FAILED: build/$bit not produced (see build/vivado.log)"

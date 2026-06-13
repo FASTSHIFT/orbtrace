@@ -10,9 +10,10 @@
 
 set part    xc7a35tfgg484-2
 set bdir    [file dirname [info script]]
+set bringup [file normalize [file join $bdir ..]]
 
-read_verilog $bdir/blink.v
-read_xdc     $bdir/blink.xdc
+read_verilog $bringup/rtl/blink.v
+read_xdc     $bringup/rtl/blink.xdc
 
 synth_design -top blink -part $part
 opt_design
