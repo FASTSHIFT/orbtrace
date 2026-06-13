@@ -27,11 +27,42 @@ import dsl_parse as D
 
 
 def deframe_raw(raw):
-    """TPIU-deframe a raw byte stream (FPGA dump), choosing the best phase."""
-    if not L.has_tpiu_sync(raw):
-        return raw, None
-    ph, _ = L.find_tpiu_phase(raw)
-    return L.tpiu_deframe_hsync(raw, ph), ph
+    """Decode a raw FPGA dump.
+
+    The FPGA packs one byte = {trace_b[3:0], trace_a[3:0]} per trace_clk
+    period (falling-edge nibble in the high half, rising-edge in the low half).
+    A logic-analyser-equivalent reconstruction (proven bit-exact against the
+    golden .dsl via tb_dsl_replay, doc 14 §24) requires:
+      1. expand each byte back into the time-ordered nibble stream
+         (b first, then a),
+      2. re-pair nibbles with the correct parity/order across period
+         boundaries (the ETM byte boundary does NOT align with the trace_clk
+         period — parity=1 / rise=low,fall=high is the match),
+      3. TPIU-deframe.
+    We search the 4 parity/order combos and keep the one with the most flash
+    anchors, exactly like dsl_parse does for the LA path.
+    """
+    # 1. byte -> time-ordered nibbles (b = high half first, then a = low half)
+    nibs = bytearray()
+    for byte in raw:
+        nibs.append((byte >> 4) & 0xF)   # trace_b (falling)
+        nibs.append(byte & 0xF)          # trace_a (rising)
+
+    # 2. re-pair, search parity/order
+    best = None
+    for parity in (0, 1):
+        for order in (0, 1):
+            data = D.assemble(nibs, parity, order)
+            fl = sum(1 for s in L.find_isyncs(data) if L.is_flash(s.addr))
+            if best is None or fl > best[0]:
+                best = (fl, data)
+    data = best[1]
+
+    # 3. TPIU deframe
+    if not L.has_tpiu_sync(data):
+        return data, None
+    ph, _ = L.find_tpiu_phase(data)
+    return L.tpiu_deframe_hsync(data, ph), ph
 
 
 def la_to_etm(dsl_path):

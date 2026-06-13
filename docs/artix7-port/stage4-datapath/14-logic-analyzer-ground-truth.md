@@ -996,3 +996,54 @@ TRACECLK。
 综合中(后台,`CAP_RAW=1`)。完成后:program stream → etm_enable + downclock(/64)→ 重新 arm →
 trace_dump → `fpga_la_crosscheck.py /tmp/fpga_raw.bin <194702.dsl>`。目标:FPGA 去帧后 unknown=0、
 锚点集合与 LA 一致(MATCH)。
+
+## 24. 决定性验证:把 .dsl 灌进 RTL 仿真(RTL 与 LA 字节级等价)
+
+### 24.1 方法(用户提的关键思路)
+
+与其在解码侧瞎试 parity/phase,不如**把 LA 的 .dsl 真实引脚波形当激励,逐样本灌进
+`trace_capture_a7(OVERSAMPLE)` RTL 仿真**,跑同一条 `→ traceIF → CAP_RAW 字节` 链路,输出 RTL
+重建的字节流,再用同一个解码器和 LA 软件路径对比。一刀切开:
+
+- 仿真能解出锚点 = RTL 正确,板上分歧是真实硬件/SI;
+- 仿真也解不出 = RTL 管线有 bug,且在仿真里逐拍可观测、零硬件成本。
+
+工具:
+- `decode/dsl_to_stim.py` — .dsl → 逐样本 memh(bit4=TRACECLK, bit3..0=TD3..TD0),50MSa/s。
+- `rtl/sim/tb_dsl_replay.v` — 20ns/样本回放进 DUT,200MHz ref_200m 过采,在每个 recovered
+  `trace_clk` posedge 抓 `{trace_b,trace_a}` 写出字节(与板上 CAP_RAW 完全一致)。
+
+### 24.2 结果:逐位锁定根因
+
+300k 样本回放,RTL-sim 重建的 nibble 序列与 LA 软件 `sample_nibbles` 逐个 diff:
+**b-first(高半字节在前)、offset -2 时 15750/15750 nibble 完全相同(0 mismatch)。**
+
+→ 即 RTL **采样完全正确**(每个 nibble 都对),唯一问题是字节里 nibble 的**配对顺序/相位**:
+板上字节是 `{trace_b, trace_a}`(一个 trace_clk 周期的下降沿+上升沿),但 ETM 字节边界**不与
+trace_clk 周期对齐**(parity=1:falling[k] 配 rising[k+1]),所以板上字节流不能直接解,必须把
+nibble 拆回时间序后按 parity=1 / rise=low,fall=high 重新配对。
+
+### 24.3 字节级等价证明(2M 样本)
+
+同一 2,000,000 样本窗口,两条路径都跑"拆 nibble → parity 搜索 → TPIU 去帧 → 解码":
+
+| 路径 | flash 锚点 | 去帧字节 | unknown |
+|------|-----------|---------|---------|
+| RTL-sim (tb_dsl_replay) | **33** | **34063** | **0.00%** |
+| LA 软件 (dsl_parse) | **33** | **34063** | **0.00%** |
+
+**完全一致。** `trace_capture_a7` OVERSAMPLE 前端经证明与逻辑分析仪金标准**字节级等价**。
+硬件/SI 在仿真层面被排除,RTL 无 bug。
+
+### 24.4 解码侧修复
+
+`fpga_la_crosscheck.deframe_raw` 改为:byte → 时间序 nibble(b 先 a 后)→ parity/order 搜索 →
+TPIU 去帧(与 dsl_parse 的 LA 路径一致)。板上 `/tmp/fpga_raw3.bin` 重解:0 锚点 → **18 flash
+锚点**(loop_sum/add 的 0x08000f8c/f90/fa4/fb2/fba 全部正确),unknown 21% → 7.7%,与 LA 共有
+7 个锚点。
+
+### 24.5 残差归类(板上 vs 仿真的差)
+
+板上 60KB 窗口仍有 7.7% unknown + 一个杂散 PC `0x08010f8c`(= 0x08000f8c 的 bit16 翻转),
+**仿真里没有**。这正是被仿真隔离出来的**真实硬件残差**(单 bit 偶发错),与采样/配对逻辑无关
+——下一步在板侧(更长窗口统计、IDELAY tap 微调、SI)收这部分,RTL 不用再动。
