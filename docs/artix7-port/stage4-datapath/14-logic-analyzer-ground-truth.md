@@ -899,3 +899,53 @@ TD1 的上升沿采样(a1=31.5%)基本正常,但 **TD1 的下降沿采样(b1)只
 
 TRACECLK=1.316MHz(/64),数据率 ~10.5 Mbps;FPGA IDDR + 200MHz IDELAYCTRL + 125/200MHz MMCM
 绰绰有余。问题是**采样相位(tap)**,不是跟不上速度。
+
+
+---
+
+## 22. 研究"边沿对齐源同步"的正确采样:根因 = 采在数据跳变点上
+
+### 22.1 ARM 官方:TPIU 输出是**边沿对齐**的(决定性)
+
+ARM CoreSight SoC TRM(TRACECLK alignment):**"The TPIU does NOT offset the edges of traceclk
+from the edges of the trace data"** —— TPIU 不把时钟沿和数据沿错开,即**时钟跳变与数据跳变同时发生
+(edge-aligned)**。ARM 建议**采集端(TPA = 我们的 FPGA)自己把采样点移到数据稳定区中心**
+(CoreSight TRM:"create a sample point within the centre of the stable data ... on each changing
+edge of TRACECLK")。
+
+→ 即:**采集端必须移相,把采样点从"时钟边沿(=数据跳变点)"挪到"半位中心"。**
+
+### 22.2 这就是我们 FPGA 下降沿坏的根因
+
+- 我们的 IDDR **直接在 TRACECLK 边沿采** = 采在数据跳变点上。
+- LA 之所以对:它 50MSa/s 过采,**我们在软件里取 edge+9 样本(180ns)= 半位中心**(`dsl_parse` 的
+  `eye=half/2`)。这正是 ARM 说的"移到稳定区中心"。
+- 实测对比(对 LA ground truth):FPGA 的 rising 值大致对、**falling 值系统性偏向 rising**,正是
+  "falling 采样点踩在跳变沿、采到了过渡/上一拍数据"的表现。所有 lane 都受影响(TD1/TD2 最明显)。
+
+### 22.3 orbtrace 为何不用移相?(ECP5 vs Xilinx 差异)
+
+orbtrace testbench 注释明说"Cortex-M always sends LSB on L-H edge, so we don't need to worry about
+phase" —— 但那是**理想 testbench**。真实 ECP5 上靠 `IDDRX1F` + `DELAYG` 的输入路径时序天然落在
+眼内;orbtrace trace/ 里**没有任何 deskew/校准代码**,全靠 ECP5 原语特性 + TPIU 同步字锁帧。
+**Xilinx IDDR 没有这个天然偏移,必须显式处理。**
+
+### 22.4 1.3MHz 下可用的移相手段(关键约束)
+
+需要把采样点移 ~190ns(四分之一周期 = 半位中心)。逐一排查:
+
+| 手段 | 可行? |
+|------|--------|
+| IDELAY 延数据/时钟 | ❌ 最多 ~2.5ns,差 190ns 两个数量级 |
+| MMCM/PLL 对 TRACECLK 移相 90° | ❌ TRACECLK 1.3MHz < MMCM 最低输入(~10MHz),锁不住 |
+| **用相反时钟沿采(IDDR 反相/换边沿配对)** | ✅ **最可行** —— 在半位中心采,不需要绝对延时 |
+
+核心思路:edge-aligned DDR 的正确采法是**在每个半位的中间采**,等价于"用 TRACECLK 反相后的边沿
+去采 IDDR",或在 IDDR 里交换上升/下降沿与 nibble 的配对关系,使采样点落在数据稳定区中心而非跳变沿。
+
+### 22.5 下一步(动手前再核一件事)
+
+在改 RTL 前,先用 LA 数据做一次**离线验证**:把 LA 的采样点从 edge+9(眼中心)改成 **edge+0
+(正好在边沿,模拟 FPGA 当前行为)**,看是不是也复现 FPGA 那种 falling 偏移、解不出锚点。
+若复现,就 100% 坐实"采在跳变点"是根因,然后再改 FPGA 用反相沿采样。**先用零成本的 LA 仿真验证
+假设,再动 Vivado。**
