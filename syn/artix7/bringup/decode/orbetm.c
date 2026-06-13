@@ -43,6 +43,11 @@ struct RT {
     struct symbolFunctionStore *curFunc;
     uint32_t curLine;
     uint32_t flashLo, flashHi;  /* code-range guard to suppress runaway */
+    uint32_t runLen;            /* executed insns in the current continuous run */
+    uint32_t runMax;            /* longest continuous run seen */
+    uint64_t runCount;          /* number of runs (>=1 insn) */
+    uint64_t runSum;            /* total insns across runs (== insExec) */
+    int verbose;                /* 1 = print each executed instruction */
 };
 
 static void addRet(struct RT *r, symbolMemaddr p)
@@ -57,6 +62,8 @@ static void addRet(struct RT *r, symbolMemaddr p)
 
 static void emit(struct RT *r, symbolMemaddr addr, const char *asmline)
 {
+    if (!r->verbose)
+        return;
     struct symbolLineStore *l = symbolLineAt(r->s, addr);
     if (l && l->function &&
         (l->function->filename != r->curFileIdx || l->function != r->curFunc)) {
@@ -67,6 +74,26 @@ static void emit(struct RT *r, symbolMemaddr addr, const char *asmline)
         r->curLine = 0;
     }
     printf("  0x%08x  %s\n", (unsigned)addr, asmline ? asmline : "?");
+}
+
+static void endRun(struct RT *r)
+{
+    /* Close the current continuous run and fold it into the stats.
+     * CAVEAT: a "run" here is a span of in-window executed instructions between
+     * losing/regaining the thread. It is NOT a certified-correct span: once an
+     * indirect return (bx lr / pop pc) has no valid call-stack candidate, the
+     * walk can march through plausible-but-wrong in-window code without leaving
+     * the flash range, inflating run length. Trust the I-sync ANCHORS (absolute
+     * PCs) as ground truth; treat inter-anchor flow as indicative only. */
+    if (r->runLen) {
+        if (r->runLen > r->runMax)
+            r->runMax = r->runLen;
+        r->runCount++;
+        r->runSum += r->runLen;
+        if (r->verbose)
+            printf("---- run end: %u instructions ----\n", r->runLen);
+    }
+    r->runLen = 0;
 }
 
 static void traceCB(void *d)
@@ -84,7 +111,14 @@ static void traceCB(void *d)
                cpu->exception, (unsigned)cpu->addr);
     }
 
-    /* Address change: explicit set of the working address (I-sync / branch). */
+    /* Address change: explicit set of the working address (I-sync / branch).
+     * With branch broadcast ON a Branch Address packet arrives for every taken
+     * branch and carries the TARGET; the decoder delivers it in its own
+     * callback (no atoms), so this is authoritative — we simply adopt it. (An
+     * earlier "consistency" comparison here was misleading: the reported addr
+     * is the branch target, not our pre-branch PC, so it legitimately differs.
+     * orbmortem's INCONSISTENT check is V_DEBUG-only and admits false positives
+     * on uncalculable instructions like bx lr.) */
     if (TRACEStateChanged(&r->i, EV_CH_ADDRESS)) {
         r->stackDelPending = false;
         r->workingAddr = cpu->addr;
@@ -123,6 +157,7 @@ static void traceCB(void *d)
              * next I-sync/branch address. */
             r->insSkipped += incAddr;
             r->inRun = false;
+            endRun(r);
             return;
         }
 
@@ -130,6 +165,7 @@ static void traceCB(void *d)
         if (insExecuted) {
             emit(r, r->workingAddr, a);
             r->insExec++;
+            r->runLen++;
         }
         disposition >>= 1;
         incAddr--;
@@ -163,16 +199,24 @@ static void traceCB(void *d)
 int main(int argc, char *argv[])
 {
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <elf> <bare-etm-file> [--alt-addr]\n",
+        fprintf(stderr,
+                "usage: %s <elf> <bare-etm-file> [--alt-addr] [-v]\n"
+                "  -v: print each executed instruction (default: stats only)\n",
                 argv[0]);
         return 1;
     }
     char *elf = argv[1];
     char *trace = argv[2];
-    bool altAddr = (argc > 3 && strcmp(argv[3], "--alt-addr") == 0);
+    bool altAddr = false;
+    int verbose = 0;
+    for (int k = 3; k < argc; k++) {
+        if (strcmp(argv[k], "--alt-addr") == 0) altAddr = true;
+        else if (strcmp(argv[k], "-v") == 0) verbose = 1;
+    }
 
     struct RT r;
     memset(&r, 0, sizeof(r));
+    r.verbose = verbose;
     /* Cortex-M flash code window. Skip the first 0x200 bytes: that region is
      * the exception vector table (data) which disassembles to junk and is
      * where a runaway PC tends to land after an unresolved indirect branch on
@@ -200,6 +244,8 @@ int main(int argc, char *argv[])
     }
     fclose(f);
 
+    endRun(&r);                 /* close the final run */
+
     struct TRACEDecoderStats *st = TRACEDecoderGetStats(&r.i);
     fprintf(stderr,
             "orbetm: %llu bytes; sync=%u lostSync=%u; "
@@ -207,6 +253,10 @@ int main(int argc, char *argv[])
             (unsigned long long)total, st->syncCount, st->lostSyncCount,
             (unsigned long long)r.insExec,
             (unsigned long long)r.insSkipped);
+    fprintf(stderr,
+            "orbetm: continuous runs=%llu, longest=%u insns, mean=%.1f insns\n",
+            (unsigned long long)r.runCount, r.runMax,
+            r.runCount ? (double)r.runSum / r.runCount : 0.0);
     symbolDelete(r.s);
     return 0;
 }
