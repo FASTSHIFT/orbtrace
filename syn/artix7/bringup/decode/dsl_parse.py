@@ -150,17 +150,21 @@ def main():
         print("!! WARNING: no valid flash I-sync anchors in ANY alignment. "
               "Check wiring / capture / that ETM is actually emitting.")
 
-    # If the TPIU formatter padded the link with sync fillers (happens with
-    # ETM branch-broadcast OFF, when the trace is sparse), strip them so the
-    # downstream ETM decoder sees bare packets.
+    # If the TPIU formatter is active (HSYNC/FSYNC fillers present), deframe the
+    # 16-byte CoreSight frames properly: skip sync fillers without consuming a
+    # frame slot AND restore the even-byte LSBs from the aux byte. (The old
+    # "just delete FF 7F" left the frame structure mangled -> ~16% of bytes fell
+    # into the data-packet encoding space and decode derailed. Proper deframing
+    # drops that to ~0.002%.) Without an FSYNC to lock phase, scan all 16 frame
+    # start phases and pick the one with the most flash I-sync anchors.
     if L.has_tpiu_sync(data):
-        stripped = L.strip_tpiu_sync(data)
-        fl2, tot2, _ = score(stripped)
-        print(f"TPIU sync fillers detected: stripped "
-              f"{len(data) - len(stripped)} bytes "
-              f"({len(data)} -> {len(stripped)}); "
+        phase, ph_flash = L.find_tpiu_phase(data)
+        deframed = L.tpiu_deframe_hsync(data, phase)
+        fl2, tot2, _ = score(deframed)
+        print(f"TPIU formatter detected: deframed 16-byte frames "
+              f"(phase={phase}); {len(data)} -> {len(deframed)} bytes; "
               f"flash anchors {flash} -> {fl2}")
-        data = stripped
+        data = deframed
 
     # Report the recovered anchors.
     _, _, syncs = score(data)

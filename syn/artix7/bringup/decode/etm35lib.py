@@ -457,34 +457,30 @@ def tpiu_deframe(stream: bytes, want_stream: "int | None" = None):
 
 
 # ----------------------------------------------------------------------------
-# TPIU half-sync / full-sync filler stripping.
+# TPIU half-sync / full-sync filler stripping (DEPRECATED — see tpiu_deframe_hsync).
 #
-# Empirically (capture 172817, ETM branch-broadcast OFF) the trace is bare ETM
-# but the TPIU formatter pads idle with sync fillers:
-#   * full sync  0xFFFFFF7F  (SYNCPATTERN)
-#   * half sync  0xFF 0x7F   (HALFSYNC_LOW=0xFF then HALFSYNC_HIGH=0x7F)
-# These are NOT ETM packets; left in place they derail the decoder (an 0xFF is
-# misread as a branch-packet header). Because this single-source ETM is emitted
-# transparently (no per-byte stream framing — confirmed: deframing by stream-ID
-# scatters into dozens of bogus streams and recovers 0 anchors, whereas simply
-# removing the sync fillers recovers all anchors), the correct front-end here is
-# to STRIP the fillers, not to run the full 16-byte deframer.
-#
-# Reference: ARM CoreSight TPIU formatter; orbuculum tpiuDecoder.c constants
-# SYNCPATTERN 0xFFFFFF7F, HALFSYNC_LOW 0xFF / HALFSYNC_HIGH 0x7F.
+# HISTORICAL NOTE: this just deletes the sync fillers and was WRONG. We later
+# proved (sigrok arm_tpiu definition + cross-check) the STM32F4 parallel trace
+# is genuine 16-byte CoreSight TPIU formatter output: even bytes carry data
+# with their LSB stripped to 0 (real LSB stored in frame byte[15]), odd bytes
+# are data, HSYNC (FF 7F) is inserted between frame bytes and must be SKIPPED
+# without consuming a frame slot. Deleting FF 7F alone leaves the 16-byte frame
+# structure intact-but-mangled -> ~16% of bytes land in the data-packet
+# encoding space (0x2e='Normal data' header, etc.) and decode derails.
+# tpiu_deframe_hsync() does the correct thing and drops the bad-byte fraction
+# from 16% to ~0.002%. strip_tpiu_sync is kept only for old callers/tests.
 # ----------------------------------------------------------------------------
 def strip_tpiu_sync(stream: bytes) -> bytes:
-    """Remove TPIU full-sync (0xFFFFFF7F) and half-sync (0xFF 0x7F) fillers,
-    returning the underlying bare-ETM byte stream. Idempotent on streams with
-    no fillers."""
-    # Drop full syncs first so their bytes can't be re-paired as half-syncs.
+    """DEPRECATED: deletes TPIU full/half sync fillers. Does NOT handle the
+    16-byte frame structure or the even-byte LSB restore — use
+    tpiu_deframe_hsync() instead. Kept for backward compatibility."""
     s = stream.replace(b"\xff\xff\xff\x7f", b"")
     out = bytearray()
     i = 0
     n = len(s)
     while i < n:
         if i + 1 < n and s[i] == 0xFF and s[i + 1] == 0x7F:
-            i += 2                       # half-sync pair -> drop
+            i += 2
             continue
         out.append(s[i])
         i += 1
@@ -493,8 +489,83 @@ def strip_tpiu_sync(stream: bytes) -> bytes:
 
 def has_tpiu_sync(stream: bytes) -> bool:
     """True if the stream contains TPIU formatter sync fillers (full or half).
-    Used to decide whether strip_tpiu_sync is needed before ETM decode."""
+    Used to decide whether TPIU deframing is needed before ETM decode."""
     return (b"\xff\xff\xff\x7f" in stream) or (b"\xff\x7f" in stream)
+
+
+# ----------------------------------------------------------------------------
+# TPIU 16-byte formatter deframe with HSYNC handling (the CORRECT front-end).
+#
+# CoreSight TPIU continuous-formatter protocol (sigrok arm_tpiu; ARM CoreSight
+# Architecture Spec):
+#   * Trace is grouped into 16-byte frames.
+#   * Even bytes (index 0,2,..,14): if bit0=1 it is a stream-ID change
+#     (id = byte>>1); if bit0=0 it is a DATA byte whose true LSB is taken from
+#     frame byte[15] bit[index/2] (the formatter stole the LSB to carry the ID
+#     flag, and stashed the real LSB in the aux byte).
+#   * Odd bytes (1,3,..,13): always data.
+#   * byte[15] is the aux byte holding the 7 even-byte LSBs (+ its own bit7).
+#   * HSYNC half-sync (0xFF 0x7F) and FSYNC full-sync (0xFFFFFF7F) are inserted
+#     into the octet stream and are NOT part of the 16-byte frame payload; they
+#     must be removed WITHOUT consuming a frame slot.
+#
+# Without an FSYNC to lock frame phase (the STM32F4 parallel port we capture
+# emits HSYNC but no FSYNC within a window), the caller scans all 16 candidate
+# start phases and picks the one yielding the most valid flash I-sync anchors.
+# ----------------------------------------------------------------------------
+def tpiu_deframe_hsync(stream: bytes, phase: int = 0,
+                       want_stream: "int | None" = None) -> bytes:
+    """Deframe a 16-byte TPIU formatter stream starting at `phase`, skipping
+    HSYNC/FSYNC fillers and restoring even-byte LSBs from the aux byte. Returns
+    the recovered payload (single concatenation when want_stream is None, else
+    only that stream-ID's bytes). See find_tpiu_phase() to choose `phase`."""
+    out = bytearray()
+    frame = []
+    cur = 0
+    i = phase
+    n = len(stream)
+    while i < n:
+        # Skip HSYNC (FF 7F) and FSYNC (FF FF FF 7F) without consuming a slot.
+        if stream[i] == 0xFF and i + 1 < n and stream[i + 1] == 0x7F:
+            i += 2
+            continue
+        if (i + 3 < n and stream[i] == 0xFF and stream[i + 1] == 0xFF
+                and stream[i + 2] == 0xFF and stream[i + 3] == 0x7F):
+            i += 4
+            continue
+        frame.append(stream[i])
+        i += 1
+        if len(frame) == 16:
+            aux = frame[15]
+            for j in range(15):
+                if j % 2 == 0:
+                    if frame[j] & 1:
+                        cur = frame[j] >> 1        # stream-ID change
+                    else:
+                        b = frame[j] | ((aux >> (j // 2)) & 1)
+                        if want_stream is None or cur == want_stream:
+                            out.append(b)
+                else:
+                    if want_stream is None or cur == want_stream:
+                        out.append(frame[j])
+            frame = []
+    return bytes(out)
+
+
+def find_tpiu_phase(stream: bytes, scorer=None) -> "tuple[int, int]":
+    """Try all 16 TPIU frame start phases; return (best_phase, score). Default
+    scorer = number of flash-range Normal I-sync anchors in the deframed
+    output (the strongest 'this phase is right' signal)."""
+    best = (0, -1)
+    for ph in range(16):
+        pl = tpiu_deframe_hsync(stream, ph)
+        if scorer is None:
+            score = sum(1 for s in find_isyncs(pl) if is_flash(s.addr))
+        else:
+            score = scorer(pl)
+        if score > best[1]:
+            best = (ph, score)
+    return best
 
 
 # ----------------------------------------------------------------------------

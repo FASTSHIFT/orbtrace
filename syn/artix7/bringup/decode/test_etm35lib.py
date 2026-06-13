@@ -808,3 +808,68 @@ def test_tpiu_deframe_single_stream():
 def test_tpiu_deframe_want_stream_absent():
     stream = bytes.fromhex("ffffff7f") + bytes(16)
     assert L.tpiu_deframe(stream, want_stream=99) == b""
+
+
+# ----------------------------------------------------------------------------
+# tpiu_deframe_hsync — the correct 16-byte TPIU formatter deframe
+# (sigrok arm_tpiu: even bytes data-with-LSB-in-aux or stream-id; odd data;
+#  byte15 = aux LSBs; HSYNC/FSYNC skipped without consuming a frame slot)
+# ----------------------------------------------------------------------------
+def _build_tpiu_frame(payload15, stream_id=1, even_lsbs=0):
+    """Build one 16-byte TPIU frame carrying 15 data bytes for one stream.
+    payload15: 15 data bytes. The first even byte (index 0) is used as the
+    stream-id change (id<<1|1); remaining bytes carry payload. For test
+    simplicity we put the id in byte0 and 14 payload bytes in 1..14, aux=byte15.
+    """
+    frame = bytearray(16)
+    frame[0] = (stream_id << 1) | 1          # stream-id change, immediate
+    aux = 0
+    for k in range(1, 15):
+        frame[k] = payload15[k - 1] & 0xFE if k % 2 == 0 else payload15[k - 1]
+        if k % 2 == 0 and (payload15[k - 1] & 1):
+            aux |= (1 << (k // 2))
+    frame[15] = aux
+    return bytes(frame), payload15[:14]
+
+
+def test_tpiu_deframe_hsync_basic():
+    payload = bytes(range(0x80, 0x80 + 14))   # 14 data bytes
+    frame, expect = _build_tpiu_frame(payload, stream_id=2)
+    out = L.tpiu_deframe_hsync(frame, phase=0)
+    assert out == bytes(expect)
+
+
+def test_tpiu_deframe_hsync_restores_even_lsb():
+    # An even-position data byte with LSB=1 must be reconstructed from the aux.
+    frame = bytearray(16)
+    frame[0] = (2 << 1) | 1                    # stream id 2
+    frame[2] = 0x2E                            # even data byte, LSB stripped
+    frame[15] = 1 << (2 // 2)                  # aux bit for index 2 -> restore LSB
+    out = L.tpiu_deframe_hsync(bytes(frame), phase=0)
+    # byte at frame index 2 should come back as 0x2E | 1 = 0x2F
+    assert 0x2F in out
+    assert 0x2E not in out
+
+
+def test_tpiu_deframe_hsync_skips_hsync_pair():
+    payload = bytes(range(0x80, 0x80 + 14))
+    frame, expect = _build_tpiu_frame(payload, stream_id=1)
+    # insert an HSYNC pair in the middle of the frame bytes
+    framed = frame[:8] + b"\xff\x7f" + frame[8:]
+    out = L.tpiu_deframe_hsync(framed, phase=0)
+    assert out == bytes(expect)
+
+
+def test_tpiu_deframe_hsync_skips_fsync():
+    payload = bytes(range(0x40, 0x40 + 14))
+    frame, expect = _build_tpiu_frame(payload, stream_id=1)
+    framed = b"\xff\xff\xff\x7f" + frame
+    out = L.tpiu_deframe_hsync(framed, phase=0)
+    assert out == bytes(expect)
+
+
+def test_find_tpiu_phase_returns_valid_phase():
+    payload = bytes(range(0x80, 0x80 + 14))
+    frame, _ = _build_tpiu_frame(payload, stream_id=1)
+    ph, score = L.find_tpiu_phase(frame * 4)
+    assert 0 <= ph < 16
