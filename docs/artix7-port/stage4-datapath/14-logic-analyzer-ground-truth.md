@@ -425,3 +425,52 @@ pop {r4,pc}`),~91% 是真实指令流,残留 ~9% 是栈候选偶尔过期的重�
 OpenCSD 1.4.1 已装(`trc_pkt_lister` + C/C++ 库 + 头 + 官方 spec/HOWTO 齐全)。**下一步(待用户拍板)
 = 写 snapshot 打包脚本,跑 `trc_pkt_lister -decode`,得到 ARM 官方解码器在我们 M4 流上的持续指令流
 质量——这是"调用栈能恢复多少"的权威标尺。** 未决策,先摸底完成。
+
+
+---
+
+## 13. 跑了一把 OpenCSD —— 权威标尺出来了
+
+写了 `make_opencsd_snapshot.py`(纯胶水,零解码代码)把我们的裸 ETM 流 + ELF + 实读的 4 个
+ETMv3 寄存器(ETMCR=0x980 ETMCCER=0x18541800 ETMIDR=0x4114f250 ETMTRACEIDR=0x02)包成 OpenCSD
+snapshot,跑 `trc_pkt_lister -decode`。
+
+### 13.1 OpenCSD 确实能解我们的流(packet 级全对)
+
+`trc_pkt_lister`(不 decode,只列 packet)从 A-sync 对齐后,正确解出 A_SYNC / P_HDR(EE/EEEE/
+EEEEEEEE)/ BRANCH_ADDRESS / TRIGGER —— **ARM 官方解码器认我们的流,packet 解析全对。**
+
+### 13.2 指令级解码:锚对了就对,但有两个坑
+
+1. **ISA=Thumb 必须靠"带 Thumb 位的 I-sync"锚定**。IHI0014Q 实证:I-sync 地址 bit[0] 是 Thumb 位
+   (Thumb 态=1)。我们流里 334 个 flash I-sync:**160 个 bit0=1(真 Thumb 锚点),174 个 bit0=0
+   (多半是 mid-stream 假阳性 0x08)**。从 bit0=1 的 I-sync 锚定,OpenCSD 立刻 `ISA=T32` 正确解出
+   `exec range=0x8000e90 ... (ISA=T32) E` —— 真实 Thumb 指令范围。从 A-sync(没跟 I-sync)起步则
+   默认 A32,解错。
+2. **OpenCSD 是"对或中止"(correct-or-abort)**:遇到一个它不认的 packet(我们锚点间的噪声/
+   reserved 头)就**直接终止整条 datapath**,不像 orbuculum/orbetm 那样硬着头皮往下走。实测:
+   从一个好 Thumb 锚点起,OpenCSD 解出**恰好 1 条指令范围**就在下一个坏 packet 处中止;整条流从头
+   跑则在第 2593 字节中止(把噪声误判成 data-trace,报 OCSD_ERR_HW_CFG_UNSUPP)。
+
+### 13.3 决定性结论:工具特性 × 数据特性的错配
+
+| | OpenCSD(ARM 官方) | orbuculum / orbetm |
+|---|---|---|
+| 设计目标 | Cortex-A,**片内 ETR/ETB 无损 trace** | Cortex-M,实时/容错 |
+| 坏 packet | **中止整条解码** | 跳过/续走 |
+| 在我们这条**有损隙的逻辑分析仪流**上 | 锚点处完全正确,但一遇噪声即停 | 一路走完(但锚点间会跑飞) |
+
+**这把标尺量出的真相**:我们流的瓶颈不在解码器算法,而在**流本身有"锚点间噪声/不连续"**——
+OpenCSD 这种为无损片内 trace 设计的严格解码器,直接拒绝在脏流上硬解(这恰恰是它工业级正确性的
+体现:它不会给你编造的指令流)。orbuculum 容错往下走,代价是锚点间不可信。
+
+→ **两边都不是 bug,是数据脏**。要让任一解码器吐出长段连续可信指令流,**必须先有"干净不丢的流"**
+——这就把球又踢回**台阶②/③(FPGA 侧无损连续采集)**。换句话说:**OpenCSD 这把权威标尺证明了
+"解码不是瓶颈,采集质量才是"**。我们之前在解码侧反复纠结(自研/复用/调用栈),方向上是次要矛盾;
+主要矛盾是把 STM32 ETM 无损连续地搬进 PC。
+
+### 13.4 产出
+
+- `make_opencsd_snapshot.py`:`.bin`+ELF → OpenCSD snapshot(纯胶水),固化下来随时可复跑。
+- 结论:**offline 求最准用 OpenCSD(但要喂干净流);现状脏流下 orbuculum 容错更实用;真正要突破
+  连续性,回台阶②/③ 做无损采集。** 解码工具选型到此尘埃落定,不再纠结。
