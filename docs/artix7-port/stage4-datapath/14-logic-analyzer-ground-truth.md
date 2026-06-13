@@ -367,3 +367,61 @@ pop {r4,pc}`),~91% 是真实指令流,残留 ~9% 是栈候选偶尔过期的重�
   并处理递归/中断导致的栈失衡),连续段就能从"锚点间短程"扩到"跨函数全程"。
 - 我之前下"物理天花板"是信息不全时的过强结论(只看了 in-code 占比 27%,没按距离分桶就归因硬件)。
   分桶一看就清楚:99% 的局部正确率证明数据是好的,是解码没跟住。**保留此教训。**
+
+
+---
+
+## 12. OpenCSD 摸底(只评估,未决策)
+
+用户问"有 OpenCSD 还要不要手搓 / 有没有现成 CLI / 谁在用这些库 / orbuculum 为啥不用它 / 以后要
+流式怎么办"。先把 OpenCSD 摸清楚再决定。
+
+### 12.1 OpenCSD 是什么 / 谁在用
+
+- **ARM/Linaro 官方开源 CoreSight 解码库**,Linux 内核 `perf`(`perf record -e cs_etm//`)的
+  CoreSight 后端,LLVM AutoFDO、Google 数据中心 ARM PGO 都用它。装机量 = Cortex-A Linux/安卓
+  几十亿台。这就是"谁在用"——**主战场是 Cortex-A,trace 存片内 ETR/ETB,软件读出,不接探针**。
+- 我们用的是它的边角:**ETMv3.5 / M-profile 解码**(同一套 ETM 协议,A/M 复用)。
+
+### 12.2 为什么 orbuculum 不用 OpenCSD(推断,无作者背书)
+
+- orbuculum = **实时流式 + 纯 C + 轻量**(逐字节 pump,边抓边显示,orbtop 实时视图)。
+- OpenCSD = **offline/batch + C++ 重库 + snapshot 输入**(攒完整 dump 再一把解)。
+- 两者数据流模型正交;且 OpenCSD 早期重心在 ETMv4/Cortex-A,M-profile 支持是后补的。
+- **对我们 offline 对拍而言,OpenCSD 才是主场;对"以后实时一直抓"而言,orbuculum 路线才对。**
+
+### 12.3 现成 CLI:有 —— `trc_pkt_lister`(Ubuntu 有包)
+
+- `apt install libopencsd-bin libopencsd-dev`(已装,**1.4.1**,零编译)。
+- `trc_pkt_lister -ss_dir <snapshot> -decode` 做完整 ETMv3.5 指令解码;带 `-tpiu` 选项可直接吃
+  TPIU 帧(连填充都不用我们剥)。
+- **门槛**:输入是 OpenCSD "snapshot 目录"(ini 配置 + 原始 trace dump + 内存镜像),不是裸 bin。
+  需要写一个**纯打包脚本**(不碰解码逻辑)把我们的数据包装进去。
+
+### 12.4 snapshot 格式(已读官方 spec,打包很简单)
+
+`/usr/share/doc/libopencsd-dev/specs/ARM Trace and Debug Snapshot file format 0v2.pdf`:
+- `snapshot.ini`:[snapshot] version=1.0 + [device_list] + [trace] metadata=trace.ini
+- 一个 core 设备 ini(class=core, type=Cortex-M4)+ 一个 trace 源 ini
+  (class=trace_source, type=**ETM3.5**)
+- **ETMv3 解码只需 4 个寄存器**:`ETMCR, ETMCCER, ETMIDR, ETMTRACEIDR` —— 我们全有/可从靶子读。
+- core ini 用 `[dump]` 指向内存镜像(直接用 ELF 的 .text;spec 明说可以是 elf 可加载段)。
+- `trace.ini`:[trace_buffers] format=source_data(我们已剥成裸 ETM 单源)或 coresight(带 TPIU)。
+
+→ 打包脚本 = 写 3 个小 ini + 把 `/tmp/dsl_bytes_0.bin` 和 ELF 放进目录。**几十行 Python,零解码代码。**
+
+### 12.5 流式("以后一直抓")的定位
+
+流式 = 两段独立问题:
+1. **连续不丢传输(台阶②/③,FPGA 侧硬骨头)**:逻辑分析仪是快照设备,不能无限流;要"一直抓"
+   必须 FPGA 实时收 ETM → orbflow 打包 → 千兆网口连续吐 + 序号防丢。这跟解码无关。
+2. **实时解码显示**:这段用 **orbuculum**(它本就是实时流式),不是 OpenCSD。
+
+**结论性认识**:offline 对拍/求最准 → OpenCSD;实时一直抓 → orbuculum 路线;两者解码内核同协议,
+现在用 OpenCSD 把"调用栈/持续流的理论上限"摸到底,认知可直接迁移到实时管线的取舍。
+
+### 12.6 现状
+
+OpenCSD 1.4.1 已装(`trc_pkt_lister` + C/C++ 库 + 头 + 官方 spec/HOWTO 齐全)。**下一步(待用户拍板)
+= 写 snapshot 打包脚本,跑 `trc_pkt_lister -decode`,得到 ARM 官方解码器在我们 M4 流上的持续指令流
+质量——这是"调用栈能恢复多少"的权威标尺。** 未决策,先摸底完成。
