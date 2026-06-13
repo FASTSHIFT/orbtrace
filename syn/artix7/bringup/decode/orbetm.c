@@ -180,12 +180,21 @@ static void traceCB(void *d)
         } else if (ic & LE_IC_JUMP) {
             if (insExecuted) {
                 if (ic & LE_IC_IMMEDIATE) {
+                    /* Direct jump: target known from the image. */
                     r->workingAddr = newaddr;
                 } else {
-                    /* indirect: use a stacked return candidate if we have one */
-                    if (r->stackDepth)
+                    /* Indirect jump/return (bx lr, pop pc, ...): the target is
+                     * NOT in the image. With branch broadcast ON a Branch
+                     * Address packet carrying the real target arrives next and
+                     * sets workingAddr via EV_CH_ADDRESS. We must NOT keep
+                     * walking atoms from a guessed address (that is the
+                     * runaway). Park a stacked candidate, then STOP this run
+                     * and wait for the authoritative address. */
+                    if (r->stackDepth) {
                         r->workingAddr = r->callStack[r->stackDepth - 1];
-                    r->stackDelPending = true;
+                        r->stackDelPending = true;
+                    }
+                    return;     /* leave inRun=true; next EV_CH_ADDRESS resumes */
                 }
             } else {
                 r->workingAddr += (ic & LE_IC_4BYTE) ? 4 : 2;
