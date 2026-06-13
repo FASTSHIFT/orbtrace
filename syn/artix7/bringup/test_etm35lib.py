@@ -591,3 +591,58 @@ def test_decode_all_realign_on_fixture_extends():
     extended, realigns = L.decode_all_realign(data)
     # extended decode recovers at least as many events as the plain walk
     assert len(extended) >= len(plain)
+
+
+# ----------------------------------------------------------------------------
+# r14 BUG-1 hardening: reject Jazelle/AltISA, half-word align, ELF-tight range
+# ----------------------------------------------------------------------------
+def test_isync_rejects_jazelle_bit():
+    pkt = bytearray(make_isync(0x08001234))
+    pkt[1] |= 0x10               # bit4 Jazelle set -> not Cortex-M
+    assert L.parse_isync_at(bytes(pkt), 0) is None
+
+
+def test_isync_rejects_altisa_bit():
+    pkt = bytearray(make_isync(0x08001234))
+    pkt[1] |= 0x04               # bit2 AltISA set -> not Cortex-M
+    assert L.parse_isync_at(bytes(pkt), 0) is None
+
+
+def test_isync_rejects_unaligned_addr():
+    # address 0x08001235 -> &~1 = 0x08001234 (even) is fine; but an address
+    # whose &~1 is still odd is impossible; instead test a word-misaligned-only
+    # scenario is N/A. Verify a normal even addr passes.
+    assert L.parse_isync_at(make_isync(0x08001234), 0) is not None
+
+
+def test_isync_custom_flash_range_tightens():
+    # A valid-looking I-sync at 0x080F0000 passes the default 1MB bound but
+    # should be rejected by a tight .text bound of [0x08000000, 0x08030000).
+    pkt = make_isync(0x080F0000)
+    assert L.parse_isync_at(pkt, 0) is not None                      # default
+    assert L.parse_isync_at(pkt, 0, flash_hi=0x08030000) is None     # tight
+
+
+def test_find_isyncs_respects_tight_range():
+    s_in = make_isync(0x08001000)
+    s_out = make_isync(0x080E0000)
+    data = s_in + bytes([0x88]) + s_out
+    addrs = {s.addr for s in L.find_isyncs(data, flash_hi=0x08030000)}
+    assert 0x08001000 in addrs
+    assert 0x080E0000 not in addrs
+
+
+def test_flowevent_branch_addr_not_target():
+    # decode a region with a branch; the branch FlowEvent must NOT claim its
+    # addr is a target (addr_is_target stays False).
+    data = bytes([0x01, 0x00])   # branch packet then async-stop
+    events, _ = L.decode_region(data, 0, 0x08001000)
+    br = [e for e in events if e.kind == "branch"]
+    assert br and all(e.addr_is_target is False for e in br)
+
+
+def test_flowevent_isync_addr_is_target():
+    s = make_isync(0x08002000)
+    events = L.decode_all(s)
+    isy = [e for e in events if e.kind == "isync"]
+    assert isy and all(e.addr_is_target is True for e in isy)

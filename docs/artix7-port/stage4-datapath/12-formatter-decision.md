@@ -49,3 +49,14 @@
 - 下一步实验:用 **swap 序固定**的 trace_stream 抓繁忙负载,看 I-sync 锚点数 + region 连续度是否比之前(nibble 序未固定)显著提升。这是把"指示性流"往"可信连续流"推的正路,且不需要 formatter。
 
 > 一句话:UDP 不是问题;但新干净数据证伪了"STM32 在发 formatter 帧",所以 FPGA formatter 对我们这单源裸 ETM 是多余的——该做的是**固定正确的采样字节序(nibble swap)**,让 FPGA 出的字节就是对齐的 ETM,PC 端锚 I-sync 即可。
+
+
+---
+
+## 5. GAP-1 闭合(回应 r14):820 帧 vs 0 帧的机制(非"巧合")
+
+r14 指出 §2.3 用"巧合"草草收尾。查清机制:**TPIUSync 是"锁一次 `0x7FFFFFFF` 后自由跑、每 16 字节吐一帧"**。
+- 老 `trace_etm.bin`:有 30 个 `0xFFFFFF7F`(idle/数据里偶发),第一个一锁,后续 16KB 全程每 16 字节硬吐 → **820 帧,内容多为 idle/垃圾,非有效 formatter 帧**。
+- 新 `raw_nibbles.bin`:**0 个 `0xFFFFFF7F` → 从不锁 → 0 帧**。
+
+**所以"帧数"不是 formatter 存在与否的指标**(单次偶发锁 + 自由跑就能造几百帧)。正确指标是**周期性 `0xFFFFFF7F` 全同步**——两份都没有。"不发 formatter 帧"的结论不变,但地基从"巧合"换成"TPIUSync free-run 语义 + 无周期全同步"。

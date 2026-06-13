@@ -72,11 +72,20 @@ def find_asyncs(data: bytes, min_zeros: int = 5) -> list[int]:
     return out
 
 
-def parse_isync_at(data: bytes, i: int) -> ISync | None:
+def parse_isync_at(data: bytes, i: int,
+                   flash_lo: int = FLASH_LO, flash_hi: int = FLASH_HI) -> "ISync | None":
     """Try to parse a Normal I-sync packet whose header is at offset i.
 
     Returns an ISync if the 6 bytes form a Normal I-sync with a flash address,
     else None. ContextID bytes = 0 on Cortex-M4 (DDI0440C).
+
+    Validation (hardened per review r14 BUG-1, to reject noise/misaligned 0x08):
+      * bit7 = 0 (Normal, not LSiP)
+      * bit4 (Jazelle) = 0 and bit2 (AltISA) = 0 — Cortex-M is Thumb-only, so
+        these are always 0; checking them is a free, strong false-positive
+        filter (IHI0014Q Fig 7-42 / Table 7-20).
+      * address in [flash_lo, flash_hi). flash_hi defaults to the full 1 MB
+        region but callers should pass the ELF .text extent for a tighter bound.
     """
     if i + 5 >= len(data):
         return None
@@ -85,34 +94,44 @@ def parse_isync_at(data: bytes, i: int) -> ISync | None:
     info = data[i + 1]
     if info & 0x80:          # bit7=1 => LSiP, not a Normal I-sync
         return None
+    if info & 0x14:          # bit4 Jazelle or bit2 AltISA set => not Cortex-M
+        return None
     addr = (data[i + 2] | (data[i + 3] << 8)
             | (data[i + 4] << 16) | (data[i + 5] << 24))
-    if not is_flash(addr):
+    a = addr & ~1            # strip Thumb bit -> half-word aligned PC
+    if not (flash_lo <= a < flash_hi):
         return None
     return ISync(
         offset=i,
-        addr=addr & ~1,
+        addr=a,
         thumb=bool(addr & 1),
         reason=(info >> 5) & 0b11,
         nonsecure=bool(info & 0x08),
     )
 
 
-def find_isyncs(data: bytes) -> list[ISync]:
+def find_isyncs(data: bytes,
+                flash_lo: int = FLASH_LO, flash_hi: int = FLASH_HI) -> "list[ISync]":
     """Scan the whole stream for Normal I-sync packets carrying a flash PC.
 
     This is the robust anchor extractor: every Normal I-sync gives an absolute
     PC (IHI0014Q Fig 7-42), independent of whether the variable-length parse
-    between syncs stayed aligned.
+    between syncs stayed aligned. Pass the ELF .text [lo,hi) for a tight bound.
     """
     out = []
     for i in range(len(data) - 5):
         if data[i] != ISYNC_HEADER:
             continue
-        s = parse_isync_at(data, i)
+        s = parse_isync_at(data, i, flash_lo, flash_hi)
         if s is not None:
             out.append(s)
     return out
+
+
+def recover_pcs(data: bytes,
+                flash_lo: int = FLASH_LO, flash_hi: int = FLASH_HI) -> "list[int]":
+    """Return the sorted distinct flash PCs anchored from I-sync packets."""
+    return sorted({s.addr for s in find_isyncs(data, flash_lo, flash_hi)})
 
 
 def bit_shift(data: bytes, shift: int) -> bytes:
@@ -131,20 +150,19 @@ def bit_shift(data: bytes, shift: int) -> bytes:
     return bytes(out)
 
 
-def recover_pcs(data: bytes) -> list[int]:
-    """Return the sorted distinct flash PCs anchored from I-sync packets."""
-    return sorted({s.addr for s in find_isyncs(data)})
-
-
-# --- traceIF byte-assembly model (matches verilog/traceIF.v width==3 path) ---
-# construct <= {dinb[3:0], dina[3:0], construct[35:8]}; a 16-bit "packet" is
-# emitted once synced on 0x7FFFFFFF; 0x7FFF packets are dropped. Used to model
-# / cross-check the FPGA front-end in tests.
+# --- traceIF byte-assembly SIMPLIFIED MODEL (NOT a faithful RTL mirror) ---
+# Approximates verilog/traceIF.v width==3: construct <= {dinb,dina,construct[35:8]};
+# a 16-bit packet is emitted once synced on 0x7FFFFFFF; 0x7FFF packets dropped.
+# NOTE (review r14 BUG-2): this is a SIMPLIFIED model, NOT a faithful mirror of
+# the RTL. It detects only the RE-sync window (0x7FFFFFFF) and omits the RTL's
+# FE-sync phase (isREsync), elemCount, and 128-bit cFrame assembly. Use only
+# for coarse byte-ordering experiments, NOT to certify RTL correctness.
 def traceif_assemble(nibble_bytes: bytes) -> bytes:
-    """Model traceIF: input bytes = {trace_b[3:0]<<4 | trace_a[3:0]} per clk.
+    """SIMPLIFIED model of traceIF (input = {trace_b<<4|trace_a} per clk).
 
-    Returns the assembled byte stream (TPIU/ETM bytes) after sync lock. This
-    mirrors the RTL closely enough for regression on the byte ordering.
+    Returns an assembled byte stream after sync lock. This is a coarse
+    approximation (single sync phase, no 128-bit frame assembly), NOT a
+    faithful RTL mirror — do not use it to back RTL correctness claims.
     """
     construct = 0
     out = bytearray()
@@ -181,9 +199,16 @@ def traceif_assemble(nibble_bytes: bytes) -> bytes:
 @dataclass
 class FlowEvent:
     kind: str          # 'isync' | 'atoms' | 'branch'
-    addr: int          # current/target PC (thumb bit stripped) where meaningful
+    addr: int          # 'isync': absolute PC (ground truth). 'atoms': the
+                       # current base PC (carried, not advanced). 'branch':
+                       # the base PC at the branch — NOT the branch TARGET.
+                       # Branch target-address decode is not implemented
+                       # (review r14 BUG-3); branch events are COUNT-ONLY and
+                       # addr is only the prevailing base, not the jump dest.
     eatoms: int = 0    # executed atoms (P-header)
     natoms: int = 0    # not-executed atoms
+    addr_is_target: bool = False  # True only when addr is a decoded absolute
+                                  # PC (isync). False for atoms/branch.
 
 
 def _phdr_atoms(c: int):
@@ -233,7 +258,7 @@ def decode_region(data: bytes, start: int, base_addr: int, max_bytes: int = 4096
         if c == ISYNC_HEADER:
             s = parse_isync_at(data, i)
             if s is not None:
-                events.append(FlowEvent("isync", s.addr))
+                events.append(FlowEvent("isync", s.addr, addr_is_target=True))
                 base_addr = s.addr
                 i += 6
                 continue
@@ -249,7 +274,7 @@ def decode_all(data: bytes):
     and 'branch' events give the executed-instruction flow between anchors."""
     events = []
     for s in find_isyncs(data):
-        events.append(FlowEvent("isync", s.addr, ))
+        events.append(FlowEvent("isync", s.addr, addr_is_target=True))
         region, _ = decode_region(data, s.offset + 6, s.addr)
         events.extend(region)
     return events
@@ -308,7 +333,7 @@ def decode_aligned(data: bytes, scan: int = 24, region_bytes: int = 4096):
         if chosen is None:
             continue
         sh, off, s, shifted = chosen
-        events = [FlowEvent("isync", s.addr)]
+        events = [FlowEvent("isync", s.addr, addr_is_target=True)]
         region, _ = decode_region(shifted, off + 6, s.addr, region_bytes)
         events.extend(region)
         regions.append(AlignedRegion(async_offset=a_off, shift=sh,
@@ -453,7 +478,7 @@ def decode_region_realign(data: bytes, start: int, base_addr: int,
         if k == "isync":
             s = parse_isync_at(work, i)
             if s is not None:
-                events.append(FlowEvent("isync", s.addr))
+                events.append(FlowEvent("isync", s.addr, addr_is_target=True))
                 base = s.addr
                 i += 6
                 continue
@@ -498,7 +523,7 @@ def decode_all_realign(data: bytes):
     events = []
     total_realigns = 0
     for s in find_isyncs(data):
-        events.append(FlowEvent("isync", s.addr))
+        events.append(FlowEvent("isync", s.addr, addr_is_target=True))
         region, _, ra = decode_region_realign(data, s.offset + 6, s.addr)
         events.extend(region)
         total_realigns += ra
