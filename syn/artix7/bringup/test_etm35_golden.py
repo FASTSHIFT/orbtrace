@@ -147,11 +147,17 @@ import os
 
 
 def test_logic_analyzer_ground_truth_while_nop():
-    p = "/tmp/dsl_bytes_0.bin"
-    if not os.path.exists(p):
+    # Prefer the committed fixture (stable); fall back to the live /tmp byte
+    # stream from dsl_parse.py if the fixture is absent.
+    here = os.path.dirname(__file__)
+    fixture = os.path.join(here, "captures", "while_nop_ground_truth.bin")
+    if os.path.exists(fixture):
+        data = open(fixture, "rb").read()
+    elif os.path.exists("/tmp/dsl_bytes_0.bin"):
+        data = open("/tmp/dsl_bytes_0.bin", "rb").read()
+    else:
         import pytest
-        pytest.skip("LA capture bytes not present (run dsl_parse.py)")
-    data = open(p, "rb").read()
+        pytest.skip("no while_nop fixture and no /tmp/dsl_bytes_0.bin")
     pcs = L.recover_pcs(data)
     # the while(1){__NOP();} loop NOP is at 0x08000ff0; it MUST be the dominant
     # I-sync anchor recovered from the physical pin capture.

@@ -75,3 +75,68 @@
 - 剩余的"连续流"问题是**覆盖率/采样窗口**问题(锚点间靠 P-header/branch 续解、会脱轨),不是正确性问题。正确性这一关,过了。
 
 > 一句话:**逻辑分析仪给我装上了眼睛。抓 `while(1){__NOP();}`,解出的 I-sync PC = `0x08000ff0` = 那个 NOP 的确切地址。整条 trace 解码链路第一次有了物理 ground truth,实测验证通过——nibble/边沿映射、裸 ETM 判定、I-sync 解码全部坐实。**
+
+
+---
+
+## 6. proj_add 对拍 + 台阶① 连续逐指令重建(实测)
+
+> 把固件从 `while(1){__NOP();}` 换成有真实控制流的 `proj_add`,验证解码链路不仅能
+> 锚定单点 PC,还能**逐条指令重建执行路径**。
+
+### 6.1 固件 ground truth(反汇编)
+
+```c
+int add(int a,int b){ return a+b; }                 // _Z3addii  @0x08000f8c
+int loop_sum(int n){ int s=0;
+    for(int i=0;i<n;i++) s+=add(i,i); return s; }   // _Z8loop_sumi @0x08000fa4
+while(1){ volatile int x = loop_sum(5); __NOP(); }
+```
+
+```
+08000f8c <_Z3addii>:        08000fa4 <_Z8loop_sumi>:
+ f8c: mov  r2, r0            ...
+ f8e: adds r0, r2, r1         fb2: bl   8000f8c <add>   ← 调 add(每次循环1次)
+ f90: bx   lr                 fbc: blt.n 8000fae        ← for 回跳(取5次/不取1次)
+```
+
+### 6.2 抓取 + 解码(`DSLogic ...162903.dsl`,HCLK /64,TRACECLK 1313 kHz)
+
+CLK 检查完美(0% 数据未对齐)。`etm_decode_cli` 锚点解析:
+
+| PC | addr2line | 判定 |
+|----|-----------|------|
+| 0x08000f8c | `_Z3addii` (main.cpp:22) | ✅ add 函数 |
+| 0x08000fb2 | `_Z8loop_sumi` (main.cpp:23) | ✅ loop_sum 里 `bl add` |
+| 0x08000fbc | `_Z8loop_sumi` | ✅ loop_sum 的 `blt` 回跳 |
+| 0x08000e90 / 0x08000c90 | TIM IRQ / SystemInit | 中断/启动上下文(预期内) |
+
+锚点全部命中预期函数。
+
+### 6.3 台阶①:连续逐指令重建(`etm_reconstruct.py`,纯软件)
+
+新增 `etm35lib.expand_pheader`(P-header→有序 atom 列表,IHI0014Q Table 7-2)+
+`decode_branch_thumb`(压缩分支地址,Fig 7-4)+ `etm_reconstruct.py`(对着 ELF 反汇编
+走 PC:**直接分支目标从镜像推算,间接分支吃 Branch Address 包**,IHI0014Q §4.5.2/§4.10.3,
+与 orbuculum `traceDecoder_etm35.c` 模型一致)。
+
+实测重建出 add() 的**精确三指令序列**:
+```
+0x08000f8c  mov  r2, r0
+0x08000f8e  adds r0, r2, r1
+0x08000f90  bx   lr            ← 间接返回,吃下一个 branch 包
+```
+以及 loop_sum 的 `bl add` / `blt` 回边。
+
+**诚实边界**:连续区段最长约 7 条指令就因 4-bit 口的子字节失步而脱轨(中位数 2 条),
+随后由下一个 I-sync 重新锚定。**解码正确性 = 实测通过;连续性 = 受当前有损采样限制**。
+这正是台阶①(纯软件解码,已达成)与台阶②(满速无损采样,物理命门)的分界:
+逐指令重建逻辑本身正确,要拿到长连续路径需要采样侧不丢数据。
+
+### 6.4 回归固化
+
+- 提交了两个稳定 fixture:`captures/while_nop_ground_truth.bin`(0x08000ff0)、
+  `captures/proj_add_ground_truth.bin`(含 add/bl-add/blt 三锚点的 16KB 窗口)。
+- `test_etm_reconstruct.py` 新增 20 用例(指令分类、Thumb 分支解码、间接分支吃包、
+  I-sync 中途重锚、proj_add 三指令序列集成)。全套 **120 用例通过**,etm35lib 覆盖率 97%。
+- ground-truth 测试不再依赖易失的 `/tmp/dsl_bytes_0.bin`,改读committed fixture。

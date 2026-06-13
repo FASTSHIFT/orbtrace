@@ -646,3 +646,85 @@ def test_flowevent_isync_addr_is_target():
     events = L.decode_all(s)
     isy = [e for e in events if e.kind == "isync"]
     assert isy and all(e.addr_is_target is True for e in isy)
+
+
+# ----------------------------------------------------------------------------
+# expand_pheader  (IHI0014Q Table 7-2 / Example 7-1)
+# ----------------------------------------------------------------------------
+@pytest.mark.parametrize("byte,atoms", [
+    (0x80, []),                  # Format-1, 0 E, 0 N
+    (0x88, ["E", "E"]),          # Format-1, EE  (the while(1){nop;b} peak)
+    (0x84, ["E"]),               # Format-1, 1 E
+    (0xC8, ["E", "E", "N"]),     # Format-1, EEN (spec Example 7-1)
+    (0xC0, ["N"]),               # Format-1, 0 E + 1 N
+    (0x8A, ["N", "E"]),          # Format-2, NE  (spec Example 7-1: bit3=1->N,bit2=0->E)
+    (0x82, ["E", "E"]),          # Format-2, both bits 0 -> EE
+    (0x8E, ["N", "N"]),          # Format-2, both bits 1 -> NN
+    (0x86, ["E", "N"]),          # Format-2, bit3=0->E, bit2=1->N
+])
+def test_expand_pheader(byte, atoms):
+    assert L.expand_pheader(byte) == atoms
+
+
+@pytest.mark.parametrize("byte", [0x00, 0x01, 0x08, 0x70, 0x42, 0x7E])
+def test_expand_pheader_rejects_non_pheaders(byte):
+    assert L.expand_pheader(byte) is None
+
+
+def test_expand_pheader_format1_full_range():
+    # Format-1 EEEE field is bits[5:2]: 0..15 E atoms, optional N at bit6.
+    for e in range(16):
+        b = 0x80 | (e << 2)
+        assert L.expand_pheader(b) == ["E"] * e
+        bn = b | 0x40
+        assert L.expand_pheader(bn) == ["E"] * e + ["N"]
+
+
+# ----------------------------------------------------------------------------
+# decode_branch_thumb  (IHI0014Q Fig 7-4 original Thumb encoding)
+# ----------------------------------------------------------------------------
+def test_branch_thumb_single_byte_low_bits():
+    # 1-byte branch: bit0=1 marker, bits[6:1]=Address[6:1], C(bit7)=0.
+    # prev = 0x08000fae; encode target 0x08000fb2 in low 7 bits only.
+    prev = 0x08000FAE
+    target = 0x08000FB2
+    # byte: marker(1) | (target[6:1]<<1)
+    b = 0x01 | (((target >> 1) & 0x3F) << 1)
+    res = L.decode_branch_thumb(bytes([b, 0x00]), 0, prev)
+    assert res is not None
+    addr, n = res
+    assert n == 1
+    assert addr == target
+
+
+def test_branch_thumb_two_byte():
+    # 2-byte branch carries Address[13:7] in the second byte (C=0 on it).
+    prev = 0x08000000
+    target = 0x08001234
+    b1 = 0x80 | 0x01 | (((target >> 1) & 0x3F) << 1)     # C=1, A[6:1]
+    b2 = (target >> 7) & 0x7F                             # C=0, A[13:7]
+    res = L.decode_branch_thumb(bytes([b1, b2, 0x00]), 0, prev)
+    assert res is not None
+    addr, n = res
+    assert n == 2
+    assert (addr & 0x3FFF) == (target & 0x3FFF)          # low 14 bits exact
+
+
+def test_branch_thumb_inherits_high_bits_from_prev():
+    # Compression: unsent high bits come from prev_addr.
+    prev = 0x08000F00
+    # 1-byte packet only specifies Address[6:1]; high bits inherit 0x08000F00.
+    target_low = 0x2A
+    b = 0x01 | (target_low << 1)
+    addr, n = L.decode_branch_thumb(bytes([b]), 0, prev)
+    assert (addr & ~0x7F) == (prev & ~0x7F)
+
+
+def test_branch_thumb_rejects_non_branch():
+    assert L.decode_branch_thumb(bytes([0x88]), 0, 0x08000000) is None
+    assert L.decode_branch_thumb(b"", 0, 0x08000000) is None
+
+
+def test_branch_thumb_strips_thumb_bit():
+    addr, _ = L.decode_branch_thumb(bytes([0x01]), 0, 0x08000001)
+    assert addr & 1 == 0

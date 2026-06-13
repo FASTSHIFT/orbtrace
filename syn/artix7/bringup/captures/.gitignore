@@ -1,3 +1,5 @@
-# Ignore large raw captures, but keep the small committed regression fixture.
+# Ignore large raw captures, but keep the small committed regression fixtures.
 *.bin
 !etm_isync_fixture.bin
+!while_nop_ground_truth.bin
+!proj_add_ground_truth.bin

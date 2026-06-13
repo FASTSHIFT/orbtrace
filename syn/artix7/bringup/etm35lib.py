@@ -528,3 +528,88 @@ def decode_all_realign(data: bytes):
         events.extend(region)
         total_realigns += ra
     return events, total_realigns
+
+
+# ----------------------------------------------------------------------------
+# Step ①: continuous per-instruction reconstruction primitives.
+#
+# Two facts make per-instruction PC reconstruction from a known anchor possible
+# (both spec-grounded and empirically confirmed on the logic-analyser ground
+# truth, doc 14):
+#
+#   * One atom per executed instruction. IHI0014Q §7.3.4: a P-header is "a
+#     sequence of Atoms that indicate the execution of instructions"; E = an
+#     instruction that passed its condition codes, N = one that failed. The
+#     nop;b while(1) loop traced as a steady 0x88 (Format-1, E=2) = exactly the
+#     two instructions per iteration, confirming per-instruction atoms.
+#   * Direct branch targets are inferred from the code image; only INDIRECT
+#     branches emit a Branch Address packet (IHI0014Q §4.5.2 / §4.10.3). With
+#     ETMCR bit8 ("branch output", value 0x980) set, every taken branch is
+#     reported, which keeps the walk anchored.
+#
+# So: walk atoms against the disassembled image. For each atom, look up the
+# instruction at the current PC; a direct branch with E jumps to its (image-
+# derived) target, N falls through; an indirect branch consumes the next Branch
+# Address packet for its target; any other instruction advances by its width.
+# ----------------------------------------------------------------------------
+
+def expand_pheader(c: int) -> "list[str] | None":
+    """Expand a non-cycle-accurate P-header byte into an ordered atom list.
+
+    Returns a list of 'E'/'N' in execution order, or None if `c` is not a
+    non-CA P-header. IHI0014Q Table 7-2 / Example 7-1:
+
+      * Format-1 (b1NEEEE00): EEEE E-atoms followed by 0/1 N-atom
+        (e.g. 0xC8 -> EEN).
+      * Format-2 (b1000FF10): bit3 = first instruction, bit2 = second;
+        a 0 bit = E (passed), 1 bit = N (failed) (e.g. 0x8A -> NE).
+    """
+    if (c & 0b10000011) == 0b10000000:          # Format-1
+        eatoms = (c & 0x3C) >> 2
+        natoms = 1 if (c & (1 << 6)) else 0
+        return ["E"] * eatoms + ["N"] * natoms
+    if (c & 0b11110011) == 0b10000010:          # Format-2
+        first = "E" if not (c & (1 << 3)) else "N"
+        second = "E" if not (c & (1 << 2)) else "N"
+        return [first, second]
+    return None
+
+
+def decode_branch_thumb(data: bytes, i: int, prev_addr: int):
+    """Decode a Thumb-state branch address packet starting at offset i.
+
+    Returns (target_addr, nbytes) or None if not a valid branch header / runs
+    off the end. Implements the original (standard) encoding, IHI0014Q Fig 7-4:
+
+        byte1: bit0=1 marker, bits[6:1]=Address[6:1],  C=bit7
+        byte2: bits[6:0]=Address[13:7],                C=bit7
+        byte3: bits[6:0]=Address[20:14],               C=bit7
+        byte4: bits[6:0]=Address[27:21],               C=bit7
+        byte5: bits[3:0]=Address[31:28],               C=bit6 (exception info)
+
+    Compression (IHI0014Q §7.3.5): only the low-order changed bits are sent;
+    unsent high bits are inherited from prev_addr (the last branch/I-sync PC).
+    Address bit0 (Thumb) is always 0. Exception Information Bytes (byte5 C=1)
+    are NOT consumed here (none occur in straight-line/loop code); callers that
+    need them must handle the continuation.
+    """
+    if i >= len(data) or not (data[i] & 1):
+        return None
+    addr = prev_addr & 0xFFFFFFFF
+    c = data[i]
+    addr = (addr & ~0x7F) | (c & 0x7E)          # Address[6:1]
+    n = 1
+    cont = bool(c & 0x80)
+    while cont and n < 5:
+        if i + n >= len(data):
+            return None
+        c = data[i + n]
+        if n < 4:
+            start = 7 * n                        # 7,14,21
+            addr = (addr & ~(0x7F << start)) | ((c & 0x7F) << start)
+            cont = bool(c & 0x80)
+        else:                                    # byte 5: Address[31:28]
+            addr = (addr & ~(0xF << 28)) | ((c & 0xF) << 28)
+            cont = bool(c & 0x40)                # exception info follows
+        n += 1
+    return addr & 0xFFFFFFFE, n                  # strip Thumb bit
