@@ -949,3 +949,50 @@ phase" —— 但那是**理想 testbench**。真实 ECP5 上靠 `IDDRX1F` + `DE
 (正好在边沿,模拟 FPGA 当前行为)**,看是不是也复现 FPGA 那种 falling 偏移、解不出锚点。
 若复现,就 100% 坐实"采在跳变点"是根因,然后再改 FPGA 用反相沿采样。**先用零成本的 LA 仿真验证
 假设,再动 Vivado。**
+
+## 23. 落地:OVERSAMPLE 采集前端(复刻 LA 取样,提交 a441fc0)
+
+### 23.1 为什么不是 §22.4 的"反相沿 IDDR"
+
+§22.4 把"用反相 TRACECLK 沿采 IDDR"列为最可行。再想清楚后否决了它:
+
+- edge-aligned DDR 的数据**每个半位都换一次**(上升沿一个 nibble、下降沿一个 nibble)。半位中心
+  在"边沿之后约 1/4 周期"处,**不等于**对向边沿(对向边沿又是下一个数据跳变点)。
+- 用反相沿采,只是把"踩在上升跳变"换成"踩在下降跳变",两个采样点都还在跳变沿上,没解决问题。
+- 真正要做的是 LA 做的事:**在边沿之后等一小段(进入眼内)再 latch**。IDDR 给不了这个"边沿后延
+  时 N"的语义,**过采(oversample)才能**。
+
+### 23.2 OVERSAMPLE 模式(`trace_capture_a7.v`,`CAP_METHOD="OVERSAMPLE"` 默认)
+
+完全复刻 `dsl_parse.sample_nibbles` 的 `s = edge + eye`:
+
+1. 用 `ref_200m`(200MHz,5ns/拍)过采 TRACECLK(原始 IBUF)和 4 条数据线,各打两拍同步进 ref 域。
+2. 边沿检测:`rise_evt = tck_s & ~tck_prev`,`fall_evt = ~tck_s & tck_prev`。
+3. 每个边沿起一个 `EYE_DELAY` 拍倒计时;数到 0 时把同步后的数据 latch 进 `a_reg`(上升沿)/
+   `b_reg`(下降沿)—— 即"边沿后 EYE_DELAY×5ns 落在半位中心"。
+4. `a_reg/b_reg` hold 到下一个同向边沿(≈一个 TRACECLK 周期);traceIF 在 recovered `trace_clk`
+   上读它们,看到稳定的 (a,b) 对。
+5. `trace_a = a_reg`(上升沿 nibble,mid-eye),`trace_b = b_reg`(下降沿 nibble,mid-eye),与
+   `trace_stream_top` 里 `nib = {trace_b, trace_a}` 的约定一致。
+
+`EYE_DELAY` 默认 4(=20ns)。1.3MHz 时半位 ≈380ns,1..~70 拍都在眼内;取小值同时兼容更快的
+TRACECLK。
+
+低速 CDC 安全性:a/b 仅在边沿后 ~EYE_DELAY×5ns 更新、之后整周期不变,远离 trace_clk 的采样沿,故
+低速下无需显式握手(高速 TRACECLK 才需要,超出"低速 100% 正确"里程碑范围)。
+
+`CAP_METHOD="IDDR"` 分支保留原 IDDR 路径作参考/中心对齐源使用。
+
+### 23.3 离线/仿真验证
+
+- **LA 零成本仿真(§20-21 已做)**:LA 采样点 eye+0(边沿上)→ 锚点塌到 73~241;eye+1 起 → 满血
+  818。坐实"采在边沿"是根因、"边沿后入眼"是解。
+- **iverilog 功能仿真(本次新增)**:`rtl/sim/tb_oversample.v` + `xil_stubs.v` 驱动一个 edge-aligned
+  源(数据在每个 TRACECLK 边沿翻转),DUT 必须 mid-eye 恢复出 trace_a/trace_b。结果 **99 checks /
+  0 errors / PASS**。IDDR 分支也确认能 elaborate。
+
+### 23.4 待办(综合后上板对拍)
+
+综合中(后台,`CAP_RAW=1`)。完成后:program stream → etm_enable + downclock(/64)→ 重新 arm →
+trace_dump → `fpga_la_crosscheck.py /tmp/fpga_raw.bin <194702.dsl>`。目标:FPGA 去帧后 unknown=0、
+锚点集合与 LA 一致(MATCH)。
