@@ -165,17 +165,16 @@ module trace_capture_a7 #(
                 .CNTVALUEOUT()
             );
 
-            // IDDR: DDR input register. DDR_CLK_EDGE = SAME_EDGE to match the
-            // LiteX/orbtrace reference exactly (litex.build.xilinx
-            // XilinxDDRInputImplS7 lowers DDRInput to IDDR with
-            // DDR_CLK_EDGE="SAME_EDGE", Q1=o1(rising), Q2=o2(falling)).
-            // We previously used SAME_EDGE_PIPELINED, whose Q1/Q2 pairing is
-            // offset by one cycle relative to the period boundary — that
-            // swapped the rising/falling nibble association and produced the
-            // FPGA-vs-LA nibble misalignment (doc 14 §19). SAME_EDGE
-            // reproduces the upstream-validated behaviour 1:1.
+            // IDDR: DDR input register. NOTE: reverted to SAME_EDGE_PIPELINED —
+            // this is the config that previously produced correct function
+            // addresses on this board. The LiteX/orbtrace reference uses
+            // SAME_EDGE, but that is for ECP5/generic LiteX paths; on THIS
+            // A7-Lite wiring the empirically-validated mode is
+            // SAME_EDGE_PIPELINED. Switching to SAME_EDGE correlated with a
+            // lane-1 falling-edge (Q2) sampling regression (doc 14 §21), so we
+            // revert and re-verify by FPGA-vs-LA cross-check.
             IDDR #(
-                .DDR_CLK_EDGE ("SAME_EDGE"),
+                .DDR_CLK_EDGE ("SAME_EDGE_PIPELINED"),
                 .INIT_Q1      (1'b0),
                 .INIT_Q2      (1'b0),
                 .SRTYPE       ("ASYNC")

@@ -811,3 +811,91 @@ FPGA `trace_stream` 经 `trace_capture_a7.v`(IDELAYE2+IDDR DDR 采样)+ `traceIF
 
 - `fpga_la_crosscheck.py`:FPGA raw vs LA .dsl,同样去帧+解码,报洁净度/锚点/重叠/判定。
 - 目标量化指标:**FPGA 去帧后 unknown=0,锚点集合 ⊇ LA 的 add/loop_sum 集合**,即两路对齐。
+
+
+---
+
+## 20. FPGA 对拍迭代:IDDR 模式修正 + 发现默认抓的是 traceIF 帧(非原始引脚)
+
+### 20.1 DDR 采集是自写,根因之一是 IDDR 模式
+
+`trace_capture_a7.v` 是**自写**的(orbtrace 原版只支持 ECP5 的 IDDRX1F,经 LiteX `DDRInput`
+抽象;Xilinx 7 系无法直接搬,故手写)。查 LiteX 源码 `XilinxDDRInputImplS7`:它把 `DDRInput`
+降级为 **IDDR `DDR_CLK_EDGE="SAME_EDGE"`**,Q1=o1(上升),Q2=o2(下降)。**我们误用了
+`SAME_EDGE_PIPELINED`**,其 Q1/Q2 配对相对周期边界偏移一拍,交换了上升/下降 nibble 关联 —— 这是
+nibble 错位的根因之一。已改回 `SAME_EDGE`(commit b4390d9),对齐 orbtrace 验证过的行为。
+
+### 20.2 但对拍仍 DIVERGENCE —— 发现第二个、更根本的不匹配
+
+改 IDDR 后重抓对拍仍分歧(14.8% unknown)。根因:**默认 `trace_stream_top` 用 `CAP_RAW=0`,抓的
+是 `traceIF.v` 片上 TPIU 锁帧后的 16 字节帧**,不是原始引脚 nibble。而 LA 抓的是原始引脚。
+两者表示层根本不同(FPGA 是 traceIF 处理过的帧,LA 是裸 TPIU 字节),没法直接对拍。
+
+→ **正确做法**:用 `CAP_RAW=1` 重建,抓 `{trace_b,trace_a}` 原始 nibble 字节(= LA 看到的同一份
+引脚流),两路再走相同的 TPIU 去帧,才是 apples-to-apples。正在重建。
+
+### 20.3 这也暴露一个设计问题
+
+如果最终要 FPGA 实时出 ETM,traceIF 的片上锁帧逻辑也得和我们 PC 端验证过的 TPIU 去帧一致 ——
+否则 traceIF 帧化的结果可能和正确去帧不符。先用 CAP_RAW 把"原始引脚→PC 去帧"这条和 LA 对齐,
+再回头审 traceIF 的片上处理是否正确。
+
+
+---
+
+## 21. CAP_RAW 对拍:定位到 FPGA 数据 lane-1 的单沿采样问题
+
+重建 `CAP_RAW=1`(抓原始 `{trace_b,trace_a}` nibble 字节 = LA 看到的同一份引脚流),重抓对拍。
+
+### 21.1 字节直方图几乎一致,差异收敛到"一个 bit"
+
+FPGA(nibswap 后)与 LA 的字节直方图高度吻合(`8c/05/90/01/88` 全对),**唯一系统差异在 bit1**:
+- LA 有 `0x2e`(5030)、HSYNC `0xff`;FPGA 对应位置是 `0x2c`、`0xfd/0xdf/0xdd` —— 全部是 **bit1 被清 0**。
+- HSYNC 段(本应全 1 = `0xff`)在 FPGA 里出现 `0xdd`(11011101,两个 nibble 的 bit1 都是 0)。
+
+### 21.2 逐 bit set 率:lane-1 的**下降沿**采样异常
+
+原始 FPGA 字节 `{trace_b[3:0],trace_a[3:0]}` 各 bit 的置 1 率:
+
+| bit | 含义 | set 率 |
+|-----|------|--------|
+| a0 TD0↑ | 41% | bit1 a1 TD1↑ | **31.5%** |
+| a2 TD2↑ | 19% | a3 TD3↑ | 47% |
+| b0 TD0↓ | 34% | **b1 TD1↓** | **8.0% ←异常** |
+| b2 TD2↓ | 65% | b3 TD3↓ | 49% |
+
+TD1 的上升沿采样(a1=31.5%)基本正常,但 **TD1 的下降沿采样(b1)只有 8%** —— 明显偏低。
+即 **数据 lane-1(XDC `trace_data_in[1]`=E14 ← STM32 PE4=TRACED1)在 DDR 下降沿的采样几乎丢失**。
+
+### 21.3 性质判断
+
+- LA(同一引脚)读 TD1 完全正常 → STM32 PE4 输出没问题,**故障在 FPGA 侧 lane-1**。
+- 不是整条线死(上升沿还有 31.5%),而是**下降沿样本坏** → 指向该 lane 的 **IDELAY tap / IDDR
+  Q2(falling)路径 / 该 lane 的建立保持窗口**,或 E14 这根的**接触不良/SI**(下降沿更敏感)。
+- 这正是只有"上板对拍"才暴露的问题:之前 OOC 综合、单看锚点都发现不了。
+
+### 21.4 下一步候选(按代价排序)
+
+1. **先查物理连线**:E14 ↔ STM32 PE4 的杜邦线/接触(LA 的 D0~D2 之前也是接触问题)。换线重抓。
+2. **per-lane IDELAY 校准**:lane-1 的 tap 单独扫(现在 4 lane 统一 tap=28);下降沿窗口偏了就单调它。
+3. 若仍不行,审 `trace_capture_a7` 对该 lane 的 IDDR Q2 路径 / BUFR_IO 时钟相位。
+
+**对拍工具已能把问题精确到"哪条 lane、哪个沿",这就是 ground-truth 对拍的价值。**
+
+### 21.5 排除项:不是 IDDR 模式,也不是连线;是 lane-1 下降沿采样窗口
+
+- **IDDR 模式排除**:把 IDDR 从 SAME_EDGE 改回 SAME_EDGE_PIPELINED(之前能抓到函数的配置)重建对拍,
+  b1(TD1↓)仍只有 10.6%(对比 SAME_EDGE 的 8%),**两种模式都坏 → 不是我改 IDDR 引入的回归**。
+  (IDDR 已保留为 SAME_EDGE_PIPELINED,即历史验证过的配置。)
+- **连线排除**:LA 用同一引脚实测 TD1 = rising 32.3% / falling 30.7%,**两沿均衡正常**;FPGA 同一线
+  = rising 31.4% / falling **10.6%**。STM32 PE4 输出没问题,故障纯在 FPGA 侧、且**只在该 lane 的
+  下降沿(Q2)样本**。
+- **性质**:上升沿好、下降沿坏、单 lane —— 是该 lane 的**采样窗口/ deskew** 问题(下降沿数据的
+  setup/hold 关系和上升沿不同),不是死线、不是 IDDR 模式。
+- **根因指向**:4 lane 共用静态 tap=28,lane-1 的下降沿眼图中心和这个 tap 不匹配。**需要 per-lane
+  IDELAY 校准 / 眼图扫描**(本是 Stage-3 PoC 项,现在被对拍精确逼出来了)。
+
+### 21.6 频率不是瓶颈(已澄清)
+
+TRACECLK=1.316MHz(/64),数据率 ~10.5 Mbps;FPGA IDDR + 200MHz IDELAYCTRL + 125/200MHz MMCM
+绰绰有余。问题是**采样相位(tap)**,不是跟不上速度。
