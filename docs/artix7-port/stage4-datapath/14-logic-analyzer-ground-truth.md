@@ -770,3 +770,44 @@ FPGA 采集前端若正确,两条**去帧后的 ETM 流应解出相同的 flash 
 4. `python3 fpga_la_crosscheck.py <fpga_raw.bin> <la.dsl>` → 看是否 MATCH
 
 目标:FPGA 去帧后 **0 未知字节、锚点集合与 LA 完全一致**,即两路 100% 对齐。
+
+
+---
+
+## 19. FPGA 对拍首跑:DIVERGENCE —— FPGA 采集前端有 bug,LA 是干净基准
+
+重新上电后:重配 ETM(ETMCR=0x980 branch-bcast ON,HCLK /64)、刷 `trace_stream.bit`,
+UDP dump 36864 字节(full=1,36279/36864 非零,数据在流)。跑 `fpga_la_crosscheck.py`:
+
+| | FPGA(trace_stream) | LA(.dsl 参考) |
+|---|---|---|
+| ETM 字节 | 26909 | 851428 |
+| flash 锚点 | **9(全是垃圾地址)** | **818(全在 add/loop_sum)** |
+| unknown 字节 | **17.8%** | 0.0018% |
+| 锚点重叠 | **common=0** | — |
+
+**判定:DIVERGENCE。** FPGA 解出的锚点如 `0x801ffbc`、`0x8002d90`、`0x802f42c` —— 注意比
+LA 的 `0x8000fbc` **多一位十六进制(地址被插入了多余 nibble)**,典型的 nibble/位级错位。
+试过整体 nibble 移位、字节内 nibble 交换都救不回(都归零),说明 FPGA 采集前端
+(`trace_capture_a7` / `traceIF.v`)的字节组装与真实引脚序**结构性不一致**,不是简单一个相位。
+
+### 19.1 这正是对拍的价值
+
+- **LA 路 = 已证 100% 干净的金标准**(818 锚点、0 真未知、控制流逐指令对 ground-truth)。
+- **FPGA 路 = 实测有 bug**(17.8% unknown、0 个锚点与 LA 重合、地址多 nibble)。
+- 对拍工具一次就把"FPGA 采集前端坏了"钉死,且给出具体症状(地址多 nibble = DDR 重组错位)。
+
+### 19.2 FPGA 侧待修(下一阶段)
+
+FPGA `trace_stream` 经 `trace_capture_a7.v`(IDELAYE2+IDDR DDR 采样)+ `traceIF.v`(TPIU 锁同步
++组帧)。症状"地址多 nibble"指向 **DDR 双沿 nibble 拼装顺序 / IDELAY tap / traceIF 的同步对齐**
+与 STM32 实际 4-bit 口输出不匹配。修复方向:
+1. 对照 LA 已验证的正确 nibble 映射(rise=低 nibble、parity),核对 `trace_capture_a7` 的
+   IDDR Q1/Q2 → trace_a/trace_b 拼装顺序。
+2. 用同一把 `fpga_la_crosscheck.py` 迭代:每改一版 FPGA,dump → 对拍,直到 unknown=0、锚点集合
+   与 LA 完全一致。
+
+### 19.3 工具产出
+
+- `fpga_la_crosscheck.py`:FPGA raw vs LA .dsl,同样去帧+解码,报洁净度/锚点/重叠/判定。
+- 目标量化指标:**FPGA 去帧后 unknown=0,锚点集合 ⊇ LA 的 add/loop_sum 集合**,即两路对齐。
