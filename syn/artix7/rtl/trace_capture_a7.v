@@ -45,7 +45,29 @@ module trace_capture_a7 #(
     //                fabric clock. Region-local, much lower skew between
     //                TRACECLK and the IDDR C pins — the proper source-
     //                synchronous choice (r11 HG-2 sensitivity study).
-    parameter CLK_BUF = "BUFG"
+    parameter CLK_BUF = "BUFG",
+    // Capture method:
+    //   "IDDR"       : sample data on the TRACECLK edges via IDDR. Correct
+    //                  only if data is CENTRE-aligned. The STM32 TPIU is
+    //                  EDGE-aligned (ARM CoreSight TRM: traceclk edges are not
+    //                  offset from data edges), so IDDR samples right on the
+    //                  data transition -> wrong (esp. the falling edge). Kept
+    //                  for reference / centre-aligned sources.
+    //   "OVERSAMPLE" : oversample TRACECLK + the 4 data lines on the fast
+    //                  ref_200m clock, detect TRACECLK edges, and latch data
+    //                  EYE_DELAY ref cycles after each edge — i.e. in the
+    //                  centre of the half-bit. This mirrors exactly what the
+    //                  logic analyser does in software (sample mid-eye, not on
+    //                  the edge), which the LA-sim proved recovers the full
+    //                  anchor set. The correct choice for edge-aligned TPIU at
+    //                  the slow (~1.3 MHz) trace rates we run.  DEFAULT.
+    parameter CAP_METHOD = "OVERSAMPLE",
+    // ref_200m cycles to wait after a detected TRACECLK edge before latching
+    // the data (mid-eye). At 200 MHz one cycle = 5 ns; the half-bit at
+    // TRACECLK<=12.5 MHz is >=40 ns, so a few cycles lands safely inside the
+    // eye. For TRACECLK ~1.3 MHz (half-bit ~380 ns) anything 1..~70 works;
+    // pick a small value so it also tolerates faster trace clocks.
+    parameter EYE_DELAY = 4
 ) (
     input  wire        rst,
     input  wire        ref_200m,
@@ -116,9 +138,11 @@ module trace_capture_a7 #(
     endgenerate
 
     // ------------------------------------------------------------------
-    // Per-lane: IBUF -> IDELAYE2 -> IDDR (DDR_CLK_EDGE = SAME_EDGE_PIPELINED).
-    // IDDR Q1 = data sampled on rising edge of C, presented on the
-    // following rising edge (one-cycle latency for both edges aligned).
+    // Per-lane input path: IBUF -> IDELAYE2 -> data_dly.
+    // The IDELAY stays in both capture modes: it keeps the IDELAYCTRL group
+    // legal and gives a known static lane delay. OVERSAMPLE does not rely on
+    // it for phase (it re-times in the ref_200m domain) but reading the
+    // delayed copy is harmless; IDDR mode uses it as the deskew element.
     // ------------------------------------------------------------------
     wire [3:0] data_ibuf;
     wire [3:0] data_dly;
@@ -164,30 +188,115 @@ module trace_capture_a7 #(
                 .DATAOUT    (data_dly[i]),
                 .CNTVALUEOUT()
             );
+        end
+    endgenerate
 
-            // IDDR: DDR input register. NOTE: reverted to SAME_EDGE_PIPELINED —
-            // this is the config that previously produced correct function
-            // addresses on this board. The LiteX/orbtrace reference uses
-            // SAME_EDGE, but that is for ECP5/generic LiteX paths; on THIS
-            // A7-Lite wiring the empirically-validated mode is
-            // SAME_EDGE_PIPELINED. Switching to SAME_EDGE correlated with a
-            // lane-1 falling-edge (Q2) sampling regression (doc 14 §21), so we
-            // revert and re-verify by FPGA-vs-LA cross-check.
+    // ------------------------------------------------------------------
+    // Capture method.
+    // ------------------------------------------------------------------
+    generate
+    if (CAP_METHOD == "OVERSAMPLE") begin : g_oversample
+        // ----------------------------------------------------------------
+        // Oversampled, mid-eye capture (mirrors the logic-analyser method).
+        //
+        // The STM32 TPIU drives TRACECLK *edge-aligned* with the data: data
+        // transitions land on TRACECLK edges, so the centre of each half-bit
+        // (the safe sampling point) is ~a quarter-period AFTER an edge. We
+        // oversample TRACECLK and the 4 data lanes on the fast ref_200m clock,
+        // detect each TRACECLK edge, then latch the data EYE_DELAY ref cycles
+        // later — i.e. inside the eye, exactly like the LA samples at edge+N.
+        //
+        //   rising  TRACECLK edge -> (after EYE_DELAY) latch into a_reg
+        //   falling TRACECLK edge -> (after EYE_DELAY) latch into b_reg
+        //
+        // a_reg/b_reg are held until the next same-direction edge (~one full
+        // TRACECLK period, ~760 ns @1.3 MHz). traceIF reads them on the
+        // recovered trace_clk; since they are stable for ~the whole period and
+        // updated only ~EYE_DELAY*5 ns after an edge (far from the trace_clk
+        // sampling instant), the CDC is safe at the low trace rates we run.
+        // (At much higher TRACECLK this would need an explicit handshake;
+        // out of scope for the low-speed 100%-correct milestone.)
+        // ----------------------------------------------------------------
+
+        // Synchronise TRACECLK (raw IBUF) and the 4 data lanes into ref_200m.
+        reg [2:0] tck_sync = 3'b0;
+        reg [3:0] d_s0 = 4'b0, d_s1 = 4'b0;
+        always @(posedge ref_200m) begin
+            tck_sync <= {tck_sync[1:0], trace_clk_ibuf};
+            d_s0 <= data_dly;
+            d_s1 <= d_s0;
+        end
+        wire tck_s    = tck_sync[2];
+        wire tck_prev = tck_sync[1];   // value one ref cycle earlier (already synced)
+        wire rise_evt = tck_s & ~tck_prev;
+        wire fall_evt = ~tck_s & tck_prev;
+
+        // EYE_DELAY countdown timers, one per edge direction.
+        localparam CW = (EYE_DELAY <= 1) ? 1 : $clog2(EYE_DELAY + 1);
+        reg [CW-1:0] r_cnt = 0, f_cnt = 0;
+        reg          r_arm = 1'b0, f_arm = 1'b0;
+        reg [3:0]    a_reg = 4'b0, b_reg = 4'b0;
+
+        always @(posedge ref_200m) begin
+            if (rst) begin
+                r_arm <= 1'b0; f_arm <= 1'b0;
+                a_reg <= 4'b0; b_reg <= 4'b0;
+            end else begin
+                // rising-edge sample
+                if (rise_evt) begin
+                    r_arm <= 1'b1;
+                    r_cnt <= EYE_DELAY[CW-1:0];
+                end else if (r_arm) begin
+                    if (r_cnt == 0) begin
+                        a_reg <= d_s1;
+                        r_arm <= 1'b0;
+                    end else begin
+                        r_cnt <= r_cnt - 1'b1;
+                    end
+                end
+                // falling-edge sample
+                if (fall_evt) begin
+                    f_arm <= 1'b1;
+                    f_cnt <= EYE_DELAY[CW-1:0];
+                end else if (f_arm) begin
+                    if (f_cnt == 0) begin
+                        b_reg <= d_s1;
+                        f_arm <= 1'b0;
+                    end else begin
+                        f_cnt <= f_cnt - 1'b1;
+                    end
+                end
+            end
+        end
+
+        assign trace_a = a_reg;   // rising-edge nibble (mid-eye)
+        assign trace_b = b_reg;   // falling-edge nibble (mid-eye)
+
+    end else begin : g_iddr
+        // ----------------------------------------------------------------
+        // IDDR: DDR input register sampled on the TRACECLK edges. Correct
+        // only for CENTRE-aligned sources; the STM32 TPIU is edge-aligned so
+        // this samples on the data transition (doc 14 §21 regression). Kept
+        // for reference and for centre-aligned parts.
+        // ----------------------------------------------------------------
+        genvar j;
+        for (j = 0; j < 4; j = j + 1) begin : g_iddr_lane
             IDDR #(
                 .DDR_CLK_EDGE ("SAME_EDGE_PIPELINED"),
                 .INIT_Q1      (1'b0),
                 .INIT_Q2      (1'b0),
                 .SRTYPE       ("ASYNC")
             ) u_iddr (
-                .Q1 (trace_a[i]),  // rising-edge sample
-                .Q2 (trace_b[i]),  // falling-edge sample
+                .Q1 (trace_a[j]),  // rising-edge sample
+                .Q2 (trace_b[j]),  // falling-edge sample
                 .C  (trace_clk_io), // BUFIO (BUFR_IO) or BUFG net
                 .CE (1'b1),
-                .D  (data_dly[i]),
+                .D  (data_dly[j]),
                 .R  (rst),
                 .S  (1'b0)
             );
         end
+    end
     endgenerate
 
 endmodule
