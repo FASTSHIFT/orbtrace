@@ -187,3 +187,58 @@ low/high),用"flash 区间合法 I-sync 锚点数"打分挑赢家;中眼采样(�
 新增 13 个测试(strip 5 种情形 + has_tpiu_sync + 透过填充恢复 I-sync + tpiu_deframe golden),
 **全套 129 用例通过**。`dsl_parse.py` 现在是健壮可复用脚本:喂任意 `.dsl`,自动定对齐、
 自动剥 TPIU 填充、报告锚点、写 `/tmp/dsl_bytes_0.bin`。
+
+
+---
+
+## 8. 复用 orbuculum 解码核心(orbetm)+ 对照验证
+
+### 8.1 动机
+
+我之前自研的 `etm_reconstruct.py` 在 call/return 配对上会错步。与其继续追 orbuculum 的状态机,
+不如**直接复用它**。做了 `orbetm.c`:link orbuculum 的 `traceDecoder*` + `loadelf.c`(capstone
+反汇编),忠实搬 orbmortem 的 `_traceCB` 指令流重建循环,去掉 ncurses TUI,逐条打印执行指令。
+
+### 8.2 编译坑(回答"为什么官方能编我编不出来")
+
+裸 `cc` 一开始失败,两个根因都是**没复刻 orbuculum 的 meson 环境**:
+1. **`dwarf.h` 找不到**:orbuculum 把 **libdwarf 作为 meson subproject 自带**(`subprojects/
+   libdwarf-0.7.0/`),不用系统 dwarf.h。本机只装了运行时 `libdw1`、没装 `-dev` 头。
+   → 指向 vendored 头 + 已编好的 `build/subprojects/.../libdwarf.so`。
+2. **`C_VERB_* undeclared`**:meson 全局 `-include uicolours_default.h`(定义颜色宏)。
+   → 手动加 `-include`。
+3. 还漏链 `readsource.c`(loadelf 依赖)。
+
+修好后见 `build_orbetm.sh`。官方一直能编,编不出来的是我绕过 meson 的手写命令。
+orbuculum 无 release tag(滚动 main,内部版本 2.2.0);当前是 debug 构建,需要时
+`meson setup build_rel --buildtype=release` 即可出 -O2 版(已验证可编)。
+
+### 8.3 对照验证(决定性):runaway 是数据固有,非解码器 bug
+
+把 172817 剥填充流喂 orbuculum **自己的**解码器统计地址事件落点:
+
+| 指标 | 值 |
+|------|----|
+| 解出的 ADDR 事件总数 | 343366 |
+| 落在 flash 代码区的 | 91986(**26.8%**) |
+| branch-broadcast ON(162903)同样测 | 62728/214451(**29.3%**) |
+
+**两份流都只有 ~27-29% 地址落在代码区,73% 是乱解。** 这证明:**orbuculum 久经考验的解码器
+在我们这份流上和我自研的表现一样会跑飞**——根因是 branch-broadcast-off 的稀疏锚点流,间接
+返回(`pop pc`/`bx lr`)在调用栈不完整时拿不到目标地址,PC 失控走进向量表。**这是数据特性
+的固有限制,不是哪个解码器实现的 bug。**
+
+### 8.4 orbetm 的处置:窗口门控,只信能落在代码区的
+
+给 orbetm 加了代码窗口门控(跳过 0x08000200 以下的向量表;PC 离开 flash 代码区就停止当前
+run、等下一个 I-sync/branch 重新锚定)。门控后从 172817 流稳定解出真实函数:
+`TIM8_UP_TIM13_IRQHandler`、`TIM_GetITStatus`、`USART_ClearITPendingBit`、`USART3_IRQHandler`、
+`HardwareSerial::IRQHandler` 等——与锚点法解出的函数集一致,且现在是**逐指令流**(带反汇编)。
+
+### 8.5 结论
+
+- **复用达成**:解码核心从自研切到 orbuculum(`orbetm` link liborb 解码器 + capstone)。
+  `etm35lib` 降级为锚点快速校验 + 测试夹具,不再承担完整指令重建。
+- **诚实边界没变**:稀疏流下的连续逐指令 100% 还原,是 orbuculum 也做不到的——卡在数据,
+  不在解码器。要真正连续,得回到台阶②(更密的同步/不丢的满速采样),不是换解码器能解决。
+- `dsl_parse.py`(.dsl → 剥填充裸 ETM)依然是我们独有、不可替代的前端。

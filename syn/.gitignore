@@ -19,3 +19,6 @@ __pycache__/
 *.pyc
 .coverage
 .pytest_cache/
+
+# Compiled decode tool (built by build_orbetm.sh)
+artix7/bringup/decode/orbetm
