@@ -140,3 +140,50 @@ CLK 检查完美(0% 数据未对齐)。`etm_decode_cli` 锚点解析:
 - `test_etm_reconstruct.py` 新增 20 用例(指令分类、Thumb 分支解码、间接分支吃包、
   I-sync 中途重锚、proj_add 三指令序列集成)。全套 **120 用例通过**,etm35lib 覆盖率 97%。
 - ground-truth 测试不再依赖易失的 `/tmp/dsl_bytes_0.bin`,改读committed fixture。
+
+
+---
+
+## 7. dsl_parse 固化 + TPIU 同步填充剥离(branch-broadcast 关闭后)
+
+### 7.1 关掉 branch broadcast 重抓(172817.dsl)
+
+按"路 2"把 `ETMCR` bit8(branch broadcast)清掉(`0xd80/0x980 → 0xc80/0x880`,
+已上板读回 `0x880`),让流匹配镜像驱动重建器的模型(直接跳转目标查 ELF、间接跳转吃包)。
+
+### 7.2 两个真问题被揪出来
+
+**问题 A — DDR edge-parity 偏移(解析器 bug)**:172817 这次采集从 DDR 半拍**中间**开始,
+整体错位一个时钟沿,旧 `dsl_parse`(硬编码 `rise=low`、从第一个沿开始配对)把每个字节都搅坏,
+直接表现为"满屏 `0xFFFFFF7F`、0 个锚点"。
+
+→ **修复**:`dsl_parse.py` 重写为**自动搜索对齐**——试全部 4 种(parity 0/1 × nibble 序
+low/high),用"flash 区间合法 I-sync 锚点数"打分挑赢家;中眼采样(沿后半个半周期);
+任何对齐都解不出锚点时大声告警。验证:162903 自动选 parity=0(332 锚点,和旧硬编码一致),
+172817 自动选 parity=1(92 锚点,旧解析器是 0)。
+
+**问题 B — TPIU 同步填充(真实存在,非 artifact)**:对齐修正后,流里**确实**有
+33902 个 `0xFFFFFF7F`(满同步)+ 大量 `FF 7F`(半同步)。这是 TPIU formatter 在 ETM 空闲时
+往链路里填的同步字。branch broadcast 关掉后数据稀疏,填充占比更高(652788 有效字节 vs 填充
+659826 字节,几乎一半)。
+
+→ 关键判断(实测):这颗单源 STM32 ETM **不是 stream-ID 分帧**(按 stream 去帧会散成几十个
+假流、0 锚点),而是**裸 ETM + 同步填充**。所以正确前端是**剥离填充**,不是跑 16 字节去帧器。
+新增 `etm35lib.strip_tpiu_sync`(去 `0xFFFFFF7F` 满同步 + `FF 7F` 半同步)+ `has_tpiu_sync`,
+并集成进 `dsl_parse.py`(检测到填充自动剥离并报告)。同时把 orbuculum `_getPacket` 的完整
+16 字节去帧器也忠实移植为 `tpiu_deframe`(供真·多源分帧场景,golden 测试覆盖)。
+
+### 7.3 效果
+
+剥离填充后重建,proj_add 最长连续路径从 **4 条指令提升到 33 条**(能看到 loop_sum 的
+`add r5; adds r3; cmp; blt` 完整循环体)。**这坐实了:低速采样物理无损,卡点在解码前端
+没处理 TPIU 填充。**
+
+仍有少量错步(如 `bl` 后跨函数跳错),是 from-scratch 重建器在调用/返回配对上的模型不全,
+属台阶①待完善项(可对齐 orbuculum 状态机解决),不影响"采样无损"这个结论。
+
+### 7.4 回归
+
+新增 13 个测试(strip 5 种情形 + has_tpiu_sync + 透过填充恢复 I-sync + tpiu_deframe golden),
+**全套 129 用例通过**。`dsl_parse.py` 现在是健壮可复用脚本:喂任意 `.dsl`,自动定对齐、
+自动剥 TPIU 填充、报告锚点、写 `/tmp/dsl_bytes_0.bin`。

@@ -728,3 +728,83 @@ def test_branch_thumb_rejects_non_branch():
 def test_branch_thumb_strips_thumb_bit():
     addr, _ = L.decode_branch_thumb(bytes([0x01]), 0, 0x08000001)
     assert addr & 1 == 0
+
+
+# ----------------------------------------------------------------------------
+# TPIU sync-filler stripping (orbuculum SYNCPATTERN / HALFSYNC constants)
+# ----------------------------------------------------------------------------
+def test_strip_full_sync():
+    data = bytes([0x88, 0x01]) + bytes.fromhex("ffffff7f") + bytes([0x88])
+    assert L.strip_tpiu_sync(data) == bytes([0x88, 0x01, 0x88])
+
+
+def test_strip_half_sync_pairs():
+    # 0xFF 0x7F repeated is half-sync filler.
+    data = bytes([0x88]) + b"\xff\x7f\xff\x7f" + bytes([0x01])
+    assert L.strip_tpiu_sync(data) == bytes([0x88, 0x01])
+
+
+def test_strip_mixed_full_and_half():
+    data = (bytes([0x08, 0x00]) + bytes.fromhex("ffffff7f")
+            + b"\xff\x7f" + bytes([0x90]))
+    assert L.strip_tpiu_sync(data) == bytes([0x08, 0x00, 0x90])
+
+
+def test_strip_idempotent_on_clean_stream():
+    clean = bytes([0x88, 0x01, 0x37, 0x05, 0xA8])
+    assert L.strip_tpiu_sync(clean) == clean
+
+
+def test_strip_preserves_isolated_ff_not_followed_by_7f():
+    # A lone 0xFF not paired with 0x7F is left as-is (real data byte).
+    data = bytes([0x88, 0xFF, 0x88])
+    assert L.strip_tpiu_sync(data) == data
+
+
+def test_has_tpiu_sync():
+    assert L.has_tpiu_sync(bytes.fromhex("88ffffff7f88")) is True
+    assert L.has_tpiu_sync(b"\x88\xff\x7f\x01") is True
+    assert L.has_tpiu_sync(bytes([0x88, 0x01, 0x37])) is False
+
+
+def test_strip_recovers_isync_through_filler():
+    # An I-sync split by half-sync filler is recovered once stripped. (Filler
+    # only appears between packets in practice; this checks the strip yields a
+    # contiguous, parseable I-sync.)
+    isync = bytes([0x08, 0x00]) + (0x08000ff0 | 1).to_bytes(4, "little")
+    framed = isync[:3] + b"\xff\x7f" + isync[3:] + b"\xff\xff\xff\x7f"
+    clean = L.strip_tpiu_sync(framed)
+    s = L.parse_isync_at(clean, 0)
+    assert s is not None and s.addr == 0x08000FF0
+
+
+# ----------------------------------------------------------------------------
+# tpiu_deframe reference port (genuinely stream-framed input)
+# ----------------------------------------------------------------------------
+def test_tpiu_deframe_single_stream():
+    # One valid 16-byte frame (arrival order): frame[0] is a stream-change to
+    # id 1 (0x03 = (1<<1)|1), then 15 bytes. On the wire even-position DATA
+    # bytes carry LSB=0 (their true LSB lives in the aux/lowbits byte[15]); odd
+    # bytes are full data. Build 14 data bytes after the id, all LSB-safe.
+    frame = bytearray(16)
+    frame[0] = (1 << 1) | 1          # stream change -> id 1 (immediate, lowbit0=0)
+    data_bytes = []
+    for k in range(1, 15):
+        if k % 2 == 0:               # even index -> must have LSB 0 to be data
+            b = 0x10 + (k << 1) & 0xFE
+        else:                        # odd index -> any value
+            b = 0x20 + k
+        frame[k] = b
+        data_bytes.append(b)
+    frame[15] = 0x00                 # aux lowbits all zero
+    # tpiu_sync_frames consumes arrival order then byte-reverses internally;
+    # tpiu_deframe reverses back, so feed arrival order directly.
+    stream = bytes.fromhex("ffffff7f") + bytes(frame)
+    res = L.tpiu_deframe(stream)
+    assert 1 in res
+    assert res[1] == bytes(data_bytes)
+
+
+def test_tpiu_deframe_want_stream_absent():
+    stream = bytes.fromhex("ffffff7f") + bytes(16)
+    assert L.tpiu_deframe(stream, want_stream=99) == b""

@@ -389,6 +389,115 @@ def tpiu_sync_frames(stream: bytes) -> list[bytes]:
 
 
 # ----------------------------------------------------------------------------
+# TPIU deframer (faithful port of orbuculum tpiuDecoder.c _getPacket) for the
+# case where the TPIU formatter is doing FULL stream-ID framing (multi-source
+# trace). NOTE:
+# our single-source STM32 ETM does NOT use stream framing — it emits bare ETM
+# and the formatter only inserts sync FILLERS (see strip_tpiu_sync below).
+# Running this deframer on that stream scatters bytes into dozens of bogus
+# stream IDs and recovers 0 anchors; strip_tpiu_sync is the correct front-end
+# here. This deframer is kept as a tested reference for genuinely framed input.
+# Each 16-byte frame interleaves data with stream-ID bytes; byte[15] is an
+# auxiliary "lowbits" byte supplying the LSB of each even-position data byte.
+# Reference: ARM CoreSight TPIU formatter; orbuculum tpiuDecoder.c
+# (SYNCPATTERN 0xFFFFFF7F, HALFSYNC FF/7F, 16-byte packet).
+#
+#   even byte E at index i (i even, i<14):
+#     if E&1: stream change. new id = E>>1, applied immediately, UNLESS the
+#             current lowbit is 1, in which case the change is DELAYED until
+#             after the odd byte of this pair.
+#     else  : data byte = E | lowbit  (lowbit restores the LSB clobbered to 0).
+#   odd byte O at index i+1: always a data byte for the current stream.
+#   the last even byte (index 14) is followed by no odd byte.
+#   lowbits (frame[15]) is shifted right by 1 after each pair.
+#   stream id 0 = padding/null -> dropped.
+# ----------------------------------------------------------------------------
+NO_CHANNEL_CHANGE = 0xFF
+
+
+def tpiu_deframe(stream: bytes, want_stream: "int | None" = None):
+    """Deframe a TPIU-formatted byte stream into per-stream payload bytes.
+
+    Returns a dict {stream_id: bytes}. If want_stream is given, returns just
+    that stream's bytes (bytes()). Faithful to orbuculum _getPacket.
+    """
+    out: dict[int, bytearray] = {}
+    cur = 0                              # current stream id (0 = null/padding)
+    for frame in tpiu_sync_frames(stream):
+        # tpiu_sync_frames emits frames byte-reversed wrt arrival (the amaranth
+        # buf packs the first arrived byte into the high bits). Restore arrival
+        # order so frame[0]=first byte, frame[15]=aux lowbits, matching the
+        # orbuculum _getPacket indexing below.
+        frame = frame[::-1]
+        lowbits = frame[15]
+        delayed = NO_CHANNEL_CHANGE
+        for i in range(0, 16, 2):
+            e = frame[i]
+            if e & 1:
+                # stream change (immediate, or delayed past the odd byte)
+                if lowbits & 1:
+                    delayed = e >> 1
+                else:
+                    cur = e >> 1
+            else:
+                if cur:
+                    out.setdefault(cur, bytearray()).append(e | (lowbits & 1))
+            if i < 14:
+                o = frame[i + 1]
+                if cur:
+                    out.setdefault(cur, bytearray()).append(o)
+            if delayed != NO_CHANNEL_CHANGE:
+                cur = delayed
+                delayed = NO_CHANNEL_CHANGE
+            lowbits >>= 1
+    result = {k: bytes(v) for k, v in out.items()}
+    if want_stream is not None:
+        return result.get(want_stream, b"")
+    return result
+
+
+# ----------------------------------------------------------------------------
+# TPIU half-sync / full-sync filler stripping.
+#
+# Empirically (capture 172817, ETM branch-broadcast OFF) the trace is bare ETM
+# but the TPIU formatter pads idle with sync fillers:
+#   * full sync  0xFFFFFF7F  (SYNCPATTERN)
+#   * half sync  0xFF 0x7F   (HALFSYNC_LOW=0xFF then HALFSYNC_HIGH=0x7F)
+# These are NOT ETM packets; left in place they derail the decoder (an 0xFF is
+# misread as a branch-packet header). Because this single-source ETM is emitted
+# transparently (no per-byte stream framing — confirmed: deframing by stream-ID
+# scatters into dozens of bogus streams and recovers 0 anchors, whereas simply
+# removing the sync fillers recovers all anchors), the correct front-end here is
+# to STRIP the fillers, not to run the full 16-byte deframer.
+#
+# Reference: ARM CoreSight TPIU formatter; orbuculum tpiuDecoder.c constants
+# SYNCPATTERN 0xFFFFFF7F, HALFSYNC_LOW 0xFF / HALFSYNC_HIGH 0x7F.
+# ----------------------------------------------------------------------------
+def strip_tpiu_sync(stream: bytes) -> bytes:
+    """Remove TPIU full-sync (0xFFFFFF7F) and half-sync (0xFF 0x7F) fillers,
+    returning the underlying bare-ETM byte stream. Idempotent on streams with
+    no fillers."""
+    # Drop full syncs first so their bytes can't be re-paired as half-syncs.
+    s = stream.replace(b"\xff\xff\xff\x7f", b"")
+    out = bytearray()
+    i = 0
+    n = len(s)
+    while i < n:
+        if i + 1 < n and s[i] == 0xFF and s[i + 1] == 0x7F:
+            i += 2                       # half-sync pair -> drop
+            continue
+        out.append(s[i])
+        i += 1
+    return bytes(out)
+
+
+def has_tpiu_sync(stream: bytes) -> bool:
+    """True if the stream contains TPIU formatter sync fillers (full or half).
+    Used to decide whether strip_tpiu_sync is needed before ETM decode."""
+    return (b"\xff\xff\xff\x7f" in stream) or (b"\xff\x7f" in stream)
+
+
+# ----------------------------------------------------------------------------
 # V4: realigning region decoder. When the plain region walk derails on an
 # unclassifiable byte (the sub-byte misalignment of a 4-bit port, IHI0014Q
 # §7.10.4), try the 8 bit-shifts of the remaining bytes and resume from the

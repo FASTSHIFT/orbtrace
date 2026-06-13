@@ -150,6 +150,18 @@ def main():
         print("!! WARNING: no valid flash I-sync anchors in ANY alignment. "
               "Check wiring / capture / that ETM is actually emitting.")
 
+    # If the TPIU formatter padded the link with sync fillers (happens with
+    # ETM branch-broadcast OFF, when the trace is sparse), strip them so the
+    # downstream ETM decoder sees bare packets.
+    if L.has_tpiu_sync(data):
+        stripped = L.strip_tpiu_sync(data)
+        fl2, tot2, _ = score(stripped)
+        print(f"TPIU sync fillers detected: stripped "
+              f"{len(data) - len(stripped)} bytes "
+              f"({len(data)} -> {len(stripped)}); "
+              f"flash anchors {flash} -> {fl2}")
+        data = stripped
+
     # Report the recovered anchors.
     _, _, syncs = score(data)
     hist = collections.Counter(s.addr for s in syncs if L.is_flash(s.addr))
