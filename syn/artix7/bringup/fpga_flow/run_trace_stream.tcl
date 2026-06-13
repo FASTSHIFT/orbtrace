@@ -63,8 +63,10 @@ set tap 28
 if {[info exists ::env(TAP)]} { set tap $::env(TAP) }
 set capraw 0
 if {[info exists ::env(CAP_RAW)]} { set capraw $::env(CAP_RAW) }
-puts "============ TAP = $tap  CAP_RAW = $capraw ============"
-synth_design -top trace_stream_top -part $part -generic TAP=$tap -generic CAP_RAW=$capraw
+set eye 4
+if {[info exists ::env(EYE)]} { set eye $::env(EYE) }
+puts "============ TAP = $tap  CAP_RAW = $capraw  EYE = $eye ============"
+synth_design -top trace_stream_top -part $part -generic TAP=$tap -generic CAP_RAW=$capraw -generic EYE=$eye
 opt_design
 place_design
 route_design

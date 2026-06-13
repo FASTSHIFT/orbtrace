@@ -22,13 +22,19 @@ module trace_stream_top #(
     parameter       DEPTH = 61440,    // captured bytes (60 KB = 3840 frames);
                                       // keep < 65536 so 16-bit ext_addr also
                                       // reaches the status bytes at DEPTH..+2
-    parameter       CAP_RAW = 0       // 0: capture traceIF 16-byte frames;
+    parameter       CAP_RAW = 0,      // 0: capture traceIF 16-byte frames;
                                       // 1: capture RAW nibble bytes
                                       // {trace_b[3:0],trace_a[3:0]} per
                                       // trace_clk (pre-traceIF) so the PC can
                                       // run orbtrace TPIUSync/TPIUDemux on the
                                       // true pin stream and settle whether the
                                       // STM32 formatter framing is present.
+    parameter       EYE = 4           // OVERSAMPLE mid-eye delay (ref_200m
+                                      // cycles after a TRACECLK edge before
+                                      // latching). 5 ns/cycle; half-bit at
+                                      // /64 (~1.3 MHz) is ~380 ns (~76 cyc) so
+                                      // ~38 is dead-centre. Swept on-board to
+                                      // find the lowest bit-error point.
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -94,7 +100,7 @@ module trace_stream_top #(
         end
     end
 
-    trace_capture_a7 #(.CLK_BUF("BUFR_IO")) u_capture (
+    trace_capture_a7 #(.CLK_BUF("BUFR_IO"), .EYE_DELAY(EYE)) u_capture (
         .rst(sys_rst), .ref_200m(clk200),
         .trace_clk_p(trace_clk_in), .trace_data_p(trace_data_in),
         .tap_data0(TAP), .tap_data1(TAP), .tap_data2(TAP), .tap_data3(TAP),
