@@ -728,3 +728,45 @@ loop_sum 的 `fb6`,`fbc blt <cond>`,`f96/fb2 b+link`(bl add)—— **loop_sum �
 现在有了**一条端到端可信的基准**:逻辑分析仪 .dsl → 正确去帧 → OpenCSD 连续指令流(已对 ground
 truth 验证)。**FPGA 侧 trace_stream/orbflow 的字节流,只要也做同样的 TPIU 去帧,就能和这条基准
 逐字节/逐指令对拍** —— 用户要的"两个性能完全对齐"的标尺,现在真正立起来了。
+
+
+---
+
+## 17. 参考流"残余 15 个未知字节"查清:是 SysTick 异常信息字节,流本身 100% 干净
+
+FPGA 对拍前先把 LA 参考流的最后 0.0018%(15 个未知字节)查清(否则标尺不干净)。结果:
+
+- 15 个全是**同一个字节 `0x1e`**,且都在**同一上下文 `bd 57 1e 98 76`**,周期性出现(每 ~5.4 万字节一次)。
+- 解码:`0x57` = branch 包,`0x1e` = 该 branch 的**异常信息字节**(IHI0014Q §7.3.5 Exception
+  Information Byte):C=0 Alt=0 Can=0 **Exception=15** NS=0。**异常号 15 = SysTick**。`0x76` = 异常退出。
+- 即:这是 **SysTick 中断的进入(branch+异常信息)/退出**序列,在整段抓取里正好出现 **15 次**
+  (`571e` 15 个、`0x76` exc-exit 15 个,完全吻合)。
+
+**所以 `0x1e` 不是未知字节,是合法的 branch 异常信息载荷字节。** 我们的 `_classify` 只识别包
+**头**、不建模 branch 包的异常信息**载荷**,才把它误报为 unknown。**TPIU 去帧后的 ETM 流本身
+100% 干净,0 个真未知字节。** 参考标尺干净,可以拿去和 FPGA 对拍。
+
+## 18. FPGA 对拍:工具就绪,待硬件上电
+
+### 18.1 对拍原理
+
+FPGA `trace_stream` 和逻辑分析仪看的是**同一组 STM32 trace 引脚**:
+- LA 路:`.dsl → dsl_parse(DDR对齐)→ tpiu_deframe_hsync → ETM 字节`
+- FPGA 路:`trace_stream UDP dump(原始 TPIU 字节)→ tpiu_deframe_hsync → ETM 字节`
+
+FPGA 采集前端若正确,两条**去帧后的 ETM 流应解出相同的 flash I-sync 锚点集合与相同指令流**。
+
+### 18.2 工具
+
+`fpga_la_crosscheck.py`:对两路做同样去帧+解码,报告各自去帧洁净度、锚点集合、重叠/分歧,
+判定 MATCH / DIVERGENCE。已自测 LA 路复现 818 锚点。
+
+### 18.3 待办(需 A7-Lite 上电联网)
+
+当前 FPGA 不在线(192.168.10.42 ping 100% 丢包)。对拍需要:
+1. A7-Lite 上电、烧 `trace_stream.bit`(`scripts/program.sh stream jtag`)
+2. 跑同一 proj_add 固件 + 开 ETM(`scripts/etm_enable.sh`)+ 降频
+3. arm 一次性采集 + UDP dump(`scripts/trace_run.sh` 或 `capture.sh`)→ 原始 TPIU 字节
+4. `python3 fpga_la_crosscheck.py <fpga_raw.bin> <la.dsl>` → 看是否 MATCH
+
+目标:FPGA 去帧后 **0 未知字节、锚点集合与 LA 完全一致**,即两路 100% 对齐。
