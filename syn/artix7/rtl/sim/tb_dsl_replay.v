@@ -27,10 +27,9 @@ module tb_dsl_replay;
 
     // ---- stimulus memory ----
     integer NSAMP = 300000;
-    reg [7:0] stim [0:4_000_000-1];
+    reg [7:0] stim [0:52_000_000-1];
     reg [8*256-1:0] stim_file;
     reg [8*256-1:0] out_file;
-    integer eye_d = 4;
 
     reg        trace_clk_p = 0;
     reg [3:0]  trace_data_p = 0;
@@ -39,13 +38,12 @@ module tb_dsl_replay;
     wire [3:0]  trace_a, trace_b;
     wire        idelayctrl_rdy;
 
-    // DUT — EYE_DELAY is a parameter; we instantiate the default (4) and rely
-    // on the +eye plusarg only for reporting. (To sweep EYE_DELAY, regenerate
-    // with -P; see the sweep script.)
+    // DUT — EYE_DELAY overridable at compile time via -P tb_dsl_replay.EYE_DELAY=<n>
+    parameter EYE_DELAY = 4;
     trace_capture_a7 #(
         .CLK_BUF("BUFG"),
         .CAP_METHOD("OVERSAMPLE"),
-        .EYE_DELAY(4)
+        .EYE_DELAY(EYE_DELAY)
     ) dut (
         .rst(rst), .ref_200m(ref_200m),
         .trace_clk_p(trace_clk_p), .trace_data_p(trace_data_p),
@@ -74,7 +72,6 @@ module tb_dsl_replay;
         if (!$value$plusargs("stim=%s", stim_file)) stim_file = "/tmp/dsl_stim.memh";
         if (!$value$plusargs("nsamp=%d", NSAMP))    NSAMP = 300000;
         if (!$value$plusargs("out=%s", out_file))   out_file = "/tmp/sim_raw.hex";
-        void'($value$plusargs("eye=%d", eye_d));
 
         $readmemh(stim_file, stim);
         outfd = $fopen(out_file, "w");
@@ -92,8 +89,8 @@ module tb_dsl_replay;
 
         #200;
         $fclose(outfd);
-        $display("tb_dsl_replay: replayed %0d samples -> %0d bytes (%s) [EYE_DELAY=4, eye_arg=%0d]",
-                 NSAMP, nbytes, out_file, eye_d);
+        $display("tb_dsl_replay: replayed %0d samples -> %0d bytes (%s) [EYE_DELAY=%0d]",
+                 NSAMP, nbytes, out_file, EYE_DELAY);
         $finish;
     end
 endmodule

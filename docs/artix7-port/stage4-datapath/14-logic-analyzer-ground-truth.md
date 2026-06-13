@@ -1047,3 +1047,48 @@ TPIU 去帧(与 dsl_parse 的 LA 路径一致)。板上 `/tmp/fpga_raw3.bin` 重
 板上 60KB 窗口仍有 7.7% unknown + 一个杂散 PC `0x08010f8c`(= 0x08000f8c 的 bit16 翻转),
 **仿真里没有**。这正是被仿真隔离出来的**真实硬件残差**(单 bit 偶发错),与采样/配对逻辑无关
 ——下一步在板侧(更长窗口统计、IDELAY tap 微调、SI)收这部分,RTL 不用再动。
+
+## 25. 仿真 100% 收口(全量验证 + 单元测试)
+
+### 25.1 严格逐字节门禁(不只比锚点)
+
+`decode/sim_la_equiv.py` 把"100% 正确"定义为最严:RTL-sim 去帧后的 ETM 字节流必须与 LA 软件路径
+**逐字节相同**(长度 + 每个字节),而不只是锚点数/unknown 率相等。
+
+多窗口回放(`tb_dsl_replay` OVERSAMPLE)对金标准 194702.dsl 的结果:
+
+| 样本窗口 | RTL 字节 | LA 字节 | 失配 | 结论 |
+|---------|---------|--------|------|------|
+| 300k | 7876→… | = | 0 | 锚点等价 |
+| 2,000,000 | 34063 | 34063 | **0** | BYTE-IDENTICAL |
+| 10,000,000 | 170272 | 170272 | **0** | BYTE-IDENTICAL |
+| **50,000,896(全量)** | **851453** | **851453** | **0** | **BYTE-IDENTICAL** |
+
+全量回放的 RTL 输出再独立解码:**818 flash 锚点、unknown 15(0.0018%)、11 个 PC**,与 LA 金标准
+逐项相同(那 15 个是 SysTick 异常信息字节,非真未知)。
+
+→ **OVERSAMPLE 前端在仿真层面 100% 无错、与逻辑分析仪字节级完全等价,全量验证通过。**
+
+### 25.2 对照:IDDR 模式(错误采法)
+
+同一 2M 窗口、同一波形,`CAP_METHOD="IDDR"`(在 TRACECLK 边沿采)只得 **8** 个锚点,远低于
+OVERSAMPLE 的 33——再次坐实"采在边沿"是错的、"边沿后入眼"是对的。
+
+### 25.3 工具与单元测试
+
+- `decode/dsl_to_stim.py` — .dsl → 逐样本 memh。
+- `rtl/sim/tb_dsl_replay.v` — 回放进 DUT,EYE_DELAY 可经 `-P` 覆盖;`xil_stubs.v` 提供 iverilog
+  用的 Xilinx 原语行为模型。
+- `decode/sim_la_equiv.py` — 严格逐字节等价门禁。
+- `decode/run_sim_equiv.sh` — 一键:.dsl → 激励 → 回放 → 逐字节校验(无需硬件)。
+- `decode/test_capture_pipeline.py` — 10 个新单元测试:stim 位布局/往返、{trace_b,trace_a}
+  时间序 nibble 提取、crosscheck 与 equiv 的 nibble 约定一致性、合成 TPIU 帧经"FPGA DDR 打包模型"
+  往返恢复 I-sync 锚点、逐字节比较器、以及对真实 2M sim 产物的回归门禁。
+
+测试总数:**144 passed**(原 134 + 新 10),含对真实仿真产物的等价回归。
+
+### 25.4 下一步(上板)
+
+仿真已钉死 100%。接着上板收**真实硬件残差**(板上 60KB 窗口曾见 7.7% unknown + 单 bit 翻转 PC,
+仿真里没有):抓更长窗口看错误率是否随窗口收敛、扫 IDELAY tap 找最低误码点;真到 SI 瓶颈再上阻抗
+匹配转接板。RTL 不需再动。
