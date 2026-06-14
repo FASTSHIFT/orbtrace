@@ -56,6 +56,10 @@ def main():
                     help="max seconds to wait for a fresh full capture")
     ap.add_argument("--status-only", action="store_true",
                     help="print DEPTH/full/gen and exit (no data read)")
+    ap.add_argument("--skip", type=int, default=0,
+                    help="drop the first SKIP bytes (capture-start transient "
+                         "lead-in; the first ~7.5KB after re-arm can be garbage "
+                         "until TPIU framing locks — doc 15 §14)")
     a = ap.parse_args()
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -104,9 +108,13 @@ def main():
         out.extend(chunk[:n])
         base += n
 
+    if a.skip > 0:
+        out = out[a.skip:]
+
     with open(a.out, "wb") as f:
         f.write(out)
-    print(f"  wrote {len(out)} bytes -> {a.out}")
+    print(f"  wrote {len(out)} bytes -> {a.out}"
+          + (f" (skipped first {a.skip})" if a.skip else ""))
     # quick content sanity: TPIU sync 0xFFFFFF7F frequency
     sync = out.count(b"\xff\xff\xff\x7f")
     print(f"  TPIU full-sync (ff ff ff 7f) occurrences: {sync}")

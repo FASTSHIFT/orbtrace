@@ -13,6 +13,7 @@ import dsl_parse as D
 
 IP = sys.argv[1] if len(sys.argv) > 1 else "192.168.10.42"
 N = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+SKIP = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 DEPTH = 61440
 
 
@@ -34,7 +35,8 @@ def rearm():
 def dump(out, pg):
     subprocess.run(["python3", os.path.join(SCR, "trace_dump.py"),
                     "--ip", IP, "--depth", str(DEPTH), "-o", out,
-                    "--prev-gen", str(pg)], capture_output=True, text=True)
+                    "--prev-gen", str(pg), "--skip", str(SKIP)],
+                   capture_output=True, text=True)
 
 
 def measure(path):
