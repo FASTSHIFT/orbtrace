@@ -132,7 +132,12 @@ module trace_capture_a7 #(
     output reg [31:0]  duty_hi_sum,
     output reg [15:0]  duty_hi_cnt,
     output reg [31:0]  duty_lo_sum,
-    output reg [15:0]  duty_lo_cnt
+    output reg [15:0]  duty_lo_cnt,
+    // E3b: count of "mid-glitch" half-periods whose dwell is > LOCKOUT but
+    // shorter than a real half-bit (a glitch/runt that slipped past the edge
+    // lockout). A bad capture should show many more of these than a good one,
+    // pinning the root cause. Cleared by cap_clear.
+    output reg [15:0]  glitch_cnt
 );
 
     // ------------------------------------------------------------------
@@ -406,6 +411,7 @@ module trace_capture_a7 #(
                 duty_lo_min <= 16'hFFFF; duty_lo_max <= 0;
                 duty_hi_sum <= 0; duty_lo_sum <= 0;
                 duty_hi_cnt <= 0; duty_lo_cnt <= 0;
+                glitch_cnt <= 0;
             end else if (tck_s != tck_prev) begin
                 // a half-period (level tck_prev) just ended after `dwell` cycles
                 if (tck_prev) begin
@@ -419,6 +425,10 @@ module trace_capture_a7 #(
                     duty_lo_sum <= duty_lo_sum + dwell;
                     duty_lo_cnt <= duty_lo_cnt + 1'b1;
                 end
+                // mid-glitch: a half-period far shorter than a real half-bit
+                // (real /64 half-bit = ~76 cyc; <32 cyc = a glitch that slipped
+                // past the LOCKOUT=4 window). Count them per capture.
+                if (dwell >= 2 && dwell < 32) glitch_cnt <= glitch_cnt + 1'b1;
                 dwell <= 1;
             end else begin
                 dwell <= dwell + 1'b1;
@@ -456,7 +466,7 @@ module trace_capture_a7 #(
         always @(posedge ref_200m) begin
             duty_hi_min <= 0; duty_hi_max <= 0; duty_lo_min <= 0;
             duty_lo_max <= 0; duty_hi_sum <= 0; duty_hi_cnt <= 0;
-            duty_lo_sum <= 0; duty_lo_cnt <= 0;
+            duty_lo_sum <= 0; duty_lo_cnt <= 0; glitch_cnt <= 0;
         end
     end
     endgenerate

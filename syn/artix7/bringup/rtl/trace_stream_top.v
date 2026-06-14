@@ -102,6 +102,7 @@ module trace_stream_top #(
     wire [15:0] duty_hi_min, duty_hi_max, duty_lo_min, duty_lo_max;
     wire [31:0] duty_hi_sum, duty_lo_sum;
     wire [15:0] duty_hi_cnt, duty_lo_cnt;
+    wire [15:0] glitch_cnt;
 
     // ---- SELFTEST pseudo-trace generator (async to ref_200m) ----------
     // Runs in the phy_rx_clk domain (125 MHz, recovered from the PHY — a
@@ -163,6 +164,7 @@ module trace_stream_top #(
         .duty_lo_min(duty_lo_min), .duty_lo_max(duty_lo_max),
         .duty_hi_sum(duty_hi_sum), .duty_hi_cnt(duty_hi_cnt),
         .duty_lo_sum(duty_lo_sum), .duty_lo_cnt(duty_lo_cnt),
+        .glitch_cnt(glitch_cnt),
         .idelayctrl_rdy(idelayctrl_rdy)
     );
 
@@ -279,7 +281,9 @@ module trace_stream_top #(
                           (ext_addr == NB+20)    ? duty_lo_sum[23:16] :
                           (ext_addr == NB+21)    ? duty_lo_sum[31:24] :
                           (ext_addr == NB+22)    ? duty_lo_cnt[7:0] :
-                          (ext_addr == NB+23)    ? duty_lo_cnt[15:8] : 8'h00;
+                          (ext_addr == NB+23)    ? duty_lo_cnt[15:8] :
+                          (ext_addr == NB+24)    ? glitch_cnt[7:0] :
+                          (ext_addr == NB+25)    ? glitch_cnt[15:8] : 8'h00;
         assign led1 = ~rfull;
     end else begin : g_frame
         // ---- traceIF 16-byte frame capture (default) ----
