@@ -120,7 +120,19 @@ module trace_capture_a7 #(
     // that tears bytes when BUFR_IO trace_clk races the ref-domain a/b
     // registers (doc 14 §27). For BUFG/IDDR modes cap_valid stays 0.
     output wire [7:0]  cap_byte,
-    output wire        cap_valid
+    output wire        cap_valid,
+
+    // E3: real TRACECLK duty stats measured at the synchronised clock (FPGA
+    // side), in ref_200m cycles. High/low half-period dwell min/max/sum/cnt;
+    // the PC computes duty = hi_avg/(hi_avg+lo_avg). Cleared by cap_clear.
+    output reg [15:0]  duty_hi_min,
+    output reg [15:0]  duty_hi_max,
+    output reg [15:0]  duty_lo_min,
+    output reg [15:0]  duty_lo_max,
+    output reg [31:0]  duty_hi_sum,
+    output reg [15:0]  duty_hi_cnt,
+    output reg [31:0]  duty_lo_sum,
+    output reg [15:0]  duty_lo_cnt
 );
 
     // ------------------------------------------------------------------
@@ -383,6 +395,36 @@ module trace_capture_a7 #(
         assign cap_byte  = cap_byte_r;
         assign cap_valid = cap_valid_r;
 
+        // E3 duty measurement: count high vs low half-period dwell of the
+        // synchronised TRACECLK (tck_sync[2]) in ref_200m cycles. Cleared on
+        // cap_clear so each capture reports its own window's duty (doc 15 §12).
+        reg [15:0] dwell = 0;
+        always @(posedge ref_200m) begin
+            if (rst || cap_clear) begin
+                dwell <= 0;
+                duty_hi_min <= 16'hFFFF; duty_hi_max <= 0;
+                duty_lo_min <= 16'hFFFF; duty_lo_max <= 0;
+                duty_hi_sum <= 0; duty_lo_sum <= 0;
+                duty_hi_cnt <= 0; duty_lo_cnt <= 0;
+            end else if (tck_s != tck_prev) begin
+                // a half-period (level tck_prev) just ended after `dwell` cycles
+                if (tck_prev) begin
+                    if (dwell < duty_hi_min) duty_hi_min <= dwell;
+                    if (dwell > duty_hi_max) duty_hi_max <= dwell;
+                    duty_hi_sum <= duty_hi_sum + dwell;
+                    duty_hi_cnt <= duty_hi_cnt + 1'b1;
+                end else begin
+                    if (dwell < duty_lo_min) duty_lo_min <= dwell;
+                    if (dwell > duty_lo_max) duty_lo_max <= dwell;
+                    duty_lo_sum <= duty_lo_sum + dwell;
+                    duty_lo_cnt <= duty_lo_cnt + 1'b1;
+                end
+                dwell <= 1;
+            end else begin
+                dwell <= dwell + 1'b1;
+            end
+        end
+
     end else begin : g_iddr
         // ----------------------------------------------------------------
         // IDDR: DDR input register sampled on the TRACECLK edges. Correct
@@ -410,6 +452,12 @@ module trace_capture_a7 #(
         // IDDR mode has no glitch-free ref-domain capture path.
         assign cap_byte  = 8'b0;
         assign cap_valid = 1'b0;
+        // IDDR mode does not measure duty; hold the stats at 0.
+        always @(posedge ref_200m) begin
+            duty_hi_min <= 0; duty_hi_max <= 0; duty_lo_min <= 0;
+            duty_lo_max <= 0; duty_hi_sum <= 0; duty_hi_cnt <= 0;
+            duty_lo_sum <= 0; duty_lo_cnt <= 0;
+        end
     end
     endgenerate
 

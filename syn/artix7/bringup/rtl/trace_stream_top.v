@@ -99,6 +99,9 @@ module trace_stream_top #(
     wire        idelayctrl_rdy;
     wire [7:0]  cap_byte;
     wire        cap_valid;
+    wire [15:0] duty_hi_min, duty_hi_max, duty_lo_min, duty_lo_max;
+    wire [31:0] duty_hi_sum, duty_lo_sum;
+    wire [15:0] duty_hi_cnt, duty_lo_cnt;
 
     // ---- SELFTEST pseudo-trace generator (async to ref_200m) ----------
     // Runs in the phy_rx_clk domain (125 MHz, recovered from the PHY — a
@@ -156,6 +159,10 @@ module trace_stream_top #(
         .cap_clear(cap_rearm),
         .trace_clk(trace_clk), .trace_a(trace_a), .trace_b(trace_b),
         .cap_byte(cap_byte), .cap_valid(cap_valid),
+        .duty_hi_min(duty_hi_min), .duty_hi_max(duty_hi_max),
+        .duty_lo_min(duty_lo_min), .duty_lo_max(duty_lo_max),
+        .duty_hi_sum(duty_hi_sum), .duty_hi_cnt(duty_hi_cnt),
+        .duty_lo_sum(duty_lo_sum), .duty_lo_cnt(duty_lo_cnt),
         .idelayctrl_rdy(idelayctrl_rdy)
     );
 
@@ -251,7 +258,28 @@ module trace_stream_top #(
                           (ext_addr == NB+0)     ? NB[7:0] :
                           (ext_addr == NB+1)     ? NB[15:8] :
                           (ext_addr == NB+2)     ? {7'b0, rfull} :
-                          (ext_addr == NB+3)     ? cap_gen_125 : 8'h00;
+                          (ext_addr == NB+3)     ? cap_gen_125 :
+                          // E3 duty stats (clk200-domain, async-read OK: quasi-static)
+                          (ext_addr == NB+4)     ? duty_hi_min[7:0] :
+                          (ext_addr == NB+5)     ? duty_hi_min[15:8] :
+                          (ext_addr == NB+6)     ? duty_hi_max[7:0] :
+                          (ext_addr == NB+7)     ? duty_hi_max[15:8] :
+                          (ext_addr == NB+8)     ? duty_lo_min[7:0] :
+                          (ext_addr == NB+9)     ? duty_lo_min[15:8] :
+                          (ext_addr == NB+10)    ? duty_lo_max[7:0] :
+                          (ext_addr == NB+11)    ? duty_lo_max[15:8] :
+                          (ext_addr == NB+12)    ? duty_hi_sum[7:0] :
+                          (ext_addr == NB+13)    ? duty_hi_sum[15:8] :
+                          (ext_addr == NB+14)    ? duty_hi_sum[23:16] :
+                          (ext_addr == NB+15)    ? duty_hi_sum[31:24] :
+                          (ext_addr == NB+16)    ? duty_hi_cnt[7:0] :
+                          (ext_addr == NB+17)    ? duty_hi_cnt[15:8] :
+                          (ext_addr == NB+18)    ? duty_lo_sum[7:0] :
+                          (ext_addr == NB+19)    ? duty_lo_sum[15:8] :
+                          (ext_addr == NB+20)    ? duty_lo_sum[23:16] :
+                          (ext_addr == NB+21)    ? duty_lo_sum[31:24] :
+                          (ext_addr == NB+22)    ? duty_lo_cnt[7:0] :
+                          (ext_addr == NB+23)    ? duty_lo_cnt[15:8] : 8'h00;
         assign led1 = ~rfull;
     end else begin : g_frame
         // ---- traceIF 16-byte frame capture (default) ----
