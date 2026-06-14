@@ -325,3 +325,31 @@ err_classify.py 想用 loop 周期性把坏捕获对齐到好捕获做逐 lane/�
   (IBUF/IDELAY/反射/duty)" vs "STM32 信号"。需接一根回环线。
 - **E3(FPGA 自测真实 TRACECLK 占空比)**:纯 RTL,加 ref 计数器测 FPGA 输入脚处 TRACECLK 高/低拍数
   直方图——这个**我能自主做**,正面验证"FPGA 脚 duty ≠ LA 探头 duty"这个未验证前提。下一步优先做 E3。
+
+
+## 13. E3 实测:FPGA 输入脚处的 TRACECLK 半周期 dwell
+
+自主做了 r16 的 E3(纯 RTL,无需 LA):在 trace_capture_a7 里用 ref_200m 计数同步后 TRACECLK
+(tck_sync[2])的高/低半周期 dwell(单位 5ns),min/max/sum/cnt 经状态寄存器 NB+4.. 读出
+(`decode/duty_probe.py`)。
+
+**关键发现(可靠)**:/64(1.31MHz)下,高、低半周期 dwell:
+- **max = 77 cyc = 385ns**(= 正确半位 ✓)
+- **min = 1 cyc = 5ns** ← **存在 5ns 级的超短半周期(runt/毛刺)**
+
+LA 在 50MSa/s(20ns 分辨率)**根本看不到 5ns 的 runt**——这解释了为什么 §29 LA 测 TRACECLK"边沿
+干净、占空比 50.0%"却仍有间歇坏:**真实存在亚 LA 分辨率的短毛刺/亚稳态双采**,落在同步后的时钟上。
+注:duty 计数器测的是 raw `tck_sync`(未经 LOCKOUT),所以它看到的是 LOCKOUT 之前的毛刺——LOCKOUT=4
+能滤掉 1 cyc 的 runt,但这证明了"毛刺源真实存在",且若有 5–10 cyc 的中等毛刺可能漏过 LOCKOUT。
+
+**不可靠**:avg/sum 数值异常(疑似 idle gap 时 TRACECLK 停拍产生超长 dwell 使 16-bit dwell 计数器
+回绕、污染 sum;min/max 不受影响仍可信)。duty% 因此暂不可信,待修(dwell 计数器加饱和、或排除 idle)。
+
+### 13.1 这条线索的意义
+
+- 坐实了"真实信号上有亚 LA 分辨率的时钟毛刺/亚稳态",这是间歇坏的强候选物理来源。
+- 但还没证明这些毛刺就是那 7–10% 的直接原因(需要把毛刺事件与坏捕获时间对齐,或加更强去毛刺看 yield)。
+- **下一步可自主**:把 dwell 计数器加饱和修好 duty,并加一个"短 dwell(<LOCKOUT 比如 <8 cyc)计数器",
+  统计每个捕获里漏过 LOCKOUT 的中等毛刺数,与该捕获 好/坏 关联——若坏捕获的中等毛刺数显著更高,
+  就把根因钉死在"毛刺漏过 LOCKOUT"。
+- **需要硬件**:E0(同会话 LA 逐 nibble 分类)、E2(物理回环)仍是定性"偏 lane/偏 a-b/均匀"的金标准。
