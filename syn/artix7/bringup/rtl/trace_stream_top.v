@@ -152,6 +152,7 @@ module trace_stream_top #(
         .tap_data0(TAP), .tap_data1(TAP), .tap_data2(TAP), .tap_data3(TAP),
         .tap_load(tap_load),
         .test_en(SELFTEST[0]), .test_clk(st_clk), .test_data(st_data),
+        .eye_delay_rt(eye_rt),
         .trace_clk(trace_clk), .trace_a(trace_a), .trace_b(trace_b),
         .cap_byte(cap_byte), .cap_valid(cap_valid),
         .idelayctrl_rdy(idelayctrl_rdy)
@@ -179,6 +180,39 @@ module trace_stream_top #(
     wire [7:0]  ext_data;
     localparam [15:0] NB = DEPTH;
 
+    // ---- runtime CSRs (frequency sweep, doc 15), written via UDP :5002 ----
+    //   addr 0x01: EYE delay (ref_200m cycles) for OVERSAMPLE mid-eye sampling
+    //   addr 0x02: soft re-arm (any write re-arms the one-shot capture)
+    wire [7:0] csr_addr_w, csr_data_w;
+    wire       csr_we_w;
+    reg  [7:0] eye_csr = 8'd0;          // 0 => use EYE parameter default
+    reg        rearm_125 = 1'b0;        // 1-cycle pulse in clk125 domain
+    always @(posedge clk125) begin
+        rearm_125 <= 1'b0;
+        if (sys_rst) begin
+            eye_csr <= 8'd0;
+        end else if (csr_we_w) begin
+            if (csr_addr_w == 8'h01) eye_csr <= csr_data_w;
+            if (csr_addr_w == 8'h02) rearm_125 <= 1'b1;
+        end
+    end
+
+    // eye_csr is quasi-static (set between captures) — sample it into the
+    // clk200 domain with a 2-FF sync for clean use by trace_capture_a7.
+    reg [7:0] eye_s0 = 0, eye_rt = 0;
+    always @(posedge clk200) begin
+        eye_s0 <= eye_csr;
+        eye_rt <= eye_s0;
+    end
+
+    // Soft re-arm: cross the clk125 rearm pulse into clk200 (capture domain)
+    // as a one-cycle pulse via a toggle + edge-detect synchroniser.
+    reg        rearm_tgl125 = 1'b0;
+    always @(posedge clk125) if (rearm_125) rearm_tgl125 <= ~rearm_tgl125;
+    reg [2:0]  rearm_sync200 = 3'b0;
+    always @(posedge clk200) rearm_sync200 <= {rearm_sync200[1:0], rearm_tgl125};
+    wire cap_rearm = rearm_sync200[2] ^ rearm_sync200[1];   // 1-cyc pulse in clk200
+
     generate
     if (CAP_RAW) begin : g_raw
         // ---- RAW nibble capture: one byte {trace_b,trace_a} per trace_clk ----
@@ -195,8 +229,8 @@ module trace_stream_top #(
             if (cap_valid && !rfull) rawmem[rwr[RAW_AW-1:0]] <= cap_byte;
         end
         always @(posedge clk200) begin
-            if (sys_rst)                    rwr <= 0;
-            else if (cap_valid && !rfull)   rwr <= rwr + 1'b1;
+            if (sys_rst || cap_rearm)  rwr <= 0;   // soft re-arm via CSR :5002
+            else if (cap_valid && !rfull)  rwr <= rwr + 1'b1;
         end
         reg [7:0] rrd;
         always @(posedge clk125) rrd <= rawmem[ext_addr[RAW_AW-1:0]];
@@ -243,7 +277,8 @@ module trace_stream_top #(
         .phy_int_n(1'b1), .phy_pme_n(1'b1),
         .uart_rxd(1'b1), .uart_txd(),
         .dbg_rx_good_frame(), .dbg_rx_bad_fcs(), .dbg_tx_axis_tvalid(),
-        .ext_addr(ext_addr), .ext_data(ext_data)
+        .ext_addr(ext_addr), .ext_data(ext_data),
+        .csr_addr(csr_addr_w), .csr_data(csr_data_w), .csr_we(csr_we_w)
     );
 
     assign phy_mdio = 1'bz;

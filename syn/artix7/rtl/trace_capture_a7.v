@@ -72,6 +72,12 @@ module trace_capture_a7 #(
     input  wire        rst,
     input  wire        ref_200m,
 
+    // Runtime EYE delay override (OVERSAMPLE). When nonzero, replaces the
+    // EYE_DELAY parameter at run time so the mid-eye sample point can be swept
+    // over UDP without re-synthesising (frequency-sweep, doc 15). 0 => use the
+    // EYE_DELAY parameter default. Tie 0 if unused.
+    input  wire [7:0]  eye_delay_rt,
+
     // Trace pins from target
     input  wire        trace_clk_p,
     input  wire [3:0]  trace_data_p,
@@ -256,9 +262,14 @@ module trace_capture_a7 #(
         wire rise_evt = tck_s & ~tck_prev;
         wire fall_evt = ~tck_s & tck_prev;
 
+        // EYE delay actually used: runtime override if nonzero, else the
+        // EYE_DELAY parameter default. 8-bit counters cover up to 255 ref
+        // cycles (~1.275 us), enough for the half-bit even at /512.
+        wire [7:0] eye_use = (eye_delay_rt != 8'd0) ? eye_delay_rt
+                                                    : EYE_DELAY[7:0];
+
         // EYE_DELAY countdown timers, one per edge direction.
-        localparam CW = (EYE_DELAY <= 1) ? 1 : $clog2(EYE_DELAY + 1);
-        reg [CW-1:0] r_cnt = 0, f_cnt = 0;
+        reg [7:0] r_cnt = 0, f_cnt = 0;
         reg          r_arm = 1'b0, f_arm = 1'b0;
         reg [3:0]    a_reg = 4'b0, b_reg = 4'b0;
 
@@ -270,7 +281,7 @@ module trace_capture_a7 #(
                 // rising-edge sample
                 if (rise_evt) begin
                     r_arm <= 1'b1;
-                    r_cnt <= EYE_DELAY[CW-1:0];
+                    r_cnt <= eye_use;
                 end else if (r_arm) begin
                     if (r_cnt == 0) begin
                         a_reg <= d_s1;
@@ -282,7 +293,7 @@ module trace_capture_a7 #(
                 // falling-edge sample
                 if (fall_evt) begin
                     f_arm <= 1'b1;
-                    f_cnt <= EYE_DELAY[CW-1:0];
+                    f_cnt <= eye_use;
                 end else if (f_arm) begin
                     if (f_cnt == 0) begin
                         b_reg <= d_s1;

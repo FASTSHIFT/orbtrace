@@ -105,7 +105,19 @@ module fpga_core_net #
      * Tie ext_data=0 if unused.
      */
     output wire [15:0] ext_addr,
-    input  wire [7:0] ext_data
+    input  wire [7:0] ext_data,
+
+    /*
+     * Control-write port (frequency-sweep CSRs, doc 15): a UDP frame to
+     * CTRL_PORT (5002) carries {reg_addr, reg_value} as its first two payload
+     * bytes. csr_we pulses for one clk when a valid write has been latched;
+     * csr_addr/csr_data hold the address/value. Lets the PC set EYE_DELAY and
+     * trigger a soft capture re-arm at runtime, no reflash. Leave unused
+     * outputs disconnected if not needed.
+     */
+    output reg  [7:0]  csr_addr,
+    output reg  [7:0]  csr_data,
+    output reg         csr_we
 );
 
 // AXI between MAC and Ethernet modules
@@ -281,12 +293,14 @@ assign tx_ip_payload_axis_tuser = 0;
 // ------------------------------------------------------------------
 wire golden_cond = rx_udp_dest_port == 16'd5000;
 wire ext_cond    = rx_udp_dest_port == 16'd5001;
-wire match_cond = (rx_udp_dest_port == 16'd1234) || golden_cond || ext_cond;
+wire ctrl_cond   = rx_udp_dest_port == 16'd5002;
+wire match_cond = (rx_udp_dest_port == 16'd1234) || golden_cond || ext_cond || ctrl_cond;
 wire no_match = !match_cond;
 
 // latched "this frame targets the golden/ext port", aligned with match_cond_reg
 reg golden_reg = 0;
 reg ext_reg = 0;
+reg ctrl_reg = 0;
 
 // payload byte position within the current frame (counts FIFO-input beats)
 reg [15:0] golden_idx = 0;
@@ -309,18 +323,41 @@ always @(posedge clk) begin
     end
 end
 
+// Control-write port (:5002) CSR latch. On a ctrl frame, byte0 -> csr_addr,
+// byte1 -> csr_data; pulse csr_we for one cycle at end-of-frame so the write
+// is atomic (both bytes captured). ctrl_reg (set in the dispatch latch below)
+// gates this to ctrl frames only.
+reg [7:0] ctrl_addr_l = 0, ctrl_data_l = 0;
+always @(posedge clk) begin
+    csr_we <= 1'b0;
+    if (rst) begin
+        ctrl_addr_l <= 0; ctrl_data_l <= 0;
+        csr_addr <= 0; csr_data <= 0;
+    end else if (rx_fifo_udp_payload_axis_tvalid && rx_fifo_udp_payload_axis_tready) begin
+        if (ctrl_reg) begin
+            if (golden_idx == 16'd0) ctrl_addr_l <= rx_udp_payload_axis_tdata;
+            if (golden_idx == 16'd1) ctrl_data_l <= rx_udp_payload_axis_tdata;
+            if (rx_fifo_udp_payload_axis_tlast) begin
+                csr_addr <= ctrl_addr_l;
+                csr_data <= ctrl_data_l;
+                csr_we   <= 1'b1;     // one-cycle write strobe
+            end
+        end
+    end
+end
+
 // external readout addressing: base (from request bytes 0..1) + position.
-// Data starts at request position 2 (after the 2 base bytes). The CAP_RAW
-// BRAM read (`rrd`) has 1 cycle of latency, so the byte presented at beat
-// `idx` reflects the address driven at beat `idx-1`. To make
-//   reply[idx>=2] = source[ base + (idx-2) ]
-// we drive the read address ONE position AHEAD (compensate the read latency):
-//   ext_pos(j) = j-1   (for j>=1)
-// so the registered rrd lines up with the byte being emitted. Verified on the
-// SELFTEST ramp ground truth (doc 14 §30/§31). NOTE: this assumes back-to-back
-// readout beats (no mid-burst stall); trace_dump keeps an adaptive
-// drop-leading-duplicate safety net that is correct regardless of stalls.
-wire [15:0] ext_pos = (golden_idx >= 16'd1) ? (golden_idx - 16'd1) : 16'd0;
+// Data starts at request position 2 (after the 2 base bytes), so by then
+// ext_base is fully latched and ext_addr is contiguous from `base`.
+//   reply[p] (p>=2) = source[ base + (p-2) ]
+// NOTE: the CAP_RAW BRAM read (`rrd`) has 1 cycle of latency, so the FIRST
+// data byte of each reply actually repeats source[base] (a stale read). An
+// RTL address-advance was tried but did not reliably remove it on real
+// readout (AXI handshake stall on the first beat). trace_dump compensates
+// deterministically by requesting n+1 bytes per page and dropping the leading
+// duplicate (verified 0.000% on real trace, doc 14 §31). Keep the simple
+// position mapping here.
+wire [15:0] ext_pos = (golden_idx >= 16'd2) ? (golden_idx - 16'd2) : 16'd0;
 assign ext_addr = ext_base + ext_pos;
 
 // GOLDEN pattern: a 4-byte TPIU full-sync prefix (FF FF FF 7F) ONCE at the
@@ -348,6 +385,7 @@ always @(posedge clk) begin
         no_match_reg <= 0;
         golden_reg <= 0;
         ext_reg <= 0;
+        ctrl_reg <= 0;
     end else begin
         if (rx_udp_payload_axis_tvalid) begin
             if ((!match_cond_reg && !no_match_reg) ||
@@ -356,12 +394,14 @@ always @(posedge clk) begin
                 no_match_reg <= no_match;
                 golden_reg <= golden_cond;
                 ext_reg <= ext_cond;
+                ctrl_reg <= ctrl_cond;
             end
         end else begin
             match_cond_reg <= 0;
             no_match_reg <= 0;
             golden_reg <= 0;
             ext_reg <= 0;
+            ctrl_reg <= 0;
         end
     end
 end

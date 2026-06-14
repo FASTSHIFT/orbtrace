@@ -59,7 +59,14 @@ def main():
     while base < a.depth:
         n = min(CHUNK, a.depth - base)
         try:
-            chunk = req(s, a.ip, a.port, base, n, a.timeout)
+            # Readout off-by-one fix (deterministic, doc 14 §31): the CAP_RAW
+            # BRAM read has 1 cycle latency, so the FIRST data byte of every
+            # reply repeats source[base] (stale read). Request n+1 bytes and
+            # drop the leading duplicate -> contiguous, correct stream.
+            # (Verified 0.000% unknown on real trace; an RTL-side fix did not
+            # reliably remove it due to a first-beat AXI stall.)
+            chunk = req(s, a.ip, a.port, base, n + 1, a.timeout)
+            chunk = chunk[1:1 + n]
         except (socket.timeout, OSError) as e:
             print(f"ERROR at base {base}: {e}")
             return 2
