@@ -153,6 +153,7 @@ module trace_stream_top #(
         .tap_load(tap_load),
         .test_en(SELFTEST[0]), .test_clk(st_clk), .test_data(st_data),
         .eye_delay_rt(eye_rt),
+        .cap_clear(cap_rearm),
         .trace_clk(trace_clk), .trace_a(trace_a), .trace_b(trace_b),
         .cap_byte(cap_byte), .cap_valid(cap_valid),
         .idelayctrl_rdy(idelayctrl_rdy)

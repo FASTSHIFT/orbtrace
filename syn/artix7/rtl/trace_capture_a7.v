@@ -78,6 +78,13 @@ module trace_capture_a7 #(
     // EYE_DELAY parameter default. Tie 0 if unused.
     input  wire [7:0]  eye_delay_rt,
 
+    // Per-capture clear (pulse on each soft re-arm). Resets the sampler's
+    // clean-start state (seen_rise) so EVERY capture begins on a fresh rising
+    // edge, decoupling capture-start from whatever sampler/TRACECLK phase
+    // happened to be latched at re-arm. Tests + fixes the re-arm phase race
+    // (red-team r16 §5/E1). Tie 0 if unused.
+    input  wire        cap_clear,
+
     // Trace pins from target
     input  wire        trace_clk_p,
     input  wire [3:0]  trace_data_p,
@@ -358,11 +365,14 @@ module trace_capture_a7 #(
                 cap_byte_r  <= 8'b0;
                 seen_rise   <= 1'b0;
             end else begin
-                // mark once a rising-edge nibble has been latched into a_reg
-                if (r_arm && r_cnt == 0) seen_rise <= 1'b1;
+                // Per-capture clear: re-arm forces a fresh rising-edge start so
+                // capture-start is decoupled from the latched sampler/TRACECLK
+                // phase (r16 E1). Also gate cap_valid off this cycle.
+                if (cap_clear) seen_rise <= 1'b0;
+                else if (r_arm && r_cnt == 0) seen_rise <= 1'b1;
                 // detect the cycle b_reg gets latched (f_arm falling with cnt 0)
                 b_latched <= (f_arm && f_cnt == 0);
-                if (b_latched && seen_rise) begin
+                if (b_latched && seen_rise && !cap_clear) begin
                     cap_byte_r  <= {b_reg, a_reg};
                     cap_valid_r <= 1'b1;
                 end else begin
