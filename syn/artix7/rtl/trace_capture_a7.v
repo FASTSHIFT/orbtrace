@@ -340,6 +340,14 @@ module trace_capture_a7 #(
         // a_reg already latched earlier the same period. Both registers are
         // long-settled in the ref domain, so the captured byte cannot tear.
         // --------------------------------------------------------------
+        // Clean start: suppress cap_valid until at least one rising-edge
+        // sample has been latched, so every capture's first emitted byte is a
+        // proper (rising, falling) pair. Without this, a capture (re-)armed
+        // mid-period could emit a first byte pairing a falling nibble with a
+        // stale rising nibble, offsetting the whole stream by half a period
+        // and corrupting the capture from byte 0 (the uniform-dirty ~7% bad
+        // captures seen after the glitch lockout, doc 15 §9/§12).
+        reg        seen_rise = 1'b0;
         reg        b_latched = 1'b0;
         reg [7:0]  cap_byte_r = 8'b0;
         reg        cap_valid_r = 1'b0;
@@ -348,10 +356,13 @@ module trace_capture_a7 #(
                 b_latched   <= 1'b0;
                 cap_valid_r <= 1'b0;
                 cap_byte_r  <= 8'b0;
+                seen_rise   <= 1'b0;
             end else begin
+                // mark once a rising-edge nibble has been latched into a_reg
+                if (r_arm && r_cnt == 0) seen_rise <= 1'b1;
                 // detect the cycle b_reg gets latched (f_arm falling with cnt 0)
                 b_latched <= (f_arm && f_cnt == 0);
-                if (b_latched) begin
+                if (b_latched && seen_rise) begin
                     cap_byte_r  <= {b_reg, a_reg};
                     cap_valid_r <= 1'b1;
                 end else begin
