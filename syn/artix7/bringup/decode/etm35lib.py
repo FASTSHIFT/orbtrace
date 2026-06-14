@@ -552,6 +552,101 @@ def tpiu_deframe_hsync(stream: bytes, phase: int = 0,
     return bytes(out)
 
 
+def _decode_frame16(frame, cur, out, want_stream):
+    """Interpret one assembled 16-byte TPIU frame into `out`. Returns the
+    (possibly updated) current stream id `cur`."""
+    aux = frame[15]
+    for j in range(15):
+        if j % 2 == 0:
+            if frame[j] & 1:
+                cur = frame[j] >> 1            # stream-ID change
+            else:
+                b = frame[j] | ((aux >> (j // 2)) & 1)
+                if want_stream is None or cur == want_stream:
+                    out.append(b)
+        else:
+            if want_stream is None or cur == want_stream:
+                out.append(frame[j])
+    return cur
+
+
+def _next_frame(stream, i, n):
+    """Collect the next 16 non-filler bytes starting at `i`, skipping
+    HSYNC/FSYNC. Returns (frame_list_or_None, new_i)."""
+    frame = []
+    while i < n:
+        if stream[i] == 0xFF and i + 1 < n and stream[i + 1] == 0x7F:
+            i += 2
+            continue
+        if (i + 3 < n and stream[i] == 0xFF and stream[i + 1] == 0xFF
+                and stream[i + 2] == 0xFF and stream[i + 3] == 0x7F):
+            i += 4
+            continue
+        frame.append(stream[i])
+        i += 1
+        if len(frame) == 16:
+            return frame, i
+    return None, i
+
+
+def tpiu_deframe_walk(stream: bytes, want_stream: "int | None" = None,
+                      check_frames: int = 6, bad_thresh: float = 0.30,
+                      scan: int = 48) -> bytes:
+    """Seam-free continuous TPIU deframer with in-place re-lock (doc 15 §18).
+
+    Unlike tpiu_deframe_local (fixed windows -> a frame lost per seam, ~1.5%
+    floor), this walks frames continuously and re-aligns only on real lock
+    loss: decode frames one at a time; peek the unknown-fraction of the next
+    `check_frames` frames; if it exceeds `bad_thresh` (a dirty window shifted
+    the boundary), scan the next `scan` byte offsets for the cleanest
+    re-alignment, jump there, continue. Clean captures never trip it (0 seam
+    loss); dirty windows re-lock right after, dropping only corrupt bytes.
+    Use on an already-correctly-assembled stream.
+    """
+    n = len(stream)
+    if n < 32:
+        ph, _ = find_tpiu_phase(stream)
+        return tpiu_deframe_hsync(stream, ph, want_stream)
+
+    def quality_ahead(pos, frames):
+        tmp = bytearray()
+        cur = 0
+        i = pos
+        for _ in range(frames):
+            fr, i = _next_frame(stream, i, n)
+            if fr is None:
+                break
+            cur = _decode_frame16(fr, cur, tmp, None)
+        if not tmp:
+            return 1.0, i
+        unk = sum(1 for c in tmp if _classify(c) == "unknown")
+        return unk / len(tmp), i
+
+    phase, _ = find_tpiu_phase(stream[:min(n, 20000)])
+    out = bytearray()
+    cur = 0
+    i = phase
+    while i < n:
+        frac, _ = quality_ahead(i, check_frames)
+        if frac > bad_thresh:
+            best = (frac, i)
+            for off in range(1, scan):
+                if i + off >= n:
+                    break
+                f2, _ = quality_ahead(i + off, check_frames)
+                if f2 < best[0]:
+                    best = (f2, i + off)
+                    if f2 <= 0.02:
+                        break
+            if best[1] != i and best[0] < frac:
+                i = best[1]
+        fr, i = _next_frame(stream, i, n)
+        if fr is None:
+            break
+        cur = _decode_frame16(fr, cur, out, want_stream)
+    return bytes(out)
+
+
 def tpiu_deframe_local(stream: bytes, window: int = 5000,
                        want_stream: "int | None" = None) -> bytes:
     """Deframe with PER-WINDOW local frame phase (doc 15 §16/§17).

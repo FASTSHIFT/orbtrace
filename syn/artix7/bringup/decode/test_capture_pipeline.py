@@ -258,3 +258,54 @@ def test_selftest_detects_corruption(tmp_path):
               if ((nibs[i] - nibs[i - 1]) & 0xF) != 7)
     # one corrupted nibble breaks the ramp at two adjacent deltas
     assert bad >= 1
+
+
+# ----------------------------------------------------------------------------
+# tpiu_deframe_walk — seam-free continuous re-aligning deframer (doc 15 §18)
+# ----------------------------------------------------------------------------
+def _mk_frame(payload14, stream_id=1):
+    """Build one 16-byte TPIU frame carrying 14 data bytes for one stream."""
+    frame = bytearray(16)
+    frame[0] = (stream_id << 1) | 1          # stream-id change, immediate
+    aux = 0
+    for k in range(1, 15):
+        src = payload14[k - 1] if (k - 1) < len(payload14) else 0
+        if k % 2 == 0:
+            frame[k] = src & 0xFE
+            if src & 1:
+                aux |= (1 << (k // 2))
+        else:
+            frame[k] = src
+    frame[15] = aux
+    return bytes(frame)
+
+
+def test_walk_matches_hsync_on_clean_stream():
+    # On a clean framed stream the walker must be as clean as plain phase-0.
+    payload = bytes(range(0x80, 0x80 + 14))
+    frame = _mk_frame(payload, stream_id=1)
+    stream = frame * 8
+    walk = L.tpiu_deframe_walk(stream)
+    plain = L.tpiu_deframe_hsync(stream, 0)
+    wu = sum(1 for c in walk if L._classify(c) == "unknown") / max(1, len(walk))
+    pu = sum(1 for c in plain if L._classify(c) == "unknown") / max(1, len(plain))
+    assert wu <= pu + 1e-9
+    assert len(walk) > 0
+
+
+def test_walk_recovers_after_inserted_garbage_window():
+    # Long clean framed stream + a 3-byte garbage burst spliced mid-stream
+    # (shifts the frame boundary). Walker must be at least as clean as a single
+    # global phase (which derails on the tail).
+    isync = bytes([0x08, (L.REASON_PERIODIC & 3) << 5]) + struct.pack("<I", 0x08001234)
+    body = (isync + bytes([0x88] * 8)) * 2
+    frames = b"".join(_mk_frame(body[:14], stream_id=1) for _ in range(40))
+    half = len(frames) // 2
+    spliced = frames[:half] + bytes([0x55, 0xAA, 0x12]) + frames[half:]
+    walk = L.tpiu_deframe_walk(spliced)
+    gph, _ = L.find_tpiu_phase(spliced)
+    glob = L.tpiu_deframe_hsync(spliced, gph)
+    wu = sum(1 for c in walk if L._classify(c) == "unknown") / max(1, len(walk))
+    gu = sum(1 for c in glob if L._classify(c) == "unknown") / max(1, len(glob))
+    assert wu <= gu + 1e-9
+

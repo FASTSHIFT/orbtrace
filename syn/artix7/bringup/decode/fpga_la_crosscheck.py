@@ -58,14 +58,15 @@ def deframe_raw(raw):
                 best = (fl, data)
     data = best[1]
 
-    # 3. TPIU deframe with per-window local frame phase. A single global phase
-    # is derailed by occasional corrupt ~1KB capture windows (which shift the
-    # frame boundary for the whole tail); local-phase deframing contains each
-    # bad window and recovers all clean regions (doc 15 §16/§17).
+    # 3. TPIU deframe with the seam-free continuous re-aligning walker. A
+    # single global phase is derailed by occasional corrupt ~1KB capture
+    # windows (which shift the frame boundary for the whole tail); the walker
+    # re-locks in place right after each bad window with no seam loss, matching
+    # the LA golden's ~0% on clean captures (doc 15 §18).
     if not L.has_tpiu_sync(data):
         return data, None
     ph, _ = L.find_tpiu_phase(data)            # report the dominant phase
-    return L.tpiu_deframe_local(data), ph
+    return L.tpiu_deframe_walk(data), ph
 
 
 def la_to_etm(dsl_path):
