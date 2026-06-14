@@ -310,11 +310,17 @@ always @(posedge clk) begin
 end
 
 // external readout addressing: base (from request bytes 0..1) + position.
-// Data starts at request position 2 (after the 2 base bytes), so by then
-// ext_base is fully latched and ext_addr is contiguous from `base`.
-//   reply[p] (p>=2) = source[ base + (p-2) ]
-// The PC sets base, then uses reply bytes 2.. as source[base..].
-wire [15:0] ext_pos = (golden_idx >= 16'd2) ? (golden_idx - 16'd2) : 16'd0;
+// Data starts at request position 2 (after the 2 base bytes). The CAP_RAW
+// BRAM read (`rrd`) has 1 cycle of latency, so the byte presented at beat
+// `idx` reflects the address driven at beat `idx-1`. To make
+//   reply[idx>=2] = source[ base + (idx-2) ]
+// we drive the read address ONE position AHEAD (compensate the read latency):
+//   ext_pos(j) = j-1   (for j>=1)
+// so the registered rrd lines up with the byte being emitted. Verified on the
+// SELFTEST ramp ground truth (doc 14 §30/§31). NOTE: this assumes back-to-back
+// readout beats (no mid-burst stall); trace_dump keeps an adaptive
+// drop-leading-duplicate safety net that is correct regardless of stalls.
+wire [15:0] ext_pos = (golden_idx >= 16'd1) ? (golden_idx - 16'd1) : 16'd0;
 assign ext_addr = ext_base + ext_pos;
 
 // GOLDEN pattern: a 4-byte TPIU full-sync prefix (FF FF FF 7F) ONCE at the

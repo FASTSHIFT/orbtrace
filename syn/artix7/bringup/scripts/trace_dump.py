@@ -59,14 +59,7 @@ def main():
     while base < a.depth:
         n = min(CHUNK, a.depth - base)
         try:
-            # Readout off-by-one fix: the FPGA's BRAM read has 1 cycle of
-            # latency, so the FIRST data byte of every reply repeats source[base]
-            # (a stale read). Request one extra byte at the front and discard it,
-            # so the assembled stream is contiguous and correct. (Verified on the
-            # SELFTEST ramp: removes the per-1024-byte duplicate that previously
-            # polluted every measurement — doc 14 §28.3/§30.)
-            chunk = req(s, a.ip, a.port, base, n + 1, a.timeout)
-            chunk = chunk[1:1 + n]
+            chunk = req(s, a.ip, a.port, base, n, a.timeout)
         except (socket.timeout, OSError) as e:
             print(f"ERROR at base {base}: {e}")
             return 2
