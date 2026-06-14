@@ -394,3 +394,39 @@ offset 8192 脏、9KB–21KB 干净、**22KB 又脏 10%**、之后恢复。即**
 - 固定 lead-in skip:**否决**(窗口可变,不可靠)。
 
 下一步:实现解码侧局部重锁 deframe,用 yield_test 验证良率→100%(按"可恢复字节数/锚点全中"判定)。
+
+
+## 15. 参考调研:类 ETM 信号 + 去帧重锁开源参考(sigrok arm_tpiu)
+
+### 15.1 ETM 并口的信号类比(采集层 / 去帧层)
+
+ETM 并口 = 源同步 + DDR + edge-aligned + 连续流 + TPIU 16 字节定长帧。最贴近的成熟领域:
+- **采集层**(DDR 并行流进 FPGA):= DDR SDRAM DQ/DQS 读、并行摄像头/LCD(PCLK+并行)。开源参考:
+  **LiteDRAM PHY 的读眼训练/per-bit deskew**(高速档 IDDR+IDELAY 扫眼的权威)、Xilinx XAPP585/524、
+  OV5640+以太网传图工程(github,与我们 trace→以太网链路同构)。
+- **去帧/重锁层**(连续流找帧边界、失锁重锁):= JESD204 frame alignment、8b/10b comma 对齐、HDMI word
+  align。直接同领域开源:**sigrok libsigrokdecode `arm_tpiu`**、OpenCSD deformatter、orbuculum。
+
+### 15.2 sigrok arm_tpiu 重锁机制(精读 decoders/arm_tpiu/pd.py)
+
+三个独立重同步机制:
+1. **gap reset**:字节间隔异常长(`ss-prevsample > byte_len`)→ 清空帧缓冲(对应 trace idle gap)。
+2. **独立 FSYNC 扫描(核心)**:滚动保留最后 4 字节,一旦 == `FF FF FF 7F`(FSYNC)无条件清空帧缓冲重新
+   对齐。注释:"Sync packets override everything else, so that we can regain sync even if some packets
+   are corrupted." ← 这就是"丢锁后重锁"的精髓,独立于 16 字节帧计数。
+3. 满 16 字节才 process_frame。
+
+### 15.3 适配我们的关键差异:无 FSYNC,但有密集 HSYNC
+
+实测我们的流(yt18 坏捕获):**FSYNC=0,HSYNC(FF 7F)=551 个**,间隔规律(62 的倍数)。
+→ sigrok 靠 FSYNC 重锁我们用不了,但 **HSYNC 可作帧相位锚点**(HSYNC 只落在 TPIU 帧内固定偶字节边界,
+其位置约束了帧 phase)。
+
+**我们的重锁策略(sigrok 思路的 HSYNC 变体)**:去帧时持续扫 HSYNC,用它校验/强制帧边界对齐;某段
+phase 与就近 HSYNC 指示不一致即判为失锁窗口,用 HSYNC 重新对齐,使局部脏窗口不污染其余。这直接对应
+§14 发现的"散布的可恢复脏窗口"。
+
+### 15.4 下一步
+
+实现 `etm35lib` 的 HSYNC 锚定局部重锁去帧(替代单一全局 phase 硬切),用 yield_test 验证良率→100%。
+高速档采集训练(>25MHz)留待后续,参考 LiteDRAM 读眼训练。
