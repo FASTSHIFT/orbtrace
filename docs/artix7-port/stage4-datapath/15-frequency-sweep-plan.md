@@ -288,3 +288,40 @@ A7 高速能力约为 ECP5 的 ~2×。
 - **结论**:A7 上限更高(~200–300MHz vs ECP5 ~150–200MHz);下限两者过采样都到 DC。差别在
   **A7 低频被迫过采样,ECP5 可 IDDR 一招通吃但上限低**。选 A7 用于"低速钉正确性 + 未来冲高速"是合理的,
   代价仅是低频自写过采样(已完成)。
+
+
+## 12. r16 红队评审后的实验(E1 做完,结果出乎意料)
+
+### 12.1 接受 r16 的核心批评
+
+- **SELFTEST 证过头**:test_clk 与 ref 同源固定相位,每次 re-arm 命中同一好相位桶 → 永远干净;且绕过
+  IDELAY(注入 test_data 而非 data_dly)、零 lane skew、50% 干净方波。它只证"FSM 对良性源+好相位无罪",
+  不证"对真实信号无罪"。承认。
+- **频率相关性证伪纯亚稳态**:1.3M~7-10% / 5.25M 更频繁 / 10.5M 几乎全坏 → 固定时间量 margin 随眼缩侵蚀。
+- **双峰需要 per-capture 锁定常量** → re-arm 相位竞态是头号嫌疑(还能解释 SELFTEST 为何永远干净)。
+
+### 12.2 E1 实测:per-capture clean-start(cap_clear)—— 没修好
+
+实现:每次软 re-arm 复位采样器的 seen_rise,强制每个捕获从全新上升沿开始,解耦"捕获起点 vs re-arm 时
+锁定的相位"。sim 字节级一致、146 测试过。
+
+板上 30 次 yield:**87% good / 13% bad**,与未改前(90-93%)无显著差异。
+
+**结论**:r16 的头号嫌疑(seen_rise 级的 re-arm 相位竞态)**被证否**。要么 re-arm 不是病根,要么相位
+竞态比 seen_rise 更深(采样器整条流水线相对 TRACECLK 的相位,不只是起始门)——但后者用 cap_clear 也
+该缓解却没缓解,所以更可能 re-arm 不是主因。
+
+### 12.3 软件版 E0 失败(印证 r16 警告)
+
+err_classify.py 想用 loop 周期性把坏捕获对齐到好捕获做逐 lane/逐 a-b 错误分类。但两个**不同会话**捕获
+在本地对齐窗口之后迅速 desync(69% 失配),per-lane 数被错位主导,不可信。**坐实 r16:E0 必须同会话 LA。**
+
+### 12.4 剩下的判别实验都需要硬件介入(交给用户)
+
+无硬件的实验已做尽(读出/CDC/glitch lockout/clean-start/EYE扫/SELFTEST/频率扫)。剩下能定锤的:
+- **E0(同会话 LA+FPGA 逐 nibble diff 分类)**:需 LA 接到 trace 线、与 FPGA 同时抓同一段。这是定性
+  "错误长相(偏 lane=skew / 偏 a-b=duty / 均匀=亚稳)"的唯一可靠手段。
+- **E2(物理回环 SELFTEST)**:FPGA 输出脚发干净 ramp → 短线回环 → trace 输入脚采。区分"FPGA I/O 路径
+  (IBUF/IDELAY/反射/duty)" vs "STM32 信号"。需接一根回环线。
+- **E3(FPGA 自测真实 TRACECLK 占空比)**:纯 RTL,加 ref 计数器测 FPGA 输入脚处 TRACECLK 高/低拍数
+  直方图——这个**我能自主做**,正面验证"FPGA 脚 duty ≠ LA 探头 duty"这个未验证前提。下一步优先做 E3。
