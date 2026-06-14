@@ -48,6 +48,14 @@ def main():
                    "span_ns": tb.span_ns(),
                    "n_etm_bytes": len(etm),
                    "times_ns": times_ns}, f)
+    # Also emit a compact binary the C++ side (orbetto/Mortrall) can mmap/read:
+    # one little-endian uint64 ns per ETM byte, in stream order. This is the
+    # 1:1 companion to the ETM bytes orbetto's TPIU deframer delivers.
+    import struct
+    binside = out_path + ".time.bin"
+    with open(binside, "wb") as f:
+        f.write(struct.pack(f"<{len(times_ns)}Q",
+                            *[int(round(t)) for t in times_ns]))
 
     # Report
     unk = sum(1 for c in etm if L._classify(c) == "unknown")
@@ -59,7 +67,7 @@ def main():
                      if times_ns[k] < times_ns[k - 1] - 1e-6)
         print(f"time: {times_ns[0]/1e3:.1f}..{times_ns[-1]/1e3:.1f} us "
               f"(span {span/1e3:.1f} us), non-decreasing violations: {nondec}")
-    print(f"wrote {out_path} + {side}")
+    print(f"wrote {out_path} + {side} + {binside}")
     return 0
 
 
