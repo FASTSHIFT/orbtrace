@@ -88,8 +88,7 @@ def measure(path):
                 best = (fl, data)
     data = best[1]
     if L.has_tpiu_sync(data):
-        ph, _ = L.find_tpiu_phase(data)
-        data = L.tpiu_deframe_hsync(data, ph)
+        data = L.tpiu_deframe_walk(data)    # seam-free continuous re-lock (doc 15 §18)
     syncs = L.find_isyncs(data)
     flash = [s for s in syncs if L.is_flash(s.addr)]
     unk = sum(1 for c in data if L._classify(c) == "unknown")
