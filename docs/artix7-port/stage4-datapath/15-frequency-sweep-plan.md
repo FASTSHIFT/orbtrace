@@ -673,3 +673,32 @@ orbetto/Mortrall 的时间戳 = `cycleCount × 1e9 / cps`(cps 来自 `-C`)。cyc
   方案 3/4。
 工具:`decode/perf_timecheck.py`(纯解析 .perf 时间戳)、`target/etm_enable_cycacc.cfg`(验证用,确认
 不支持)。
+
+
+## 23. 重大修正:ETM3.5 **支持** timestamp(我之前查错了特性)
+
+§22 的结论"本芯片 ETM 无时间基"**错了**。我把 **cycle-accurate(ETMCR bit[12])** 和 **timestamp
+(ETMCR bit[28])** 搞混了——它们是两个独立特性:
+
+| 特性 | ETMCR 使能位 | 支持指示 | 本芯片 |
+|------|-----------|---------|--------|
+| cycle-accurate(周期计数) | bit[12] | 写 bit12 读回 | **不支持**(读回 0)|
+| **timestamp(时间戳)** | **bit[28]** | **ETMCCER bit[22]/[28]** | **支持** ✓ |
+
+实证(IHI0014Q §7.7 + §3.5.41):
+- **ETMCCER = 0x18541800**:**bit[22]=1 且 bit[28]=1** → timestamping 已实现(bit29=0 → 48-bit TS 包)。
+- 之前 ETMCCER 读到 0 是**地址读错**(用了 0xE0041040,正确是 word offset 0x7A = 0xE00411E8)。
+- 置 ETMCR bit[28]:读回 **0x10000400**(stick,非 RAZ/WI)→ timestamp 可使能。
+- 开 timestamp 重抓(`target/etm_enable_ts.cfg`,ETMCR=0x10000980):流里**出现 11 个 timestamp 包**
+  (0x42 头,§7.7.4 T-Sync/timestamp),之前是 0。
+
+→ **ETM3.5 时间戳本就支持,只是 etm_enable.cfg 没开 bit[28]。** Perfetto 时间戳乱的根因是**没使能
+timestamp**,不是芯片不支持。§22 的"无原生时间基"作废。
+
+### 23.1 待办
+- 开 timestamp 后 unknown 升到 ~23%:timestamp 是多字节(头 0x42 + 连续值字节),我们的分类器把连续
+  字节当 unknown、walk 解码也要正确**消费** timestamp 包(§7.7.4 格式:1 头 + 最多 9 值字节,C 位续接)。
+  需在 etm35lib 加 timestamp 包解析(消费其长度),并把时间值喂给下游。
+- 喂 orbetto:orbetto 有 `_handleTSFromETM(cc)` 走 ETM 时间戳路径;确认 Mortrall 是否解 ETM3.5 TS 包
+  (它原本为 cycle-count 设计)。可能需让 orbetto/我们解析 TS → 设 cps = timestamp generator 时钟。
+- 标定时间值单位:48-bit timestamp 来自 timestamp generator(常为系统计数器),`-C` 要对应它的频率。
