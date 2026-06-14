@@ -702,3 +702,53 @@ timestamp**,不是芯片不支持。§22 的"无原生时间基"作废。
 - 喂 orbetto:orbetto 有 `_handleTSFromETM(cc)` 走 ETM 时间戳路径;确认 Mortrall 是否解 ETM3.5 TS 包
   (它原本为 cycle-count 设计)。可能需让 orbetto/我们解析 TS → 设 cps = timestamp generator 时钟。
 - 标定时间值单位:48-bit timestamp 来自 timestamp generator(常为系统计数器),`-C` 要对应它的频率。
+
+
+## 24. timestamp 包出来了但值恒为 0 → F429 无系统时间戳源(最终定论)
+
+开 timestamp(ETMCR bit28)后,正确对齐(swap=0,parity=0,order=1)解码:**0.00% unknown,39 个
+timestamp 包**——干净。但**所有 timestamp 值都是 0**。
+
+之前测到 23% unknown 是我 inline 脚本选错了 parity/order(latch 到 0x8080808 噪声"锚点");正确对齐
+下流是干净的,loop PC(0x08000fxx)全对。
+
+### 24.1 值恒为 0 的含义(查 ETM 文档 + M4 TRM + ROM 表实证)
+
+先厘清"时间源到底从哪来"这个问题(用户问:ARM 内核指令计数器?ETM 自带计数器?):
+
+- **不是 ARM 内核指令计数器**:M4 没有把执行的指令数喂给 ETM 当时间。
+- **不是 ETM 自带计数器**:ETM3.5 的 cycle-count(Cc)字段需要 cycle-accurate 模式,而 F429 的 ETM
+  **不实现** cycle-accurate(§22 实证:ETMCR bit12 写不进)。所以 ETM 自己也产不出时间。
+- **是 SoC 的独立时间戳生成器(TSGEN / CoreSight timestamp generator)**:一个自由运行的计数器,经
+  APB(CNTCONTROL)广播给所有 trace 源(ETM/ITM)。ETM 只是把这个**外部输入**打进 timestamp 包。
+
+文档依据:
+- IHI0014Q §7.7.4:"**A value of zero indicates that the timestamp is unknown.** This might also indicate
+  that the implementation does not fully support timestamping."
+- DDI0440C(M4 ETM TRM)§2.1.2:"**A system implementation may provide** a timestamp count which can be
+  used by several trace sources." → ETMCCER bit22=1 只表示 ETM 端**有能力接**,时间值本身是 SoC 输入。
+
+**ROM 表实证(决定性证据)**:读 CoreSight ROM 表 `0xE00FF000`,F429 只挂了 **6 个组件**——
+SCS(0xE000E000)、DWT(0xE0001000)、FPB(0xE0002000)、ITM(0xE0000000)、TPIU(0xE0040000)、
+ETM(0xE0041000)。**没有 TSGEN / CNTCONTROL 组件**。ARM 社区也实证过同级小 STM32(如 L433)不集成
+TSGEN。
+
+→ **结论:F429 根本没集成 TSGEN 硬件块。** 不是"timestamp 没使能"(没有寄存器可开),而是芯片物理上
+没有这个时间源。ETM timestamp 机制实现了(包能发)、bit28 能置位,但喂进来的时间输入恒为 0。
+M4 ETM 无 cycle-accurate(§22)+ SoC 无 TSGEN(本节,ROM 表实证)= **F429 上 ETM 拿不到 wall-clock,
+且无任何寄存器开关能改变这一点。**
+
+### 24.2 最终时间基方案:FPGA 采集端打时间戳(方案 4)
+
+既然源端给不了时间,**由我们 FPGA 采集端提供权威时间基**:用 ref_200m(5ns)在采集每个 trace 字节
+(或每个 TRACECLK 沿)时打一个计数器时间戳,与字节流一起存。这:
+- 完全绕开"F429 ETM 无时间源"的限制;
+- 是真实的采集 wall-clock(5ns 分辨率,远超需求);
+- 天然适配我们的架构(FPGA 已有 ref_200m + BRAM)。
+下游把"第 N 个 trace 字节 → 采集时间"映射进 Perfetto(替代 Mortrall 的 cycleCount 路径)。
+
+### 24.3 现状
+- 性能链路 ETM→指令流→Perfetto:**内容/顺序 100% 正确**;
+- 时间基:ETM 原生不可得(已彻底查清),**改由 FPGA 采集端提供**(待实现)。
+- timestamp 包解析已验证(能从流里提取,只是值为 0);etm_enable.cfg 是否常开 bit28 可选(值为 0 时
+  无意义,反而增加流量,**建议默认不开**,除非将来芯片有 TS 源)。
