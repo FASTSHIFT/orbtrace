@@ -32,7 +32,7 @@ def decode(raw):
     ph = None
     if L.has_tpiu_sync(data):
         ph, _ = L.find_tpiu_phase(data)
-        data = L.tpiu_deframe_hsync(data, ph)
+        data = L.tpiu_deframe_local(data)   # per-window local phase (doc 15 §17)
     return data, best[1], best[2], ph
 
 

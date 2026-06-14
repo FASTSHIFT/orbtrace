@@ -54,8 +54,7 @@ def measure(path):
                 best = (fl, data)
     data = best[1]
     if L.has_tpiu_sync(data):
-        ph, _ = L.find_tpiu_phase(data)
-        data = L.tpiu_deframe_hsync(data, ph)
+        data = L.tpiu_deframe_local(data)   # per-window local phase (doc 15 §17)
     unk = sum(1 for c in data if L._classify(c) == "unknown")
     return 100 * unk / max(1, len(data))
 

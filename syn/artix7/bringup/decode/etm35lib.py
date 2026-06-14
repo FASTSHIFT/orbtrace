@@ -552,6 +552,41 @@ def tpiu_deframe_hsync(stream: bytes, phase: int = 0,
     return bytes(out)
 
 
+def tpiu_deframe_local(stream: bytes, window: int = 5000,
+                       want_stream: "int | None" = None) -> bytes:
+    """Deframe with PER-WINDOW local frame phase (doc 15 §16/§17).
+
+    A single global TPIU phase cannot span an occasional corrupt ~1KB capture
+    window: the window inserts/drops bytes, shifting the 16-byte frame boundary
+    for the whole tail, so one bad window scores the entire capture ~10-14%
+    unknown. The nibble-pairing parity is CONSISTENT across the window (the
+    window is locally damaged but self-heals), so only the FRAME phase needs to
+    re-lock after each bad window.
+
+    This deframes in `window`-byte segments, each with its own best frame phase
+    (find_tpiu_phase), CONTAINING each dirty window's frame-shift to that
+    window. Worst-case captures improve from ~14% to a few %, with all program
+    anchors recovered. KNOWN LIMITATION: a frame is lost at each window seam
+    (~1.5% floor even on otherwise-clean captures); a seam-free continuous
+    re-aligning walker is future work (doc 15 §17). Use on an already-correctly
+    -assembled stream (globally-best parity/order).
+    """
+    out = bytearray()
+    n = len(stream)
+    if n < 32:
+        ph, _ = find_tpiu_phase(stream)
+        return tpiu_deframe_hsync(stream, ph, want_stream)
+    st = 0
+    while st < n:
+        seg = stream[st:st + window]
+        if len(seg) < 32:
+            break
+        ph, _ = find_tpiu_phase(seg)
+        out += tpiu_deframe_hsync(seg, ph, want_stream)
+        st += window
+    return bytes(out)
+
+
 def find_tpiu_phase(stream: bytes, scorer=None) -> "tuple[int, int]":
     """Try all 16 TPIU frame start phases; return (best_phase, score). Default
     scorer = number of flash-range Normal I-sync anchors in the deframed
@@ -566,6 +601,7 @@ def find_tpiu_phase(stream: bytes, scorer=None) -> "tuple[int, int]":
         if score > best[1]:
             best = (ph, score)
     return best
+
 
 
 # ----------------------------------------------------------------------------
