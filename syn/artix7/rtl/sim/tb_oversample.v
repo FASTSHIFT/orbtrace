@@ -46,6 +46,7 @@ module tb_oversample;
         .trace_clk_p(trace_clk_p), .trace_data_p(trace_data_p),
         .tap_data0(5'd16), .tap_data1(5'd16), .tap_data2(5'd16), .tap_data3(5'd16),
         .tap_load(1'b0),
+        .test_en(1'b0), .test_clk(1'b0), .test_data(4'b0),
         .trace_clk(trace_clk), .trace_a(trace_a), .trace_b(trace_b),
         .idelayctrl_rdy(idelayctrl_rdy)
     );

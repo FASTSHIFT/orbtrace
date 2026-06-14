@@ -29,12 +29,22 @@ module trace_stream_top #(
                                       // run orbtrace TPIUSync/TPIUDemux on the
                                       // true pin stream and settle whether the
                                       // STM32 formatter framing is present.
-    parameter       EYE = 4           // OVERSAMPLE mid-eye delay (ref_200m
+    parameter       EYE = 4,          // OVERSAMPLE mid-eye delay (ref_200m
                                       // cycles after a TRACECLK edge before
                                       // latching). 5 ns/cycle; half-bit at
                                       // /64 (~1.3 MHz) is ~380 ns (~76 cyc) so
                                       // ~38 is dead-centre. Swept on-board to
                                       // find the lowest bit-error point.
+    parameter       SELFTEST = 0      // 1: feed the OVERSAMPLE sampler an
+                                      // FPGA-internal, asynchronous (phy_rx_clk
+                                      // domain), clean edge-aligned pseudo-trace
+                                      // (DDR ramp +7 mod 16 per edge) instead of
+                                      // the physical pins. Isolates async
+                                      // sampling-architecture faults from
+                                      // physical SI (red-team r15 E1). The
+                                      // captured stream must be an exact +7
+                                      // mod-16 ramp; any deviation = the async
+                                      // oversampling architecture itself errs.
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -90,6 +100,40 @@ module trace_stream_top #(
     wire [7:0]  cap_byte;
     wire        cap_valid;
 
+    // ---- SELFTEST pseudo-trace generator (async to ref_200m) ----------
+    // Runs in the phy_rx_clk domain (125 MHz, recovered from the PHY — a
+    // genuinely independent oscillator vs the MMCM-derived ref_200m, so the
+    // TRACECLK/ref phase beats exactly like the real STM32 source). Produces a
+    // clean edge-aligned DDR stream: a half-bit clock (~1 MHz after /64) and a
+    // 4-bit value that advances +7 (mod 16) on EVERY clock edge. Edge-aligned
+    // (data changes on the clock edge), matching the STM32 TPIU. +7 is coprime
+    // to 16 so every nibble is distinct over 16 edges, and a dropped/duplicated
+    // edge shows up as a +14/+0 step instead of +7 — trivially detectable
+    // offline with zero cross-session alignment.
+    wire        st_clk;
+    wire [3:0]  st_data;
+    generate
+    if (SELFTEST) begin : g_selftest
+        reg [6:0] st_div = 0;      // /64 of phy_rx_clk*2-edges -> ~1 MHz half-bit
+        reg       st_clk_r = 0;
+        reg [3:0] st_val = 0;
+        always @(posedge phy_rx_clk) begin
+            if (st_div == 7'd63) begin
+                st_div   <= 0;
+                st_clk_r <= ~st_clk_r;   // toggle => one trace edge
+                st_val   <= st_val + 4'd7;  // advance on every (DDR) edge
+            end else begin
+                st_div <= st_div + 1'b1;
+            end
+        end
+        assign st_clk  = st_clk_r;
+        assign st_data = st_val;
+    end else begin : g_nost
+        assign st_clk  = 1'b0;
+        assign st_data = 4'b0;
+    end
+    endgenerate
+
     reg [3:0] ld_sync = 4'h0;
     reg       loaded  = 1'b0;
     reg       tap_load = 1'b0;
@@ -107,6 +151,7 @@ module trace_stream_top #(
         .trace_clk_p(trace_clk_in), .trace_data_p(trace_data_in),
         .tap_data0(TAP), .tap_data1(TAP), .tap_data2(TAP), .tap_data3(TAP),
         .tap_load(tap_load),
+        .test_en(SELFTEST[0]), .test_clk(st_clk), .test_data(st_data),
         .trace_clk(trace_clk), .trace_a(trace_a), .trace_b(trace_b),
         .cap_byte(cap_byte), .cap_valid(cap_valid),
         .idelayctrl_rdy(idelayctrl_rdy)

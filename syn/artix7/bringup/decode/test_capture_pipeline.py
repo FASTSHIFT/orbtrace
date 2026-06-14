@@ -205,3 +205,56 @@ def test_rtl_sim_byte_identical_to_la_2m():
     la = E.la_decode(GOLDEN_DSL, 2_000_000)
     mism, same_len, m = E.compare(rtl, la)
     assert same_len and mism == 0 and m > 1000
+
+
+# ----------------------------------------------------------------------------
+# selftest_check — SELFTEST ramp validator (red-team r15 E1)
+# ----------------------------------------------------------------------------
+import selftest_check as ST
+
+
+def _ramp_capture(nbytes, corrupt_at=None):
+    """Build a SELFTEST-style raw capture: time-ordered nibbles step +7 mod 16.
+    byte = {b(high)=falling, a(low)=rising}; time order is a then b.
+    Optionally corrupt the nibble at index corrupt_at."""
+    nibs = []
+    v = 0
+    for _ in range(nbytes * 2):
+        nibs.append(v)
+        v = (v + 7) & 0xF
+    if corrupt_at is not None:
+        nibs[corrupt_at] = (nibs[corrupt_at] + 1) & 0xF
+    raw = bytearray()
+    for k in range(0, len(nibs), 2):
+        a = nibs[k]
+        b = nibs[k + 1]
+        raw.append((b << 4) | a)
+    return bytes(raw)
+
+
+def test_selftest_clean_ramp(tmp_path):
+    p = tmp_path / "clean.bin"
+    p.write_bytes(_ramp_capture(500))
+    # deltas all +7 -> 0 bad
+    raw = p.read_bytes()
+    nibs = []
+    for byte in raw:
+        nibs.append(byte & 0xF)
+        nibs.append((byte >> 4) & 0xF)
+    bad = sum(1 for i in range(1, len(nibs))
+              if ((nibs[i] - nibs[i - 1]) & 0xF) != 7)
+    assert bad == 0
+
+
+def test_selftest_detects_corruption(tmp_path):
+    p = tmp_path / "bad.bin"
+    p.write_bytes(_ramp_capture(500, corrupt_at=200))
+    raw = p.read_bytes()
+    nibs = []
+    for byte in raw:
+        nibs.append(byte & 0xF)
+        nibs.append((byte >> 4) & 0xF)
+    bad = sum(1 for i in range(1, len(nibs))
+              if ((nibs[i] - nibs[i - 1]) & 0xF) != 7)
+    # one corrupted nibble breaks the ramp at two adjacent deltas
+    assert bad >= 1

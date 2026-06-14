@@ -83,6 +83,17 @@ module trace_capture_a7 #(
     input  wire [4:0]  tap_data3,
     input  wire        tap_load,
 
+    // --- Self-test injection (red-team E1, doc r15) ---------------------
+    // When test_en=1, the OVERSAMPLE sampler takes its clock + data from
+    // test_clk/test_data (driven by an FPGA-internal generator in a DIFFERENT,
+    // asynchronous clock domain) instead of the physical trace pins. This
+    // exercises the full async oversampling architecture with CLEAN edges and
+    // NO signal-integrity / IDELAY effects, isolating "async sampling
+    // architecture" faults from physical SI. Tied to 0 in normal capture.
+    input  wire        test_en,
+    input  wire        test_clk,
+    input  wire [3:0]  test_data,
+
     // Captured outputs to traceIF
     output wire        trace_clk,
     output wire [3:0]  trace_a,      // rising-edge sample
@@ -228,11 +239,16 @@ module trace_capture_a7 #(
         // ----------------------------------------------------------------
 
         // Synchronise TRACECLK (raw IBUF) and the 4 data lanes into ref_200m.
+        // Self-test (test_en) swaps in an FPGA-internal async clean source
+        // BEFORE the synchroniser, so the full async oversampling path is
+        // exercised with no physical-pin / IDELAY / SI effects (doc r15 E1).
+        wire       os_clk_src  = test_en ? test_clk  : trace_clk_ibuf;
+        wire [3:0] os_data_src = test_en ? test_data : data_dly;
         reg [2:0] tck_sync = 3'b0;
         reg [3:0] d_s0 = 4'b0, d_s1 = 4'b0;
         always @(posedge ref_200m) begin
-            tck_sync <= {tck_sync[1:0], trace_clk_ibuf};
-            d_s0 <= data_dly;
+            tck_sync <= {tck_sync[1:0], os_clk_src};
+            d_s0 <= os_data_src;
             d_s1 <= d_s0;
         end
         wire tck_s    = tck_sync[2];
