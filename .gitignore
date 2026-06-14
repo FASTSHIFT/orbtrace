@@ -43,3 +43,7 @@ xelab.pb
 xvlog.pb
 xsim.pb
 syn/artix7/*.v.bak
+
+# Local OpenCSD CLI build artifact (190MB, do not commit — exceeds GitHub limit)
+*.ppl
+trc_pkt_lister.ppl
