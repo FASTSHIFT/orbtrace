@@ -232,12 +232,25 @@ module trace_stream_top #(
             if (sys_rst || cap_rearm)  rwr <= 0;   // soft re-arm via CSR :5002
             else if (cap_valid && !rfull)  rwr <= rwr + 1'b1;
         end
+        // Capture-generation counter: increments on every soft re-arm so the
+        // PC can confirm it is reading a FRESH capture (poll until gen changed
+        // AND full=1) rather than a stale buffer. Crucial at high TRACECLK
+        // where a naive re-arm+read races (doc 15 §7/§8). Synced to clk125 for
+        // the readout-byte mux.
+        reg [7:0] cap_gen200 = 8'd0;
+        always @(posedge clk200) if (cap_rearm) cap_gen200 <= cap_gen200 + 1'b1;
+        reg [7:0] cap_gen_s0 = 0, cap_gen_125 = 0;
+        always @(posedge clk125) begin
+            cap_gen_s0  <= cap_gen200;
+            cap_gen_125 <= cap_gen_s0;
+        end
         reg [7:0] rrd;
         always @(posedge clk125) rrd <= rawmem[ext_addr[RAW_AW-1:0]];
         assign ext_data = (ext_addr < NB)        ? rrd :
                           (ext_addr == NB+0)     ? NB[7:0] :
                           (ext_addr == NB+1)     ? NB[15:8] :
-                          (ext_addr == NB+2)     ? {7'b0, rfull} : 8'h00;
+                          (ext_addr == NB+2)     ? {7'b0, rfull} :
+                          (ext_addr == NB+3)     ? cap_gen_125 : 8'h00;
         assign led1 = ~rfull;
     end else begin : g_frame
         // ---- traceIF 16-byte frame capture (default) ----

@@ -250,17 +250,41 @@ module trace_capture_a7 #(
         // exercised with no physical-pin / IDELAY / SI effects (doc r15 E1).
         wire       os_clk_src  = test_en ? test_clk  : trace_clk_ibuf;
         wire [3:0] os_data_src = test_en ? test_data : data_dly;
-        reg [2:0] tck_sync = 3'b0;
+        reg [2:0] tck_sync = 3'b0;        // 3-FF async synchroniser
         reg [3:0] d_s0 = 4'b0, d_s1 = 4'b0;
         always @(posedge ref_200m) begin
             tck_sync <= {tck_sync[1:0], os_clk_src};
             d_s0 <= os_data_src;
             d_s1 <= d_s0;
         end
+
+        // ----------------------------------------------------------------
+        // Spurious-edge lockout (doc 15 §9 fix). The intermittent ~20%
+        // bad-capture rate came from occasional SPURIOUS extra TRACECLK edges
+        // (metastability / ringing crossing the synchroniser): one extra edge
+        // inserts a nibble and permanently shifts the DDR pairing + byte
+        // boundary, corrupting the rest of the capture ("clean region then
+        // dirty to end" signature). Fix: after accepting an edge, ignore any
+        // further edge for LOCKOUT ref cycles. Real TRACECLK edges are a
+        // half-bit apart (76 ref cycles @1.3MHz), far longer than any glitch,
+        // so a short lockout rejects glitches WITHOUT dropping real edges.
+        // (Unlike a hold-based de-bounce, a lockout cannot delay/drop a real
+        // edge — it only suppresses a too-soon second one.)
+        // ----------------------------------------------------------------
         wire tck_s    = tck_sync[2];
-        wire tck_prev = tck_sync[1];   // value one ref cycle earlier (already synced)
-        wire rise_evt = tck_s & ~tck_prev;
-        wire fall_evt = ~tck_s & tck_prev;
+        wire tck_prev = tck_sync[1];
+        wire raw_rise = tck_s & ~tck_prev;
+        wire raw_fall = ~tck_s & tck_prev;
+        localparam [4:0] LOCKOUT = 5'd4;   // 4 ref cycles = 20ns min edge spacing
+        reg [4:0] lock_cnt = 5'd0;
+        wire locked = (lock_cnt != 0);
+        always @(posedge ref_200m) begin
+            if (rst) lock_cnt <= 0;
+            else if ((raw_rise | raw_fall) & ~locked) lock_cnt <= LOCKOUT;
+            else if (locked) lock_cnt <= lock_cnt - 1'b1;
+        end
+        wire rise_evt = raw_rise & ~locked;
+        wire fall_evt = raw_fall & ~locked;
 
         // EYE delay actually used: runtime override if nonzero, else the
         // EYE_DELAY parameter default. 8-bit counters cover up to 255 ref

@@ -46,14 +46,27 @@ def set_eye(ip, eye):
                    capture_output=True, text=True)
 
 
+def read_gen(ip, depth=61440):
+    """Read the current capture-generation counter (status-only)."""
+    r = subprocess.run(["python3", os.path.join(HERE, "trace_dump.py"),
+                        "--ip", ip, "--depth", str(depth), "--status-only"],
+                       capture_output=True, text=True)
+    for tok in r.stdout.split():
+        if tok.startswith("gen="):
+            return int(tok.split("=")[1])
+    return None
+
+
 def rearm(ip):
     subprocess.run(["python3", os.path.join(HERE, "trace_ctrl.py"),
                     "--ip", ip, "rearm"], capture_output=True, text=True)
 
 
-def dump(ip, out, depth=61440):
+def dump(ip, out, prev_gen, depth=61440):
+    """Re-arm then dump a CONFIRMED-FRESH capture (gen advanced + full)."""
     subprocess.run(["python3", os.path.join(HERE, "trace_dump.py"),
-                    "--ip", ip, "--depth", str(depth), "-o", out],
+                    "--ip", ip, "--depth", str(depth), "-o", out,
+                    "--prev-gen", str(prev_gen)],
                    capture_output=True, text=True)
 
 
@@ -108,9 +121,10 @@ def main():
             set_eye(a.ip, eye)
             unks, anchors, strays = [], [], []
             for r in range(a.repeat):
+                prev_gen = read_gen(a.ip, a.depth)
                 rearm(a.ip)
                 out = f"/tmp/sweep_d{div}_e{eye}_r{r}.bin"
-                dump(a.ip, out, a.depth)
+                dump(a.ip, out, prev_gen if prev_gen is not None else 0, a.depth)
                 try:
                     u, fa, st = measure(out)
                 except Exception as e:

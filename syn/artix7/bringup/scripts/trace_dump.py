@@ -30,6 +30,18 @@ def req(sock, ip, port, base, n, timeout):
     return data[2:2 + n]
 
 
+def read_status(s, ip, port, depth, timeout):
+    """Read (dev_depth, full, gen) from the status region at addr=depth.
+    The status bytes come from a combinational mux (NOT the BRAM `rrd`), so
+    unlike the data region they have NO leading-duplicate latency artifact —
+    read them directly."""
+    st = req(s, ip, port, depth, 4, timeout)
+    dev_depth = st[0] | (st[1] << 8)
+    full = st[2] & 1
+    gen = st[3]
+    return dev_depth, full, gen
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ip", default="192.168.10.42")
@@ -37,20 +49,37 @@ def main():
     ap.add_argument("--depth", type=int, default=16384)
     ap.add_argument("-o", "--out", default="trace.bin")
     ap.add_argument("--timeout", type=float, default=2.0)
+    ap.add_argument("--prev-gen", type=int, default=None,
+                    help="wait until capture generation != PREV_GEN and full=1 "
+                         "(confirms a FRESH capture after a soft re-arm)")
+    ap.add_argument("--wait", type=float, default=3.0,
+                    help="max seconds to wait for a fresh full capture")
+    ap.add_argument("--status-only", action="store_true",
+                    help="print DEPTH/full/gen and exit (no data read)")
     a = ap.parse_args()
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(a.timeout)
 
-    # read status (DEPTH, full) at addr depth..depth+2
+    # read status (DEPTH, full, gen) at addr depth..depth+3
     try:
-        st = req(s, a.ip, a.port, a.depth, 4, a.timeout)
-        dev_depth = st[0] | (st[1] << 8)
-        full = st[2] & 1
-        print(f"  device DEPTH={dev_depth}  full={full}")
+        dev_depth, full, gen = read_status(s, a.ip, a.port, a.depth, a.timeout)
+        # If asked, wait for a FRESH capture: generation advanced AND full.
+        if a.prev_gen is not None:
+            import time
+            t0 = time.time()
+            while time.time() - t0 < a.wait:
+                if gen != (a.prev_gen & 0xFF) and full:
+                    break
+                time.sleep(0.02)
+                dev_depth, full, gen = read_status(s, a.ip, a.port,
+                                                   a.depth, a.timeout)
+        print(f"  device DEPTH={dev_depth}  full={full}  gen={gen}")
     except (socket.timeout, OSError) as e:
         print(f"ERROR reading status: {e}")
         return 2
+    if a.status_only:
+        return 0
     if not full:
         print("  WARNING: capture buffer not full yet (still filling or no sync).")
 
