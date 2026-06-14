@@ -557,3 +557,39 @@ TRACECLK = HCLK/2,HCLK = 168MHz/DIV。每点多次重复 + gen 确认新捕获 +
 
 当前 EYE 是运行时 CSR 但要手动给值。可加一个"按检测到的 TRACECLK 半位自动设 EYE=半位/3"的逻辑
 (用 §13 的 dwell 测量得到半位),省去每频率手扫。
+
+
+## 20. 性能链路打通:ETM 指令流 → Perfetto(orbetto/Mortrall)
+
+目标:把低速已解出的指令流接到可视化/性能分析后端,链路打通后剩下就是提性能。
+
+### 20.1 选型:Auterion orbetto / Mortrall
+
+`embedded-debug-tools/ext/orbetto`(平级 clone)。关键发现:它的 `mortrall.hpp` 就是**并口 ETM 指令
+trace → Perfetto CallStack** 解码器(基于 orbuculum mortem 改),正是我们需要的下游。硬件经验也和我们
+一致(去 LED、lane 不等长、"<100MHz 才行")。**与我们 ETM 并口链路天然契合,不用自写 Perfetto 后端。**
+
+### 20.2 接入(三个适配点)
+
+1. **构建**:meson + ninja,子项目(orbuculum/libdwarf/croaring/perfetto)自动拉,已编出 `build/orbetto`。
+2. **ETM 协议**:Mortrall `_init()` upstream **硬编码 ETM4**(其 F765/H7 目标),而 STM32F429 是
+   **ETMv3.5**。改成 `TRACE_PROT_ETM35`(解码体本就支持 ETM35 disposition 模型)。
+3. **ELF device hint**:`Device()` 要求 ELF 名含已知 hint(v5x/nuttx…)否则 assert,ELF 名加 `nuttx`。
+4. **TPIU 封装**:orbetto 用 `-t 2` 走自带 TPIU 去帧,路由 stream-id 2 → ETM;但它需要 **FSYNC** 锁帧,
+   而我们的流只有 HSYNC 无 FSYNC → 它锁不住。解法:`decode/etm_to_tpiu.py` 把我们**已去帧的干净 ETM
+   字节**重新封成带 FSYNC、stream-2 的 TPIU 帧喂进去(绕开 orbetto 锁不住的部分,复用我们已验证的去帧)。
+
+### 20.3 结果(链路通)
+
+金标准 ETM(818 锚点)→ etm_to_tpiu → orbetto -t 2:
+- 之前(ETM4 init / 无 FSYNC):**PC bitmap cardinality = 0**(没解出)。
+- 修后(ETM35 + 重封装):**PC bitmap cardinality = 29**,`orbetto.perf` = **5.9MB** Perfetto 数据。
+
+→ **完整链路打通**:STM32 ETM → FPGA 4-bit DDR 采集 → 去帧/walk 重组 → TPIU 重封装 → orbetto/Mortrall
+(ETM3.5)→ Perfetto。29 个不同 PC 与 proj_add 循环规模吻合。.perf 可拖进 perfetto UI。
+
+### 20.4 待办
+- 验证 29 个 PC 与已知 loop_sum/add 地址逐一对上(确认非乱码)。
+- 用真实 FPGA 抓的流(非 LA 金标准)跑通同一链路。
+- CallStack 线程视图是 NuttX 专属,我们裸机循环用不到;指令/PC 时间线通用,够用。
+- 上游差异(ETM35 init、device hint、FSYNC 封装)记为 fork orbetto 的改动点。
