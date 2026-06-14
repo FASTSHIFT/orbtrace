@@ -293,7 +293,33 @@ def test_walk_matches_hsync_on_clean_stream():
     assert len(walk) > 0
 
 
-def test_walk_recovers_after_inserted_garbage_window():
+def test_walk_offsets_match_bytes_and_are_monotonic():
+    # The offset-tracking walker must yield IDENTICAL bytes to the plain walker
+    # and per-byte source offsets that are within range and non-decreasing
+    # (frames are consumed left-to-right). This is the FPGA-time bridge
+    # (doc 15 §24.2): each decoded ETM byte -> the RAW capture byte it came from.
+    payload = bytes(range(0x80, 0x80 + 14))
+    frame = _mk_frame(payload, stream_id=1)
+    stream = frame * 8
+    walk = L.tpiu_deframe_walk(stream)
+    out, offs = L.tpiu_deframe_walk_offsets(stream)
+    assert bytes(out) == bytes(walk)
+    assert len(offs) == len(out)
+    assert all(0 <= o < len(stream) for o in offs)
+    assert all(offs[k] <= offs[k + 1] for k in range(len(offs) - 1))
+
+
+def test_walk_offsets_select_stream():
+    # With want_stream set, offsets must align 1:1 with the selected payload.
+    payload = bytes(range(0x10, 0x10 + 14))
+    frame = _mk_frame(payload, stream_id=2)
+    stream = frame * 4
+    out, offs = L.tpiu_deframe_walk_offsets(stream, want_stream=2)
+    assert len(out) == len(offs) > 0
+    assert all(offs[k] <= offs[k + 1] for k in range(len(offs) - 1))
+
+
+
     # Long clean framed stream + a 3-byte garbage burst spliced mid-stream
     # (shifts the frame boundary). Walker must be at least as clean as a single
     # global phase (which derails on the tail).

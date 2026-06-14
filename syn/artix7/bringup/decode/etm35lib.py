@@ -647,6 +647,103 @@ def tpiu_deframe_walk(stream: bytes, want_stream: "int | None" = None,
     return bytes(out)
 
 
+def tpiu_deframe_walk_offsets(stream: bytes, want_stream: "int | None" = None,
+                              check_frames: int = 6, bad_thresh: float = 0.30,
+                              scan: int = 48):
+    """Like tpiu_deframe_walk but ALSO returns, per output byte, the SOURCE
+    byte offset in `stream` it was extracted from. Returns (out, offsets) where
+    offsets[k] is the index into `stream` of the TPIU slot that produced out[k].
+
+    This is the bridge for the FPGA capture-time base (doc 15 §24.2): the FPGA
+    timestamps RAW capture bytes, so to put a wall-clock on a DECODED ETM byte
+    we must know which RAW (pre-deframe) byte it came from. The frame's data
+    slots map 1:1 to source positions, so we record the source index as each
+    payload byte is emitted.
+    """
+    n = len(stream)
+
+    def decode_frame_off(frame, fsrc, cur, out, offs):
+        # fsrc[j] = source index of frame[j]; mirrors _decode_frame16.
+        aux = frame[15]
+        for j in range(15):
+            if j % 2 == 0:
+                if frame[j] & 1:
+                    cur = frame[j] >> 1
+                else:
+                    b = frame[j] | ((aux >> (j // 2)) & 1)
+                    if want_stream is None or cur == want_stream:
+                        out.append(b)
+                        offs.append(fsrc[j])
+            else:
+                if want_stream is None or cur == want_stream:
+                    out.append(frame[j])
+                    offs.append(fsrc[j])
+        return cur
+
+    def next_frame_off(i):
+        frame = []
+        fsrc = []
+        while i < n:
+            if stream[i] == 0xFF and i + 1 < n and stream[i + 1] == 0x7F:
+                i += 2
+                continue
+            if (i + 3 < n and stream[i] == 0xFF and stream[i + 1] == 0xFF
+                    and stream[i + 2] == 0xFF and stream[i + 3] == 0x7F):
+                i += 4
+                continue
+            frame.append(stream[i])
+            fsrc.append(i)
+            i += 1
+            if len(frame) == 16:
+                return frame, fsrc, i
+        return None, None, i
+
+    def quality_ahead(pos, frames):
+        tmp = bytearray()
+        cur = 0
+        i = pos
+        for _ in range(frames):
+            fr, _fs, i = next_frame_off(i)
+            if fr is None:
+                break
+            cur = _decode_frame16(fr, cur, tmp, None)
+        if not tmp:
+            return 1.0, i
+        unk = sum(1 for c in tmp if _classify(c) == "unknown")
+        return unk / len(tmp), i
+
+    if n < 32:
+        ph, _ = find_tpiu_phase(stream)
+        out = bytearray(tpiu_deframe_hsync(stream, ph, want_stream))
+        offs = [min(n - 1, (k * n) // max(1, len(out))) for k in range(len(out))]
+        return bytes(out), offs
+
+    phase, _ = find_tpiu_phase(stream[:min(n, 20000)])
+    out = bytearray()
+    offs = []
+    cur = 0
+    i = phase
+    while i < n:
+        frac, _ = quality_ahead(i, check_frames)
+        if frac > bad_thresh:
+            best = (frac, i)
+            for off in range(1, scan):
+                if i + off >= n:
+                    break
+                f2, _ = quality_ahead(i + off, check_frames)
+                if f2 < best[0]:
+                    best = (f2, i + off)
+                    if f2 <= 0.02:
+                        break
+            if best[1] != i and best[0] < frac:
+                i = best[1]
+        fr, fsrc, i = next_frame_off(i)
+        if fr is None:
+            break
+        cur = decode_frame_off(fr, fsrc, cur, out, offs)
+    return bytes(out), offs
+
+
 def tpiu_deframe_local(stream: bytes, window: int = 5000,
                        want_stream: "int | None" = None) -> bytes:
     """Deframe with PER-WINDOW local frame phase (doc 15 §16/§17).

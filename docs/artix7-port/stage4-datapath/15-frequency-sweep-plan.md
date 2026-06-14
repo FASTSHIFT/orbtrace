@@ -752,3 +752,54 @@ M4 ETM 无 cycle-accurate(§22)+ SoC 无 TSGEN(本节,ROM 表实证)= **F429 上
 - 时间基:ETM 原生不可得(已彻底查清),**改由 FPGA 采集端提供**(待实现)。
 - timestamp 包解析已验证(能从流里提取,只是值为 0);etm_enable.cfg 是否常开 bit28 可选(值为 0 时
   无意义,反而增加流量,**建议默认不开**,除非将来芯片有 TS 源)。
+
+
+## 25. FPGA 采集端时间戳(方案 4 实现 + 实测)
+
+§24.2 的方案落地:既然 F429 ETM 给不了 wall-clock,由 FPGA 采集端提供权威时间基。**实测打通,真实硬件
+0.000% unknown、时间轴零非单调。**
+
+### 25.1 RTL(trace_stream_top.v,CAP_RAW 路径)
+
+- **自由运行计数器** `cap_clk_cnt`:clk200(ref_200m,5ns/tick)域,每个 ref 周期 +1,软 re-arm 清零。
+  这是真实采集 wall-clock,**与目标 TRACECLK 频率无关**——我们给字节打时间,不假设字节速率。
+- **稀疏快照表** `tsmem`:每采集 `TS_STRIDE`(256)个 RAW 字节,把 `cap_clk_cnt` 快照进一格
+  (distributed RAM,DEPTH=60KB → 241 格 × 4B ≈ 964B)。为什么稀疏而非首尾两点?**TRACECLK 会中途空闲**
+  (目标不发数据时的长 0 区);首尾线性模型会把暂停"抹平"到整段。每 256B 一个真实时间快照,使暂停在它
+  实际发生的位置体现为时间间隙(stride 粒度)。
+- **读出**:UDP :5001 在数据区/状态区之后开了两块——
+  - `NB+26..32`:元数据(stride_log2、表格条目数 n、最后一字节的 tick)。
+  - `NB+64 .. NB+64+4n`:快照表(每格小端 u32)。
+  读出与数据区同样有 1 拍 BRAM 延迟;**字节车道选择器 `ts_lane_d` 必须和 `tsrd` 一起延 1 拍**,否则
+  车道与锁存的字相互错位(第一版就是这个 bug:tick 表出现周期-3/4 的乱序;延拍后 0 乱序)。
+- 时序:WNS=0.206ns,THS=0,0 errors。bit 存为 `build/trace_stream_ts.bit`。
+
+### 25.2 PC 侧
+
+- `scripts/trace_dump.py --timebase`:抓数据后再读元数据+快照表,写边车文件 `<out>.ts.json`
+  (`{stride, n, tick_ns, last_tick, ticks[]}`)。
+- `decode/fpga_timebase.py` `TimeBase`:把边车表插值成"任意 RAW 字节索引 → wall-clock ns"。
+  处理 32-bit 计数器回绕(>21.5s 才回绕,正常不触发)、尾部插值到最后一字节、skip 偏移。8 个单测。
+- `decode/etm35lib.py` `tpiu_deframe_walk_offsets`:在无缝行走去帧的同时,记录每个输出 ETM 字节来自哪个
+  RAW 源字节偏移(数据槽与源位置 1:1)。2 个单测。
+- `decode/etm_with_time.py`:串起来——RAW 抓取 + 边车 → 去帧(带偏移)→ 每个 ETM 字节的 wall-clock 数组
+  `<out>.time.json`。这是替代 Mortrall cycleCount 路径、给 Perfetto 真实时间轴的桥。
+
+### 25.3 实测(/64,TRACECLK≈1.31MHz)
+
+```
+trace_dump --timebase : 241 snapshots @ every 256 B, span 49928 us
+tick 表               : 0 decreasing, 每 256B 均匀 ~39006 ticks
+                        = 195us/256B = 762ns/byte —— 与 /64 DDR 单字节/TRACECLK 周期吻合
+etm_with_time         : 61440 RAW -> 39943 ETM bytes, unknown 0.000%
+                        time 4.6..46799.8 us, 非单调违规 0
+```
+
+频率自适应验证:同一码流换 DIV 档位时,762ns/byte 这个数会随 TRACECLK 自动变化(慢则每字节 tick 多、
+快则少),无需改任何参数——因为我们测的是真实采集时间,这正是方案 4 相对"假设字节速率"的优势。
+
+### 25.4 待接(下一步)
+
+把 `<out>.time.json` 喂进 orbetto/Mortrall,用 FPGA 时间替换 `cpu.cycleCount` 路径
+(`_handleTSFromETM`/`_flush_proto_buffer` 的 ns 计算),让 Perfetto slice 落在真实 wall-clock 上。
+RTL+PC 解码侧时间基已就绪且实测干净;剩下是 Mortrall 注入点改造。

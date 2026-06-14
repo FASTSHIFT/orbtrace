@@ -42,6 +42,43 @@ def read_status(s, ip, port, depth, timeout):
     return dev_depth, full, gen
 
 
+def read_timebase(s, ip, port, depth, timeout):
+    """Read the FPGA capture-time base (doc 15 §24.2).
+
+    Metadata lives just past the status region; the per-stride snapshot table
+    starts at depth+64. Returns a dict:
+      stride      : captured-byte interval between snapshots (1<<stride_log2)
+      n           : number of table entries
+      tick_ns     : ns per ref_200m tick (5.0)
+      last_tick   : ref tick at the last captured byte (for the tail)
+      ticks       : list[n] of ref_200m counter snapshots (one per stride bytes)
+
+    The table read uses the SAME 1-cycle BRAM latency as the data region, so we
+    request +1 leading byte per chunk and drop it (mirrors the data path)."""
+    meta = req(s, ip, port, depth + 26, 7, timeout)
+    stride_log2 = meta[0]
+    n = meta[1] | (meta[2] << 8)
+    last_tick = meta[3] | (meta[4] << 8) | (meta[5] << 16) | (meta[6] << 24)
+    base = depth + 64
+    nbytes = 4 * n
+    raw = bytearray()
+    off = 0
+    while off < nbytes:
+        m = min(CHUNK, nbytes - off)
+        chunk = req(s, ip, port, base + off, m + 1, timeout)
+        raw.extend(chunk[1:1 + m])
+        off += m
+    ticks = [raw[4*k] | (raw[4*k+1] << 8) | (raw[4*k+2] << 16) | (raw[4*k+3] << 24)
+             for k in range(n)]
+    return {
+        "stride": 1 << stride_log2,
+        "n": n,
+        "tick_ns": 5.0,           # ref_200m = 200 MHz
+        "last_tick": last_tick,
+        "ticks": ticks,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ip", default="192.168.10.42")
@@ -60,6 +97,10 @@ def main():
                     help="drop the first SKIP bytes (capture-start transient "
                          "lead-in; the first ~7.5KB after re-arm can be garbage "
                          "until TPIU framing locks — doc 15 §14)")
+    ap.add_argument("--timebase", action="store_true",
+                    help="also read the FPGA capture-time base table and write "
+                         "a sidecar <out>.ts.json (byte-index -> wall-clock ns). "
+                         "Adapts to any TRACECLK frequency (doc 15 §24.2).")
     a = ap.parse_args()
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -115,6 +156,28 @@ def main():
         f.write(out)
     print(f"  wrote {len(out)} bytes -> {a.out}"
           + (f" (skipped first {a.skip})" if a.skip else ""))
+
+    if a.timebase:
+        import json
+        try:
+            tb = read_timebase(s, a.ip, a.port, a.depth, a.timeout)
+        except (socket.timeout, OSError) as e:
+            print(f"  WARNING: time base read failed: {e} (old bitstream?)")
+        else:
+            tb["skip"] = a.skip          # bytes dropped from the front of out
+            tb["depth"] = a.depth
+            side = a.out + ".ts.json"
+            with open(side, "w") as f:
+                json.dump(tb, f)
+            ticks = tb["ticks"]
+            span_ns = (tb["last_tick"]) * tb["tick_ns"]
+            print(f"  time base: {tb['n']} snapshots @ every {tb['stride']} B, "
+                  f"span {span_ns/1e3:.1f} us -> {side}")
+            # quick monotonic sanity (ticks may wrap if capture > ~21s @200MHz)
+            nonmono = sum(1 for k in range(1, len(ticks)) if ticks[k] < ticks[k-1])
+            if nonmono:
+                print(f"  NOTE: {nonmono} tick wrap/non-monotonic points "
+                      f"(capture longer than counter range)")
     # quick content sanity: TPIU sync 0xFFFFFF7F frequency
     sync = out.count(b"\xff\xff\xff\x7f")
     print(f"  TPIU full-sync (ff ff ff 7f) occurrences: {sync}")

@@ -254,6 +254,67 @@ module trace_stream_top #(
             cap_gen_s0  <= cap_gen200;
             cap_gen_125 <= cap_gen_s0;
         end
+
+        // ---- FPGA capture-time base (doc 15 §24.2) ----------------------
+        // F429 ETM has no usable wall-clock (no TSGEN, no cycle-accurate;
+        // §22/§24). So WE provide the authoritative time base on the capture
+        // side: a free-running ref_200m counter (5 ns/tick) snapshotted into a
+        // small table every TS_STRIDE captured bytes. This is real wall-clock,
+        // INDEPENDENT of the target TRACECLK, so it:
+        //   * adapts to any trace frequency automatically (we time the bytes,
+        //     not assume a byte rate), and
+        //   * records TRACECLK idle pauses as genuine time gaps (the all-zero
+        //     "long-0" regions), instead of smearing time linearly across them.
+        // The PC maps captured-byte-index -> wall-clock by interpolating
+        // between adjacent table entries, then carries that through deframing.
+        localparam TS_STRIDE_LOG2 = 8;                       // snapshot / 256 bytes
+        localparam TS_N           = (DEPTH >> TS_STRIDE_LOG2) + 1;
+        localparam TS_IW          = $clog2(TS_N);
+        localparam [15:0] TS_BYTES = 4*TS_N;                 // 4 bytes/entry
+        localparam [7:0]  TS_N_LO  = TS_N[7:0];
+        localparam [7:0]  TS_N_HI  = TS_N[15:8];
+        reg [31:0] cap_clk_cnt = 32'd0;                      // free-run ref_200m ticks
+        always @(posedge clk200) begin
+            if (sys_rst || cap_rearm) cap_clk_cnt <= 32'd0;
+            else                      cap_clk_cnt <= cap_clk_cnt + 1'b1;
+        end
+        (* ram_style = "distributed" *)
+        reg [31:0] tsmem [0:TS_N-1];
+        wire             ts_snap = cap_valid && !rfull &&
+                                   (rwr[TS_STRIDE_LOG2-1:0] == 0);
+        wire [TS_IW-1:0] ts_widx = rwr[RAW_AW-1:TS_STRIDE_LOG2];
+        always @(posedge clk200) if (ts_snap) tsmem[ts_widx] <= cap_clk_cnt;
+        // last captured-byte time (latched each accepted byte) for the tail
+        reg [31:0] cap_clk_last = 32'd0;
+        always @(posedge clk200) begin
+            if (sys_rst || cap_rearm)      cap_clk_last <= 32'd0;
+            else if (cap_valid && !rfull)  cap_clk_last <= cap_clk_cnt;
+        end
+        // ts table readout (clk125, registered like rrd: 1-cycle latency).
+        // tsrd is the word read for the PREVIOUS presented address; the byte-
+        // lane selector must therefore also use the previous address's low
+        // bits, or the lanes scramble across words. Register ts_off[1:0] to
+        // align the lane with the latched word (mirrors the rrd +1/drop-first
+        // contract used by trace_dump).
+        localparam [15:0] TS_BASE = NB + 16'd64;
+        wire [15:0]      ts_off  = ext_addr - TS_BASE;
+        wire [TS_IW-1:0] ts_ridx = ts_off[TS_IW+1:2];        // /4 (4 bytes/entry)
+        reg  [31:0]      tsrd;
+        reg  [1:0]       ts_lane_d;
+        always @(posedge clk125) begin
+            tsrd      <= tsmem[ts_ridx];
+            ts_lane_d <= ts_off[1:0];
+        end
+        wire             ts_win  = (ext_addr >= TS_BASE) &&
+                                   (ext_addr <  TS_BASE + TS_BYTES);
+        wire [7:0]       ts_byte = tsrd[8*ts_lane_d +: 8];
+        // sync cap_clk_last into clk125 for the status read
+        reg [31:0] cclast_s0 = 0, cclast_125 = 0;
+        always @(posedge clk125) begin
+            cclast_s0  <= cap_clk_last;
+            cclast_125 <= cclast_s0;
+        end
+
         reg [7:0] rrd;
         always @(posedge clk125) rrd <= rawmem[ext_addr[RAW_AW-1:0]];
         assign ext_data = (ext_addr < NB)        ? rrd :
@@ -283,7 +344,17 @@ module trace_stream_top #(
                           (ext_addr == NB+22)    ? duty_lo_cnt[7:0] :
                           (ext_addr == NB+23)    ? duty_lo_cnt[15:8] :
                           (ext_addr == NB+24)    ? glitch_cnt[7:0] :
-                          (ext_addr == NB+25)    ? glitch_cnt[15:8] : 8'h00;
+                          (ext_addr == NB+25)    ? glitch_cnt[15:8] :
+                          // FPGA capture-time base metadata (doc 15 §24.2)
+                          (ext_addr == NB+26)    ? TS_STRIDE_LOG2[7:0] :  // stride = 1<<this
+                          (ext_addr == NB+27)    ? TS_N_LO :            // table entry count
+                          (ext_addr == NB+28)    ? TS_N_HI :
+                          (ext_addr == NB+29)    ? cclast_125[7:0] :      // last byte's tick
+                          (ext_addr == NB+30)    ? cclast_125[15:8] :
+                          (ext_addr == NB+31)    ? cclast_125[23:16] :
+                          (ext_addr == NB+32)    ? cclast_125[31:24] :
+                          // ts table window: NB+64 .. NB+64+4*TS_N (LE u32/entry)
+                          ts_win                 ? ts_byte : 8'h00;
         assign led1 = ~rfull;
     end else begin : g_frame
         // ---- traceIF 16-byte frame capture (default) ----
