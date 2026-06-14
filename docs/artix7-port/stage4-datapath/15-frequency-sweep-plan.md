@@ -588,8 +588,88 @@ trace → Perfetto CallStack** 解码器(基于 orbuculum mortem 改),正是我�
 → **完整链路打通**:STM32 ETM → FPGA 4-bit DDR 采集 → 去帧/walk 重组 → TPIU 重封装 → orbetto/Mortrall
 (ETM3.5)→ Perfetto。29 个不同 PC 与 proj_add 循环规模吻合。.perf 可拖进 perfetto UI。
 
-### 20.4 待办
-- 验证 29 个 PC 与已知 loop_sum/add 地址逐一对上(确认非乱码)。
+### 20.4 验证:PC 与程序逐一对上(非乱码)
+
+orbetto -v3 输出的执行 PC 直方图(命中次数):
+```
+0800fb6 ×1057823   0800f9c ×889101   0800f8c ×635138(add)  0800fae ×422980
+0800fa4 ×127221(loop_sum)  0800fbc ×106057  0800fba ×84908  0800f96 ×84596 ...
+```
+全部落在 proj_add 循环体 0x08000f8c–0x08000fc0,热指令命中数主导,分布合理;仅 1 个 0x0800120c
+(flash 段尾)和 0x08000bbc(一次性 init 分支)。→ **确认是真实指令执行数据,Mortrall 正确重建了
+程序执行流。**
+
+### 20.5 待办（更新）
+- ✅ 执行 PC 与 loop_sum/add 地址对上。
 - 用真实 FPGA 抓的流(非 LA 金标准)跑通同一链路。
-- CallStack 线程视图是 NuttX 专属,我们裸机循环用不到;指令/PC 时间线通用,够用。
+- CallStack 线程视图 NuttX 专属(裸机不需要);指令/PC 时间线通用够用。
 - 上游差异(ETM35 init、device hint、FSYNC 封装)记为 fork orbetto 的改动点。
+
+
+
+## 21. 时间戳核验:无 cycle-count → 时间轴退化(根因 + 修法)
+
+Perfetto 里 slice(loop_sum/add)出来了,但时间戳"看着不对"。写了 `decode/perf_timecheck.py`(无 perfetto
+库,纯 protobuf 线格式解析)核验 `orbetto.perf` 的 ftrace 事件时间戳:
+
+- 253790 个事件,时间跨度 **7027 秒**(裸机小循环实际只跑了毫秒级)——离谱。
+- delta 双峰:**253780 个事件 delta=1ns**(指令被挤在 1ns 间隔),夹杂几个 **~334 秒的巨跳**。
+- slice 样例:`loop_sum @1ns`、`add @334634824821ns`、`E|0 @5354157015619ns`…
+
+### 21.1 根因(已定位)
+
+orbetto/Mortrall 的时间戳 = `cycleCount × 1e9 / cps`(cps 来自 `-C`)。cycleCount 来自 **ETM cycle-count
+包**。实测 `-v3` 输出 **"Cc:" 计数 = 0** —— 我们的流里**没有任何 cycle-count 包**。原因:ETMCR=0x980,
+**CYCACC(bit12=0x1000)= 0**,cycle-accurate 关着。所以 Mortrall 无真实时间基:大部分指令 ts 不前进
+(delta=1ns 退化插值),偶发把未知/野 cycleCount 乘进去 → 334 秒级假跳。
+
+→ **slice 的顺序/内容是对的(指令流正确重建),但时间轴是假的**,因为源端没发周期信息。
+
+### 21.2 修法
+
+1. **开 cycle-accurate**:ETMCR 置 CYCACC(bit12)→ 0x980 | 0x1000 = **0x1980**,让 ETM 发 cycle-count
+   包。Mortrall 即有真实周期时间基。需在 `target/etm_enable.cfg` 改 ETMCR 写值并复测。
+   - 注意:cycle-accurate 会显著增加 trace 数据量(每段带周期数),低速 60KB 缓冲可能更快填满;且高频
+     时加重带宽——提频阶段要权衡。
+2. **cps 要对**:`-C` 给的是 **CPU 周期/秒(KHz)**,必须等于产生 cycleCount 的那个时钟。我们 /64 时
+   HCLK=2.625MHz → `-C 2625`。但 cycle-count 计的是 **CPU 周期还是 TRACECLK 周期**要核(ETM cycle count
+   通常是 CPU 时钟)。开了 CYCACC 后用已知时长程序标定。
+
+### 21.3 现状
+
+- 性能链路(ETM→Perfetto)**结构通**,指令流正确;**只差真实时间基**。
+- 下一步:etm_enable.cfg 开 CYCACC → 重抓 → perf_timecheck 复验时间戳是否变合理(毫秒级跨度、
+  循环周期间隔均匀且与 HCLK 吻合)。
+
+
+## 22. cycle-accurate 不被本芯片支持 → ETM 无原生时间基(实证)
+
+按 IHI0014Q §3(6056-6073)的官方测试法验证 cycle-accurate 支持:写 ETMCR bit[12]=1 再读回。
+- 写 0x1980,读回 **0x980**(bit12=0)。复测:写 `v|0x1000` 读回仍 0x980。
+- Table 3-10:bit[12] 读回 0 = **cycle-accurate tracing 不支持**。
+
+→ **STM32F429 的 Cortex-M4 ETM 不实现 cycle-accurate**(与 M4 ETM 精简一致:无 data trace、无周期计数)。
+故 **ETM 指令流在本芯片上不携带任何原生时间信息**;Perfetto 时间戳乱(§21)不是我们的 bug,是源端
+没有时钟数据,Mortrall 无 cycle-count 时插值退化。
+
+### 22.1 时间轴的现实选项
+
+1. **指令序时间轴(order-only)**:承认无 wall-clock,只保证指令顺序正确(当前已做到)。修 Mortrall 的
+   无-cc 插值,让它给均匀递增 ts(而非 1ns 挤叠 + 334s 假跳),至少 Perfetto 里顺序/嵌套正确可读。
+2. **I-sync 周期当粗时间锚**:ETM 每 1024 字节发周期性 I-sync(ETMSYNCFR 锁死 1024)。这是**字节域**
+   等间隔,不是时间域;但若 trace 带宽恒定,可粗略映射时间。精度差,仅作粗轴。
+3. **ITM 全局时间戳**(若要真时间):ITM/DWT 的 timestamp 包带真实周期数(走 SWO 或 TPIU stream-1)。
+   这正是 orbetto 原生支持的(`_handleTS`)。要真 wall-clock,需**同时开 ITM 时间戳 + ETM 指令流**
+   (TPIU 多路复用 stream 1+2),用 ITM TS 给 ETM 段打时间锚。这是 orbetto/PX4 的标准做法。
+4. **外部时间**:LA/FPGA 采集时打硬件时间戳(我们 FPGA 采集端可以给每个 TRACECLK 周期计数 → 真实采集
+   时间),作为权威时间基注入。**这条最适合我们**:FPGA 本就有 ref_200m,可在采集时给字节流打 5ns 分辨
+   率时间戳,完全绕开"ETM 无周期"的限制。
+
+### 22.2 结论与下一步
+
+- 性能链路(ETM→指令流→Perfetto slice)**结构与内容正确**;唯一缺的是时间基,且**本芯片 ETM 给不了**。
+- 最干净的真时间基 = **方案 4(FPGA 采集端打时间戳)** 或 **方案 3(叠加 ITM 时间戳)**。
+- 短期可做方案 1(修 Mortrall 无-cc 插值给单调均匀 ts),让 Perfetto 至少顺序正确好看;真性能分析再上
+  方案 3/4。
+工具:`decode/perf_timecheck.py`(纯解析 .perf 时间戳)、`target/etm_enable_cycacc.cfg`(验证用,确认
+不支持)。
