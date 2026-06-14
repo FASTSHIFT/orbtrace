@@ -37,6 +37,8 @@ module tb_dsl_replay;
     wire        trace_clk;
     wire [3:0]  trace_a, trace_b;
     wire        idelayctrl_rdy;
+    wire [7:0]  cap_byte;
+    wire        cap_valid;
 
     // DUT — EYE_DELAY overridable at compile time via -P tb_dsl_replay.EYE_DELAY=<n>
     parameter EYE_DELAY = 4;
@@ -50,17 +52,18 @@ module tb_dsl_replay;
         .tap_data0(5'd16), .tap_data1(5'd16), .tap_data2(5'd16), .tap_data3(5'd16),
         .tap_load(1'b0),
         .trace_clk(trace_clk), .trace_a(trace_a), .trace_b(trace_b),
+        .cap_byte(cap_byte), .cap_valid(cap_valid),
         .idelayctrl_rdy(idelayctrl_rdy)
     );
 
-    // ---- CAP_RAW byte pack: one byte {trace_b, trace_a} per trace_clk edge ----
-    // trace_stream_top samples on posedge trace_clk. Replicate that here.
+    // ---- CAP_RAW byte capture via the glitch-free ref_200m strobe ----
+    // Mirrors trace_stream_top g_raw: write cap_byte on (clk200, cap_valid).
     integer outfd;
     integer nbytes = 0;
     reg cap_en = 0;
-    always @(posedge trace_clk) begin
-        if (cap_en) begin
-            $fwriteh(outfd, "%02x\n", {trace_b, trace_a});
+    always @(posedge ref_200m) begin
+        if (cap_en && cap_valid) begin
+            $fwriteh(outfd, "%02x\n", cap_byte);
             nbytes = nbytes + 1;
         end
     end

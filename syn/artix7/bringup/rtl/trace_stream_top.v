@@ -87,6 +87,8 @@ module trace_stream_top #(
     wire        trace_clk;
     wire [3:0]  trace_a, trace_b;
     wire        idelayctrl_rdy;
+    wire [7:0]  cap_byte;
+    wire        cap_valid;
 
     reg [3:0] ld_sync = 4'h0;
     reg       loaded  = 1'b0;
@@ -106,6 +108,7 @@ module trace_stream_top #(
         .tap_data0(TAP), .tap_data1(TAP), .tap_data2(TAP), .tap_data3(TAP),
         .tap_load(tap_load),
         .trace_clk(trace_clk), .trace_a(trace_a), .trace_b(trace_b),
+        .cap_byte(cap_byte), .cap_valid(cap_valid),
         .idelayctrl_rdy(idelayctrl_rdy)
     );
 
@@ -139,13 +142,16 @@ module trace_stream_top #(
         reg [7:0] rawmem [0:DEPTH-1];
         reg [RAW_AW:0] rwr;
         wire rfull = rwr[RAW_AW];
-        wire [7:0] nib = {trace_b, trace_a};
-        always @(posedge trace_clk) begin
-            if (!rfull) rawmem[rwr[RAW_AW-1:0]] <= nib;
+        // Glitch-free capture: write the ref_200m-domain byte on its valid
+        // strobe, entirely in the clk200 domain. This replaces the previous
+        // capture on the async BUFR_IO `trace_clk`, which tore bytes when its
+        // edge raced the ref-domain a/b registers (doc 14 §27 root cause).
+        always @(posedge clk200) begin
+            if (cap_valid && !rfull) rawmem[rwr[RAW_AW-1:0]] <= cap_byte;
         end
-        always @(posedge trace_clk) begin
-            if (sys_rst)      rwr <= 0;
-            else if (!rfull)  rwr <= rwr + 1'b1;
+        always @(posedge clk200) begin
+            if (sys_rst)                    rwr <= 0;
+            else if (cap_valid && !rfull)   rwr <= rwr + 1'b1;
         end
         reg [7:0] rrd;
         always @(posedge clk125) rrd <= rawmem[ext_addr[RAW_AW-1:0]];

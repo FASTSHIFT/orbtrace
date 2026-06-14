@@ -87,7 +87,16 @@ module trace_capture_a7 #(
     output wire        trace_clk,
     output wire [3:0]  trace_a,      // rising-edge sample
     output wire [3:0]  trace_b,      // falling-edge sample
-    output wire        idelayctrl_rdy
+    output wire        idelayctrl_rdy,
+
+    // Glitch-free, ref_200m-domain raw byte capture (OVERSAMPLE only).
+    // cap_byte = {falling nibble, rising nibble} for one TRACECLK period;
+    // cap_valid pulses one ref_200m cycle when cap_byte is freshly complete.
+    // Capturing on (clk200, cap_valid) avoids the async trace_clk->fabric CDC
+    // that tears bytes when BUFR_IO trace_clk races the ref-domain a/b
+    // registers (doc 14 §27). For BUFG/IDDR modes cap_valid stays 0.
+    output wire [7:0]  cap_byte,
+    output wire        cap_valid
 );
 
     // ------------------------------------------------------------------
@@ -272,6 +281,36 @@ module trace_capture_a7 #(
         assign trace_a = a_reg;   // rising-edge nibble (mid-eye)
         assign trace_b = b_reg;   // falling-edge nibble (mid-eye)
 
+        // --------------------------------------------------------------
+        // Glitch-free capture strobe, all in ref_200m.
+        // A DDR byte = (rising nibble, falling nibble) of one TRACECLK
+        // period. We emit the byte one ref cycle AFTER b_reg is latched
+        // (falling nibble is the second of the pair), pairing it with the
+        // a_reg already latched earlier the same period. Both registers are
+        // long-settled in the ref domain, so the captured byte cannot tear.
+        // --------------------------------------------------------------
+        reg        b_latched = 1'b0;
+        reg [7:0]  cap_byte_r = 8'b0;
+        reg        cap_valid_r = 1'b0;
+        always @(posedge ref_200m) begin
+            if (rst) begin
+                b_latched   <= 1'b0;
+                cap_valid_r <= 1'b0;
+                cap_byte_r  <= 8'b0;
+            end else begin
+                // detect the cycle b_reg gets latched (f_arm falling with cnt 0)
+                b_latched <= (f_arm && f_cnt == 0);
+                if (b_latched) begin
+                    cap_byte_r  <= {b_reg, a_reg};
+                    cap_valid_r <= 1'b1;
+                end else begin
+                    cap_valid_r <= 1'b0;
+                end
+            end
+        end
+        assign cap_byte  = cap_byte_r;
+        assign cap_valid = cap_valid_r;
+
     end else begin : g_iddr
         // ----------------------------------------------------------------
         // IDDR: DDR input register sampled on the TRACECLK edges. Correct
@@ -296,6 +335,9 @@ module trace_capture_a7 #(
                 .S  (1'b0)
             );
         end
+        // IDDR mode has no glitch-free ref-domain capture path.
+        assign cap_byte  = 8'b0;
+        assign cap_valid = 1'b0;
     end
     endgenerate
 
