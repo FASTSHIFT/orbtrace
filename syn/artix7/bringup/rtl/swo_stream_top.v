@@ -18,7 +18,13 @@
 `default_nettype none
 
 module swo_stream_top #(
-    parameter DEPTH  = 61440,        // captured bytes (< 65536 for 16-bit addr)
+    parameter DEPTH  = 98304,        // captured bytes (96 KB, ~22 RAMB36; fits
+                                     // 35T's 30 with the eth core). Read in 64K
+                                     // banks via the bank CSR (0x05) since the
+                                     // readout address is 16-bit. Larger DEPTH =
+                                     // longer capture time window so a (time-
+                                     // periodic) TPIU sync always lands even at
+                                     // high baud.
     parameter BITLEN = 16'd100       // ref_200m cycles/UART bit (200MHz/2Mbaud)
 ) (
     input  wire        sys_clk_50,
@@ -77,6 +83,9 @@ module swo_stream_top #(
     // 0 (default) => use the BITLEN parameter. Set it to match the STM32 TPIU
     // ACPR baud, then re-arm (CSR 0x02).
     reg [15:0] bitlen_csr = 16'd0;
+    // Bank select (CSR 0x05): which 64 KB page of the capture buffer the 16-bit
+    // readout address indexes into. clk125 domain (readout side).
+    reg [7:0]  bank_csr = 8'd0;
     always @(posedge clk125) begin
         rearm_125 <= 1'b0;
         if (sys_rst) begin
@@ -85,6 +94,7 @@ module swo_stream_top #(
             if (csr_addr_w == 8'h02) rearm_125 <= 1'b1;
             if (csr_addr_w == 8'h03) bitlen_csr[7:0]  <= csr_data_w;
             if (csr_addr_w == 8'h04) bitlen_csr[15:8] <= csr_data_w;
+            if (csr_addr_w == 8'h05) bank_csr <= csr_data_w;
         end
     end
     // sync quasi-static bitlen into clk200
@@ -124,7 +134,6 @@ module swo_stream_top #(
     // ---- capture BRAM + paged readout (mirrors CAP_RAW path) ------------
     wire [15:0] ext_addr;
     wire [7:0]  ext_data;
-    localparam [15:0] NB = DEPTH;
     localparam RAW_AW = $clog2(DEPTH);
 
     (* ram_style = "block" *)
@@ -147,13 +156,23 @@ module swo_stream_top #(
         cap_gen_125 <= cap_gen_s0;
     end
 
+    // Full read address = bank*65536 + ext_addr (banked paging past 16-bit).
+    wire [RAW_AW-1:0] rd_addr = {bank_csr, ext_addr}[RAW_AW-1:0];
     reg [7:0] rrd;
-    always @(posedge clk125) rrd <= rawmem[ext_addr[RAW_AW-1:0]];
-    assign ext_data = (ext_addr < NB)    ? rrd :
-                      (ext_addr == NB+0) ? NB[7:0] :
-                      (ext_addr == NB+1) ? NB[15:8] :
-                      (ext_addr == NB+2) ? {7'b0, rfull} :
-                      (ext_addr == NB+3) ? cap_gen_125 : 8'h00;
+    always @(posedge clk125) rrd <= rawmem[rd_addr];
+    // Status bytes live in bank 0 at a fixed high offset (0xFF00..), away from
+    // the data, so the PC reads DEPTH/full/gen without colliding with the 128 KB
+    // data region. DEPTH is reported as a 32-bit value (it exceeds 16 bits).
+    localparam [31:0] NB = DEPTH;
+    wire status_sel = (bank_csr == 8'd0) && (ext_addr >= 16'hFF00);
+    wire [7:0] status_byte =
+                      (ext_addr == 16'hFF00) ? NB[7:0] :
+                      (ext_addr == 16'hFF01) ? NB[15:8] :
+                      (ext_addr == 16'hFF02) ? NB[23:16] :
+                      (ext_addr == 16'hFF03) ? NB[31:24] :
+                      (ext_addr == 16'hFF04) ? {7'b0, rfull} :
+                      (ext_addr == 16'hFF05) ? cap_gen_125 : 8'h00;
+    assign ext_data = status_sel ? status_byte : rrd;
     assign led1 = ~rfull;
 
     // ---- Ethernet UDP readout (same core as the parallel top) -----------
