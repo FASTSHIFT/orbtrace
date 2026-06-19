@@ -19,6 +19,8 @@ import sys
 CTRL_PORT = 5002
 REG_EYE = 0x01
 REG_REARM = 0x02
+REG_BITLEN_LO = 0x03
+REG_BITLEN_HI = 0x04
 
 
 def write_csr(ip, addr, value, timeout=1.0):
@@ -40,12 +42,19 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     pe = sub.add_parser("set-eye")
     pe.add_argument("value", type=int)
+    pb = sub.add_parser("set-bitlen",
+                        help="SWO NRZ bit length in ref_200m cycles (=200e6/baud)")
+    pb.add_argument("value", type=int)
     sub.add_parser("rearm")
     a = ap.parse_args()
 
     if a.cmd == "set-eye":
         write_csr(a.ip, REG_EYE, a.value)
         print(f"set EYE delay = {a.value}")
+    elif a.cmd == "set-bitlen":
+        write_csr(a.ip, REG_BITLEN_LO, a.value & 0xFF)
+        write_csr(a.ip, REG_BITLEN_HI, (a.value >> 8) & 0xFF)
+        print(f"set SWO bitlen = {a.value} ref cycles (~{200e6/a.value/1e6:.3f} Mbaud)")
     elif a.cmd == "rearm":
         write_csr(a.ip, REG_REARM, 1)
         print("soft re-arm pulsed")

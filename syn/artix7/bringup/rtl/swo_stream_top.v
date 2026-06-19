@@ -72,11 +72,28 @@ module swo_stream_top #(
     wire [7:0] csr_addr_w, csr_data_w;
     wire       csr_we_w;
     reg        rearm_125 = 1'b0;
+    // Runtime bitlen (ref_200m cycles/UART bit) so the baud can be raised
+    // without re-synthesis (frequency sweep): CSR 0x03=low byte, 0x04=high byte.
+    // 0 (default) => use the BITLEN parameter. Set it to match the STM32 TPIU
+    // ACPR baud, then re-arm (CSR 0x02).
+    reg [15:0] bitlen_csr = 16'd0;
     always @(posedge clk125) begin
         rearm_125 <= 1'b0;
-        if (sys_rst) ;
-        else if (csr_we_w && csr_addr_w == 8'h02) rearm_125 <= 1'b1;
+        if (sys_rst) begin
+            bitlen_csr <= 16'd0;
+        end else if (csr_we_w) begin
+            if (csr_addr_w == 8'h02) rearm_125 <= 1'b1;
+            if (csr_addr_w == 8'h03) bitlen_csr[7:0]  <= csr_data_w;
+            if (csr_addr_w == 8'h04) bitlen_csr[15:8] <= csr_data_w;
+        end
     end
+    // sync quasi-static bitlen into clk200
+    reg [15:0] bitlen_s0 = 0, bitlen_200 = 0;
+    always @(posedge clk200) begin
+        bitlen_s0  <= bitlen_csr;
+        bitlen_200 <= bitlen_s0;
+    end
+    wire [15:0] bitlen_use = (bitlen_200 != 16'd0) ? bitlen_200 : BITLEN;
     reg        rearm_tgl125 = 1'b0;
     always @(posedge clk125) if (rearm_125) rearm_tgl125 <= ~rearm_tgl125;
     reg [2:0]  rearm_sync200 = 3'b0;
@@ -94,7 +111,7 @@ module swo_stream_top #(
     swo_nrz_decode #(.CW(16)) u_nrz (
         .clk(clk200), .rst(sys_rst),
         .pulse_valid(p_valid), .pulse_level(p_level), .pulse_count(p_count),
-        .bit_valid(bvld), .bit_value(bval), .bitlen(BITLEN)
+        .bit_valid(bvld), .bit_value(bval), .bitlen(bitlen_use)
     );
     wire [7:0]  cap_byte;
     wire        cap_valid;
