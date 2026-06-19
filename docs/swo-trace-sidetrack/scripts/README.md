@@ -37,6 +37,15 @@
 
 两者都不负责抓 SWO —— SWO 由 CH343/逻辑分析仪从 PB3 抓（NRZ 2Mbaud），调试器只管配置 + 保持 CPU 跑。
 
+### ⚠️ 坑：调试器会话退出 = SWO 立即停
+
+**SWO 持续输出的前提是调试器会话一直在。** 实测两种调试器都有这个坑：
+
+- **J-Link**：`JLinkExe` 脚本 `exit` 会 halt CPU → SWO 停。靠脚本末尾长 `sleep` 挂住规避。
+- **ST-Link/OpenOCD**：OpenOCD 退出/Ctrl-C，其 shutdown 序列（hla_swd 下）会 halt 内核并/或在断开时让 ST-Link 复位目标 → CPU 停 → ETM/SWO 流立即死。
+
+根因：CPU 一停就不执行指令，ETM 没有指令流可 trace，SWO 自然无输出。所以**整个抓取窗口内必须保持调试器会话存活**（脚本配好 `resume` 后常驻，不要 `shutdown`）。`etm_swo_openocd.cfg` 里加了 `pre_shutdown` 钩子尝试退出前 `resume`，但 hla_swd 下**不可靠**（ST-Link 仍可能在断开时复位/halt）——把"OpenOCD 存活"当作抓取的硬前提，而非优化项。
+
 ## 典型流程
 
 1. 自检引脚：`pb3_wiggle.jlink` → 逻辑分析仪/表确认 PB3 有方波。

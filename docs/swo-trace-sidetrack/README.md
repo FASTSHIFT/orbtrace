@@ -174,7 +174,7 @@ timeline
     GPIO 地址写错 : 把 GPIOB(0x40020400) 误写成 GPIOA(0x40020000) : 寄存器写不进/读回假值
     stall 死锁 : ETM stall + SWO 没出数据 : FIFO 永满 CPU 卡死 SWD 连不上 : 靠 RST 救回
     HSI 时钟漂移 : 停在 HSI 16MHz 未校准 : SWO 波特率漂移失锁 : 换 HSE 168MHz 解决（最大的坑）
-    exit 停 CPU : JLinkExe 脚本 exit 会 halt CPU : 抓波形时 PB3 静默 : 用常驻会话挂住
+    exit 停 CPU : 调试器会话退出(JLink exit / OpenOCD shutdown)会 halt CPU : 抓波形时 PB3 静默 : 会话必须常驻保活
     ITM FIFO 溢出 : 全速写 ITM 灌满即丢 : 突发后静默 : 写入限速
     TPIU sync 太稀疏 : 200KB 才 1 个同步帧 : 解码器对不齐 : dwtSyncTap 调密
     J-Link SWO 脚未接 : 自抓全 0 : 改用 LA 抓 PB3
@@ -186,7 +186,10 @@ timeline
 1. **GPIOB 基址 = `0x40020400`**，不是 `0x40020000`（那是 GPIOA）。每个端口偏移 0x400。
 2. **stall 模式有死锁风险**：SWO 一旦没真正输出，ETM FIFO 永满会把 CPU stall 死，SWD 都连不上。**必须接好 NRST** 才能可靠救回。
 3. **必须用 HSE 稳定时钟**：HSI 16MHz 未校准、±1% 漂移，累积几字节后 UART bit 错位，表现为"突发-间隙-静默"。这是最隐蔽、卡最久的坑。
-4. **JLinkExe `exit` 会 halt CPU**：要让 CPU 在抓取窗口持续运行，必须用常驻会话（长 sleep 挂住）或 GDB continue。
+4. **调试器会话退出 = CPU 停 = SWO 立即停**（两种调试器都中招）：
+   - **J-Link**：`JLinkExe` 脚本 `exit` 会 halt CPU → 用常驻会话（长 `sleep` 挂住）或 GDB `continue` 保活。
+   - **ST-Link/OpenOCD**：OpenOCD 退出/Ctrl-C，shutdown 序列（hla_swd 下）会 halt 内核并/或断开时让 ST-Link 复位目标 → CPU 停 → SWO 死。OpenOCD 配好 `resume` 后**常驻 server 本身保活**，绝不能 `shutdown`；`pre_shutdown` 钩子里 `resume` 在 hla_swd 下不可靠。
+   - 通用根因：CPU 一停就无指令流，ETM/SWO 即停。**整个抓取窗口必须保持调试器会话存活**，这是硬前提。
 5. **ITM stimulus 全速写会溢出丢数据**：调试器/CPU 全速写 FIFO，满了静默丢弃。要么写入限速，要么用 ETM 的 stall。
 6. **TPIU/ETM 同步要够密**：同步包太稀疏，任何解码器都无法对齐帧。调 `dwtSyncTap` 提高频率。
 7. **J-Link 自抓 SWO 需物理接好其 SWO 引脚**：本次未接，J-Link 自抓全 0，最终靠逻辑分析仪抓 PB3。
