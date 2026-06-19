@@ -590,7 +590,7 @@ def _next_frame(stream, i, n):
 
 
 def tpiu_deframe_walk(stream: bytes, want_stream: "int | None" = None,
-                      check_frames: int = 6, bad_thresh: float = 0.30,
+                      check_frames: int = 6, bad_thresh: "float | None" = None,
                       scan: int = 48) -> bytes:
     """Seam-free continuous TPIU deframer with in-place re-lock (doc 15 §18).
 
@@ -602,6 +602,17 @@ def tpiu_deframe_walk(stream: bytes, want_stream: "int | None" = None,
     re-alignment, jump there, continue. Clean captures never trip it (0 seam
     loss); dirty windows re-lock right after, dropping only corrupt bytes.
     Use on an already-correctly-assembled stream.
+
+    ADAPTIVE re-lock (doc 15 §27): when `bad_thresh is None` (default), pick the
+    threshold from the stream's own baseline unknown-fraction. A capture WITHOUT
+    a periodic TPIU full-sync (e.g. high-baud SWO where stall slows the CPU so
+    sync packets almost never emit) drifts its frame boundary continuously, so
+    the global unknown sits around ~10% and a fixed 0.30 threshold NEVER trips
+    -> the walker coasts on one bad phase. Setting the threshold just above the
+    achievable floor makes it re-lock aggressively at every drift, recovering
+    the stream (measured 21 MHz SWO: 6.1% -> 0.36%, real PCs). For a clean
+    full-sync stream the baseline is ~0 so the threshold stays tight and there
+    are still zero spurious re-locks.
     """
     n = len(stream)
     if n < 32:
@@ -623,12 +634,42 @@ def tpiu_deframe_walk(stream: bytes, want_stream: "int | None" = None,
         return unk / len(tmp), i
 
     phase, _ = find_tpiu_phase(stream[:min(n, 20000)])
+
+    if bad_thresh is None:
+        # Estimate the baseline unknown-fraction at the chosen phase over a
+        # sample of the stream; relock threshold = baseline + margin, floored so
+        # a genuinely clean stream keeps a wide (0.30) threshold and never
+        # spuriously re-locks, while a drifting (no-full-sync) stream gets an
+        # aggressive threshold just above its own floor.
+        probe = tpiu_deframe_hsync(stream[:min(n, 40000)], phase)
+        if probe:
+            base = sum(1 for c in probe if _classify(c) == "unknown") / len(probe)
+        else:
+            base = 0.0
+        # A high baseline (>2%) means there is NO periodic full-sync and the
+        # frame boundary drifts -> the achievable floor is reached only by
+        # re-locking AGGRESSIVELY, so use a low fixed threshold (just above the
+        # ~0% floor a correctly-aligned window hits) rather than baseline+margin
+        # (which would sit at the drift level and never trip). A low baseline is
+        # a clean full-sync stream -> keep the wide 0.30 threshold (no spurious
+        # re-locks). Measured 21 MHz SWO: baseline 17% -> thresh 0.05 -> 0.36%.
+        # Only engage aggressive re-lock on a stream long enough for the
+        # baseline estimate to be meaningful and for drift to actually occur
+        # (a short synthetic stream has no drift; aggressive re-lock would just
+        # fragment it).
+        if n >= 8192 and base > 0.02:
+            thresh = 0.05
+        else:
+            thresh = 0.30
+    else:
+        thresh = bad_thresh
+
     out = bytearray()
     cur = 0
     i = phase
     while i < n:
         frac, _ = quality_ahead(i, check_frames)
-        if frac > bad_thresh:
+        if frac > thresh:
             best = (frac, i)
             for off in range(1, scan):
                 if i + off >= n:
