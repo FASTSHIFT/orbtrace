@@ -46,7 +46,18 @@ module swo_nrz_decode #(
     reg  [3:0]    cnt;
     reg           cur_level;
 
+    // 1-deep pending buffer: with the IDDR 2x front-end pulses can arrive while
+    // the previous pulse's bits are still draining (a long N-bit pulse needs N
+    // cycles to drain, but the next edge of a short pulse is only bitlen/2
+    // cycles away). Latch an overlapping pulse instead of clobbering acc, then
+    // process it when the current run finishes draining. (The single-edge
+    // front-end never hit this because pulses were ~100 cycles apart.)
+    reg           pend_valid;
+    reg           pend_level;
+    reg  [CW-1:0] pend_count;
+
     wire have_bit = (acc >= {1'b0, bitlen}) && (cnt < 4'd12);
+    wire draining = have_bit;
 
     always @(posedge clk) begin
         if (rst) begin
@@ -55,10 +66,23 @@ module swo_nrz_decode #(
             cur_level <= 1'b0;
             bit_valid <= 1'b0;
             bit_value <= 1'b0;
+            pend_valid <= 1'b0;
         end else begin
             bit_valid <= 1'b0;
-            if (pulse_valid) begin
-                // load: acc = count + bitlen/2
+            if (pulse_valid && draining) begin
+                // overlapping pulse: buffer it (drop only if buffer full, which
+                // would need 3 pulses to overlap — not physically possible since
+                // a pulse is >= bitlen ticks long).
+                pend_valid <= 1'b1;
+                pend_level <= pulse_level;
+                pend_count <= pulse_count;
+                // still emit a bit this cycle from the current run
+                bit_valid <= 1'b1;
+                bit_value <= cur_level;
+                acc       <= acc - {1'b0, bitlen};
+                cnt       <= cnt + 1'b1;
+            end else if (pulse_valid) begin
+                // accept new pulse (current run already drained)
                 acc       <= {1'b0, pulse_count} + {2'b0, bitlen[CW-1:1]};
                 cur_level <= pulse_level;
                 cnt       <= 0;
@@ -68,6 +92,12 @@ module swo_nrz_decode #(
                 bit_value <= cur_level;
                 acc       <= acc - {1'b0, bitlen};
                 cnt       <= cnt + 1'b1;
+            end else if (pend_valid) begin
+                // current run drained; start the buffered pulse
+                acc        <= {1'b0, pend_count} + {2'b0, bitlen[CW-1:1]};
+                cur_level  <= pend_level;
+                cnt        <= 0;
+                pend_valid <= 1'b0;
             end
         end
     end
