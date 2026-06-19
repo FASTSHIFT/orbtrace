@@ -25,6 +25,17 @@
 | `ch343_grab.py` | 从串口抓原始 SWO 字节 | `python3 ch343_grab.py /dev/ttyACM1 2000000 3 out.bin` |
 | `csv3.py` | 逻辑分析仪 UART 解码 CSV → 二进制 + 同步密度分析 | `python3 csv3.py decoder.csv out.bin` |
 | `etm_full_decode.py` | 自写 ETMv3.5 解码器：TPIU解帧 + capstone 反汇编 → 指令流 | `python3 etm_full_decode.py etm.bin firmware.axf flow.txt` |
+| `etm_swo_openocd.cfg` | **ST-Link 版** ETM-over-SWO 配置（OpenOCD），与 J-Link `etm_2m_forever.jlink` 等效，OpenOCD 常驻=持续输出 | `openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -f etm_swo_openocd.cfg` |
+
+## 调试器选择：J-Link vs ST-Link
+
+两条路等效，都是配同一套 TPIU/ETM 寄存器后让 CPU 持续运行：
+
+- **J-Link**：`JLinkExe -NoGUI 1 -CommanderScript etm_2m_forever.jlink`，靠脚本末尾长 `sleep` 挂住会话保持 CPU 运行。
+- **ST-Link**：`openocd -f interface/stlink.cfg -f target/stm32f4x.cfg -f etm_swo_openocd.cfg`，OpenOCD 配好 `resume` 后**常驻 server 本身就保持连接**，CPU 持续运行（比 J-Link sleep 更自然）。Ctrl-C 停止。
+  - hla_swd 模式实测可正常写 TPIU/ETM(PPB 区 0xE004xxxx) 寄存器；读回 ETM_CR=0x880 / FFCR=0x102 / ACPR=0x53 / SPPR=0x2 全部生效。
+
+两者都不负责抓 SWO —— SWO 由 CH343/逻辑分析仪从 PB3 抓（NRZ 2Mbaud），调试器只管配置 + 保持 CPU 跑。
 
 ## 典型流程
 
