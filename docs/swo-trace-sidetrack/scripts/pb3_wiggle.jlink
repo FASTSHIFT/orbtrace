@@ -1,0 +1,66 @@
+exec SuppressInfoUpdateFW
+exec DisableAutoUpdateFW
+exec SuppressGUI
+si SWD
+speed 1000
+device STM32F429ZI
+connect
+r
+halt
+
+// ===== Enable GPIOB clock + PB3 as push-pull OUTPUT =====
+w4 0x40023830 0x00100002
+// MODER: PB3 -> output (01). reset 0x280, clear bits7:6 -> 0x200, set 0x40 -> 0x240
+w4 0x40020400 0x00000240
+// OTYPER push-pull (default 0)
+w4 0x40020404 0x00000000
+// OSPEEDR high speed PB3
+w4 0x40020408 0x000000C0
+// PUPDR none
+w4 0x4002040C 0x00000000
+
+// ===== Inject square-wave toggle loop into RAM @0x20000000 =====
+// Thumb code:
+//   loop:
+//   6001  str r1,[r0]       ; *GPIOB_BSRR = r1 (set PB3)
+//   3A01  subs r2,#1        ; (use as part of delay) -- replaced below
+// We build an explicit delay using a countdown register r3.
+//
+// Layout (halfwords):
+// 0x20000000: 6001  str  r1,[r0]      ; PB3 high
+// 0x20000002: 4623  mov  r3,r4        ; r3 = delay count
+// 0x20000004: 3B01  subs r3,#1        ; dec
+// 0x20000006: D1FD  bne  .-2 (0x20000004)
+// 0x20000008: 6002  str  r2,[r0]      ; PB3 low
+// 0x2000000A: 4623  mov  r3,r4
+// 0x2000000C: 3B01  subs r3,#1
+// 0x2000000E: D1FD  bne  .-2 (0x2000000C)
+// 0x20000010: E7F6  b    .-18 (0x20000000)
+//
+// Encode as 32-bit words (little-endian, low halfword first):
+// word@0x00: 4623 6001 -> 0x46236001
+// word@0x04: D1FD 3B01 -> 0xD1FD3B01
+// word@0x08: 4623 6002 -> 0x46236002
+// word@0x0C: D1FD 3B01 -> 0xD1FD3B01
+// word@0x10: 0000 E7F6 -> 0x0000E7F6
+w4 0x20000000 0x46236001
+w4 0x20000004 0xD1FD3B01
+w4 0x20000008 0x46236002
+w4 0x2000000C 0xD1FD3B01
+w4 0x20000010 0x0000E7F6
+
+// ===== Set up registers =====
+// r0 = GPIOB BSRR address
+wreg R0 0x40020418
+// r1 = set PB3 (BSRR bit3)
+wreg R1 0x00000008
+// r2 = reset PB3 (BSRR bit19)
+wreg R2 0x00080000
+// r4 = delay count (gives ~ a few kHz at 16MHz HSI)
+wreg R4 0x00000400
+wreg MSP 0x20001000
+SetPC 0x20000001
+
+// GO -> PB3 should now output a square wave
+go
+exit

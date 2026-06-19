@@ -116,3 +116,13 @@ graph TD
 - [x] **第三阶段：上板 bring-up** —— 三道单元门全通：JTAG 点灯、STM32 ETM 自验（示波器确认 4-bit trace）、千兆网口 RGMII 链路（UDP 双向环回实测）。踩坑记录见 `stage3-bringup/`
 - [ ] **第四阶段：trace 数据通路端到端打通** —— 把三个孤岛连成 `trace 引脚→traceIF→OrbFlow→UDP→Orbuculum` 数据流，端到端解出真实执行流（详见 `PLAN_STAGE4.md`，验证阶梯 V0→V4）
 - [ ] **第五阶段：满速 PoC** —— 升速逼满速源同步采样命门，眼图 / 丢包实测定工具能力边界
+
+---
+
+## 相关支线任务
+
+- **SWO 单线 trace 能力边界探索**：[`../swo-trace-sidetrack/`](../swo-trace-sidetrack/README.md)
+  - 在 STM32F429 上实测 ITM/ETM-over-SWO 的可行性与边界，为本主线"为何必须并口高速 trace"提供实测依据。
+  - 关键结论：SWO 单线 SI 简单（杜邦线即可）但带宽受限（UART ≤12Mbaud≈1.2MB/s）、M4 ETM 无地址过滤、ETM+ITM 不能经 SWO 混流；满速实时 + 多源时间戳对齐必须走并口 trace。
+  - 副产物：可复现的 SWO/ETM/ITM 解码链路（CH343P + orbuculum/orbmortem），**可作为 Stage5 满速 PoC 的黄金对照基线**（同固件下用 SWO 解出的指令流校验并口数据通路）。
+  - 工具补丁：orbuculum 的 CH343/稀疏同步适配已提交 fork 分支 `feature/ch343-swo-sparse-sync`。
