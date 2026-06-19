@@ -2,4 +2,5 @@ pinmap.json
 pool.json
 vectors.txt
 results.txt
+sample_results.txt
 scan.log
