@@ -26,11 +26,13 @@ module swo_stream_top #(
                                      // periodic) TPIU sync always lands even at
                                      // high baud.
     parameter BITLEN  = 16'd100,     // sample-ticks/UART bit (default 2 Mbaud)
-    parameter SWO_MODE = 0           // 0: single-edge oversample @clk200 (200MSa/s)
-                                     // 1: IDDR double-edge @clk200 (400MSa/s) —
+    parameter SWO_MODE = 0,          // 0: single-edge oversample @clk200 (200MSa/s)
+                                     // 1: IDDR double-edge (400 or 500 MSa/s)
                                      //    2x sample rate, toward ORBTrace 500MSa/s
                                      //    (proposal 17). bitlen is then in
-                                     //    400MSa/s half-cycle units.
+                                     //    sample-tick units.
+    parameter CAP500 = 0             // IDDR sample clock: 0=clk200(400MSa/s,
+                                     // timing-clean), 1=clk250(500MSa/s)
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -53,25 +55,39 @@ module swo_stream_top #(
 
     wire rst = ~rst_n;
 
-    // ---- clocks: reuse the parallel top's MMCM recipe -------------------
-    wire clkfb, clk125_u, clk125_90_u, clk200_u, clk100_u, mmcm_locked;
+    // ---- clocks: MMCM (VCO=1000MHz). clk250 added for the IDDR 500MSa/s
+    // sample clock (proposal 17 §4: 250MHz IDDR double-edge = 500 MSa/s, the
+    // ORBTrace-matching rate). IDELAYCTRL is unused here (oversample SWO needs
+    // no eye-centering), so clk250 is free to drive the IDDR C pin.
+    wire clkfb, clk125_u, clk125_90_u, clk200_u, clk100_u, clk250_u, mmcm_locked;
     MMCME2_BASE #(
         .CLKIN1_PERIOD(20.0), .CLKFBOUT_MULT_F(20.0), .DIVCLK_DIVIDE(1),
         .CLKOUT0_DIVIDE_F(8.0),
         .CLKOUT1_DIVIDE(8), .CLKOUT1_PHASE(90.0),
         .CLKOUT2_DIVIDE(5), .CLKOUT3_DIVIDE(10),
-        .CLKOUT0_PHASE(0.0), .CLKOUT2_PHASE(0.0), .CLKOUT3_PHASE(0.0)
+        .CLKOUT4_DIVIDE(4),                       // 1000/4 = 250 MHz
+        .CLKOUT0_PHASE(0.0), .CLKOUT2_PHASE(0.0), .CLKOUT3_PHASE(0.0),
+        .CLKOUT4_PHASE(0.0)
     ) u_mmcm (
         .CLKIN1(sys_clk_50), .CLKFBIN(clkfb), .CLKFBOUT(clkfb),
         .CLKOUT0(clk125_u), .CLKOUT1(clk125_90_u),
-        .CLKOUT2(clk200_u), .CLKOUT3(clk100_u),
+        .CLKOUT2(clk200_u), .CLKOUT3(clk100_u), .CLKOUT4(clk250_u),
         .LOCKED(mmcm_locked), .RST(rst), .PWRDWN(1'b0)
     );
-    wire clk125, clk125_90, clk200, clk100;
+    wire clk125, clk125_90, clk200, clk100, clk250;
     BUFG b0(.I(clk125_u), .O(clk125));
     BUFG b1(.I(clk125_90_u), .O(clk125_90));
     BUFG b2(.I(clk200_u), .O(clk200));
     BUFG b3(.I(clk100_u), .O(clk100));
+    BUFG b4(.I(clk250_u), .O(clk250));
+
+    // capture-domain clock. SWO_MODE=1 (IDDR) can run on clk200 (400 MSa/s,
+    // timing-clean) or clk250 (500 MSa/s, ORBTrace-matching but the nrz acc
+    // feedback path is marginal at 250 MHz — WNS ~-0.2ns). CAP500 selects:
+    //   CAP500=0 -> clk200 (400 MSa/s, default, closes timing)
+    //   CAP500=1 -> clk250 (500 MSa/s)
+    // Single-edge mode always uses clk200.
+    wire cap_clk = (SWO_MODE == 1 && CAP500 == 1) ? clk250 : clk200;
 
     reg [3:0] rst_sync = 4'hf;
     always @(posedge clk100 or posedge rst)
@@ -102,9 +118,9 @@ module swo_stream_top #(
             if (csr_addr_w == 8'h05) bank_csr <= csr_data_w;
         end
     end
-    // sync quasi-static bitlen into clk200
+    // sync quasi-static bitlen into the capture domain
     reg [15:0] bitlen_s0 = 0, bitlen_200 = 0;
-    always @(posedge clk200) begin
+    always @(posedge cap_clk) begin
         bitlen_s0  <= bitlen_csr;
         bitlen_200 <= bitlen_s0;
     end
@@ -112,20 +128,20 @@ module swo_stream_top #(
     reg        rearm_tgl125 = 1'b0;
     always @(posedge clk125) if (rearm_125) rearm_tgl125 <= ~rearm_tgl125;
     reg [2:0]  rearm_sync200 = 3'b0;
-    always @(posedge clk200) rearm_sync200 <= {rearm_sync200[1:0], rearm_tgl125};
+    always @(posedge cap_clk) rearm_sync200 <= {rearm_sync200[1:0], rearm_tgl125};
     wire cap_rearm = rearm_sync200[2] ^ rearm_sync200[1];
 
-    // ---- SWO front-end: pin -> bytes (all in clk200) --------------------
+    // ---- SWO front-end: pin -> bytes (all on cap_clk) -------------------
     // SWO_MODE=0: single-edge oversample @ clk200 (200 MSa/s).
-    // SWO_MODE=1: IDDR double-edge @ clk200 (400 MSa/s) — 2 samples/cycle.
+    // SWO_MODE=1: IDDR double-edge @ clk250 (500 MSa/s) — 2 samples/cycle.
     wire        p_valid, p_level;
     wire [15:0] p_count;
 
     generate
     if (SWO_MODE == 1) begin : g_iddr
-        // IDDR samples swo_in on BOTH edges of clk200 -> 2 oversamples/cycle.
-        // SAME_EDGE_PIPELINED: Q1 and Q2 are presented together one cycle after
-        // the sampling edges. Q1 = rising-edge sample, Q2 = falling-edge sample.
+        // IDDR samples swo_in on BOTH edges of clk250 -> 2 oversamples/cycle
+        // = 500 MSa/s (matches ORBTrace). SAME_EDGE_PIPELINED: Q1/Q2 presented
+        // together one cycle after the sampling edges; Q1=rising, Q2=falling.
         wire swo_ibuf;
         IBUF u_swo_ibuf (.I(swo_in), .O(swo_ibuf));
         wire q1, q2;
@@ -133,17 +149,17 @@ module swo_stream_top #(
             .DDR_CLK_EDGE("SAME_EDGE_PIPELINED"),
             .INIT_Q1(1'b1), .INIT_Q2(1'b1), .SRTYPE("ASYNC")
         ) u_swo_iddr (
-            .Q1(q1), .Q2(q2), .C(clk200), .CE(1'b1),
+            .Q1(q1), .Q2(q2), .C(cap_clk), .CE(1'b1),
             .D(swo_ibuf), .R(sys_rst), .S(1'b0)
         );
         swo_iddr_capture #(.CW(16), .IDLE_FLUSH(16'd8000)) u_cap (
-            .sample_clk(clk200), .rst(sys_rst),
+            .sample_clk(cap_clk), .rst(sys_rst),
             .s_d1(q1), .s_d2(q2),
             .pulse_valid(p_valid), .pulse_level(p_level), .pulse_count(p_count)
         );
     end else begin : g_single
         swo_pulse_capture #(.CW(16), .IDLE_FLUSH(16'd4000)) u_cap (
-            .clk(clk200), .rst(sys_rst), .swo_in(swo_in),
+            .clk(cap_clk), .rst(sys_rst), .swo_in(swo_in),
             .pulse_valid(p_valid), .pulse_level(p_level), .pulse_count(p_count)
         );
     end
@@ -151,14 +167,14 @@ module swo_stream_top #(
 
     wire        bvld, bval;
     swo_nrz_decode #(.CW(16)) u_nrz (
-        .clk(clk200), .rst(sys_rst),
+        .clk(cap_clk), .rst(sys_rst),
         .pulse_valid(p_valid), .pulse_level(p_level), .pulse_count(p_count),
         .bit_valid(bvld), .bit_value(bval), .bitlen(bitlen_use)
     );
     wire [7:0]  cap_byte;
     wire        cap_valid;
     swo_uart_decode u_uart (
-        .clk(clk200), .rst(sys_rst),
+        .clk(cap_clk), .rst(sys_rst),
         .bit_valid(bvld), .bit_value(bval),
         .byte_valid(cap_valid), .byte_data(cap_byte)
     );
@@ -172,16 +188,16 @@ module swo_stream_top #(
     reg [7:0] rawmem [0:DEPTH-1];
     reg [RAW_AW:0] rwr;
     wire rfull = rwr[RAW_AW];
-    always @(posedge clk200) begin
+    always @(posedge cap_clk) begin
         if (cap_valid && !rfull) rawmem[rwr[RAW_AW-1:0]] <= cap_byte;
     end
-    always @(posedge clk200) begin
+    always @(posedge cap_clk) begin
         if (sys_rst || cap_rearm)     rwr <= 0;
         else if (cap_valid && !rfull) rwr <= rwr + 1'b1;
     end
 
     reg [7:0] cap_gen200 = 8'd0;
-    always @(posedge clk200) if (cap_rearm) cap_gen200 <= cap_gen200 + 1'b1;
+    always @(posedge cap_clk) if (cap_rearm) cap_gen200 <= cap_gen200 + 1'b1;
     reg [7:0] cap_gen_s0 = 0, cap_gen_125 = 0;
     always @(posedge clk125) begin
         cap_gen_s0  <= cap_gen200;

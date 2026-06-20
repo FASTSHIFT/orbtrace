@@ -46,7 +46,8 @@ set_clock_groups -asynchronous \
     -group [get_clocks -of_objects [get_pins u_mmcm/CLKOUT0]] \
     -group [get_clocks -of_objects [get_pins u_mmcm/CLKOUT1]] \
     -group [get_clocks -of_objects [get_pins u_mmcm/CLKOUT2]] \
-    -group [get_clocks -of_objects [get_pins u_mmcm/CLKOUT3]]
+    -group [get_clocks -of_objects [get_pins u_mmcm/CLKOUT3]] \
+    -group [get_clocks -of_objects [get_pins u_mmcm/CLKOUT4]]
 
 set_property BITSTREAM.CONFIG.SPI_BUSWIDTH 4 [current_design]
 set_property CONFIG_MODE SPIx4 [current_design]

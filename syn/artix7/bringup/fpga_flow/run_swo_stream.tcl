@@ -62,11 +62,13 @@ read_xdc $bringup/rtl/swo_stream.xdc
 
 set swo_mode 1
 if {[info exists ::env(SWO_MODE)]} { set swo_mode $::env(SWO_MODE) }
-puts "============ SWO_MODE = $swo_mode (0=single-edge 200MSa/s, 1=IDDR 400MSa/s) ============"
-synth_design -top swo_stream_top -part $part -generic SWO_MODE=$swo_mode
+set cap500 0
+if {[info exists ::env(CAP500)]} { set cap500 $::env(CAP500) }
+puts "============ SWO_MODE = $swo_mode  CAP500 = $cap500 ============"
+synth_design -top swo_stream_top -part $part -generic SWO_MODE=$swo_mode -generic CAP500=$cap500
 opt_design
 place_design
 route_design
 report_timing_summary -no_detailed_paths -no_header
 write_bitstream -force swo_stream.bit
-puts "============ SWO STREAM BUILD DONE (SWO_MODE=$swo_mode) ============"
+puts "============ SWO STREAM BUILD DONE (SWO_MODE=$swo_mode CAP500=$cap500) ============"
