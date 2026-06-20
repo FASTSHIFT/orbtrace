@@ -13,6 +13,7 @@ set repo_root [file normalize [file join $bdir .. .. .. ..]]
 set ex        $repo_root/syn/external/verilog-ethernet/example/NexysVideo/fpga
 
 read_verilog $bringup/rtl/swo_pulse_capture.v
+read_verilog $bringup/rtl/swo_iddr_capture.v
 read_verilog $bringup/rtl/swo_nrz_decode.v
 read_verilog $bringup/rtl/swo_uart_decode.v
 read_verilog $bringup/rtl/fpga_core_net.v
@@ -59,10 +60,13 @@ foreach s {
 
 read_xdc $bringup/rtl/swo_stream.xdc
 
-synth_design -top swo_stream_top -part $part
+set swo_mode 1
+if {[info exists ::env(SWO_MODE)]} { set swo_mode $::env(SWO_MODE) }
+puts "============ SWO_MODE = $swo_mode (0=single-edge 200MSa/s, 1=IDDR 400MSa/s) ============"
+synth_design -top swo_stream_top -part $part -generic SWO_MODE=$swo_mode
 opt_design
 place_design
 route_design
 report_timing_summary -no_detailed_paths -no_header
 write_bitstream -force swo_stream.bit
-puts "============ SWO STREAM BUILD DONE ============"
+puts "============ SWO STREAM BUILD DONE (SWO_MODE=$swo_mode) ============"

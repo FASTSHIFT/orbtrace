@@ -25,7 +25,12 @@ module swo_stream_top #(
                                      // longer capture time window so a (time-
                                      // periodic) TPIU sync always lands even at
                                      // high baud.
-    parameter BITLEN = 16'd100       // ref_200m cycles/UART bit (200MHz/2Mbaud)
+    parameter BITLEN  = 16'd100,     // sample-ticks/UART bit (default 2 Mbaud)
+    parameter SWO_MODE = 0           // 0: single-edge oversample @clk200 (200MSa/s)
+                                     // 1: IDDR double-edge @clk200 (400MSa/s) —
+                                     //    2x sample rate, toward ORBTrace 500MSa/s
+                                     //    (proposal 17). bitlen is then in
+                                     //    400MSa/s half-cycle units.
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -111,12 +116,39 @@ module swo_stream_top #(
     wire cap_rearm = rearm_sync200[2] ^ rearm_sync200[1];
 
     // ---- SWO front-end: pin -> bytes (all in clk200) --------------------
+    // SWO_MODE=0: single-edge oversample @ clk200 (200 MSa/s).
+    // SWO_MODE=1: IDDR double-edge @ clk200 (400 MSa/s) — 2 samples/cycle.
     wire        p_valid, p_level;
     wire [15:0] p_count;
-    swo_pulse_capture #(.CW(16), .IDLE_FLUSH(16'd4000)) u_cap (
-        .clk(clk200), .rst(sys_rst), .swo_in(swo_in),
-        .pulse_valid(p_valid), .pulse_level(p_level), .pulse_count(p_count)
-    );
+
+    generate
+    if (SWO_MODE == 1) begin : g_iddr
+        // IDDR samples swo_in on BOTH edges of clk200 -> 2 oversamples/cycle.
+        // SAME_EDGE_PIPELINED: Q1 and Q2 are presented together one cycle after
+        // the sampling edges. Q1 = rising-edge sample, Q2 = falling-edge sample.
+        wire swo_ibuf;
+        IBUF u_swo_ibuf (.I(swo_in), .O(swo_ibuf));
+        wire q1, q2;
+        IDDR #(
+            .DDR_CLK_EDGE("SAME_EDGE_PIPELINED"),
+            .INIT_Q1(1'b1), .INIT_Q2(1'b1), .SRTYPE("ASYNC")
+        ) u_swo_iddr (
+            .Q1(q1), .Q2(q2), .C(clk200), .CE(1'b1),
+            .D(swo_ibuf), .R(sys_rst), .S(1'b0)
+        );
+        swo_iddr_capture #(.CW(16), .IDLE_FLUSH(16'd8000)) u_cap (
+            .sample_clk(clk200), .rst(sys_rst),
+            .s_d1(q1), .s_d2(q2),
+            .pulse_valid(p_valid), .pulse_level(p_level), .pulse_count(p_count)
+        );
+    end else begin : g_single
+        swo_pulse_capture #(.CW(16), .IDLE_FLUSH(16'd4000)) u_cap (
+            .clk(clk200), .rst(sys_rst), .swo_in(swo_in),
+            .pulse_valid(p_valid), .pulse_level(p_level), .pulse_count(p_count)
+        );
+    end
+    endgenerate
+
     wire        bvld, bval;
     swo_nrz_decode #(.CW(16)) u_nrz (
         .clk(clk200), .rst(sys_rst),
