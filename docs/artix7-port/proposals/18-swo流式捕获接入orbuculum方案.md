@@ -232,6 +232,55 @@ Terminal C: orbcat -s localhost:3402 -T -t 2   (或 orbtop / orbmortem)
 自发 TX（§9 的 FSM/header bug）是"FPGA 主动推流"的优化项，可在主线（并口 SI / SWO baud）
 之后再修；它不再阻塞"流式接入 orbuculum"这个用户目标。
 
+## 8b. 实时工具链深化：reframe 让 orbuculum 原生锁定（✅ 已实现）
+
+§8 的 live bridge 直推原始拼接 TPIU 流时，**orbuculum 自带 TPIU decoder 锁不住**——
+verbose 日志刷 `No handler for tag N`（tag 分布散乱：27/14/64...），因为我们的 sync 太稀疏
+（每 90KB 才 4–5 个 full-sync）且多个一次性 capture 拼接破坏 16 字节帧对齐。orbuculum 的标准
+TPIU 解帧没有我们 etm35lib 的自适应重锁能力。
+
+**解法（不造轮子，复用已验证工具）**：bridge 加 `--reframe` 模式：
+1. 用 `etm35lib.tpiu_deframe_walk(want_stream=2)` 自适应重锁去帧 → 纯 ETM stream 2 字节；
+2. 用 `etm_to_tpiu.reframe()` 重新封装成**标准 TPIU 帧（16 字节对齐 + 每 16 帧一个 FSYNC）**；
+3. 喂 `orbuculum -s ... -T -N -t 2`。
+
+**实测（实时链路，FPGA→bridge→orbuculum）**：
+- orbuculum **0 个 `No handler`**（之前是数万个）→ TPIU **原生锁定**，按 tag 2 路由。
+- legacy :3443 实时持续解出真实 PC（连续多轮 307 / 321 / 224 锚点，全 proj_add）。
+- `--deframe`（只去帧不重封装，喂 orbuculum 不带 `-T`）也能让 0 no-handler，但 reframe
+  版让 orbuculum 走完整 TPIU→tag 路由，更接近原生用法。
+
+bridge 三种模式：默认（原始 TPIU，orbuculum 锁不住，仅 etm35lib 旁路能解）；`--deframe`
+（纯 ETM）；`--reframe`（重封装 TPIU，orbuculum 原生锁）。**推荐 `--reframe`。**
+
+## 8c. orbmortem 实时反汇编：卡在 orbuculum OFLOW 输出缺陷（⚠️ 受阻，已定位）
+
+实时反汇编 orbmortem **只支持从 OFLOW :3402 取 tag**（源码 `orbmortem.c` 第 467-469：
+`PROT_ETM` 直连 legacy 的分支 `return false`，未实现）。所以必须让 OFLOW :3402 的 tag 2
+有合法数据。
+
+reframe 让 orbuculum 锁定后，OFLOW :3402 **裸 socket 能收到字节**（channel header = 2，
+确认 tag 路由对），但：
+- 抓到的字节流 **没有任何 COBS 0x00 帧分隔符**（开头 `25 02 a8 37...`），**不是合法 OFLOW
+  COBS 帧**。
+- orbmortem 连上、配置正确（日志 "Decoding OFLOW with ETM in stream 2"），但**永远 "Waiting"**，
+  verbose 无 RXED——它的 OFLOW 解析器认不出这些非 COBS 字节。
+
+**定位**：这个 orbuculum 版本（`3de6b9b-dirty`）在 **`-T` legacy → OFLOW 重编码路径
+（`_purgeBlock` createOFLOW 分支 / `OFLOWEncode`）上输出的不是合法 COBS 帧**，导致下游 OFLOW
+客户端（orbmortem/orbtop）收不到可解帧。这是 **orbuculum 自身在该模式的缺陷**，不是我们链路
+的问题——我们的 ETM 数据本身正确（legacy :3443 旁路实时解出真实 PC 已证）。
+
+**下一步选项（待定方向，停下讨论）**：
+1. **换/升级 orbuculum**：拉上游最新版，看 OFLOW 重编码是否修了；或用原生 OFLOW 源（不走
+   `-T` legacy）。
+2. **bridge 直接产 OFLOW**：PC 端用 COBS+OFLOW（带 `%%ORBFLOW1.0.0%%` 签名）把去帧后的纯
+   ETM 封成 tag 2，当 OFLOW 源喂 orbuculum（绕开有缺陷的 `-T`→OFLOW 重编码）。中等工作量。
+3. **接受现状**：实时"解出真实 PC 流"已达成（legacy :3443），orbtop/orbmortem 的 TUI 实时
+   呈现作为后续 nice-to-have；离线 orbmortem/Perfetto 已能给完整反汇编+调用栈。
+4. **orbtop 对 ETM 本就弱**：orbtop 基于 ITM PC-sampling，对纯 ETM 指令流支持有限，即使
+   OFLOW 修好也未必出热点——实时反汇编应以 orbmortem 为主。
+
 ## 9. 自发 UDP TX 零包：STREAM=0 判别实验结论（r20 闭环）
 
 r20 指定的单一 next action：把 `selftx_test_top` 设 STREAM=0（摘掉自发 TX FSM，选

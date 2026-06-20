@@ -18,10 +18,16 @@ Set --bitlen to match the STM32 baud at the FPGA sample rate
 (IDDR 400MSa/s, 2 Mbaud -> 200).
 """
 import argparse
+import os
 import socket
 import struct
 import sys
 import time
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "decode"))
+sys.path.insert(0, "decode")
+sys.path.insert(0, ".")
 
 CTRL = 5002
 DATA = 5001
@@ -92,7 +98,32 @@ def main():
                     help="SWO bitlen in sample-ticks (IDDR 400MSa/s, 2Mbaud=200)")
     ap.add_argument("--skip", type=int, default=7680, help="drop capture lead-in transient")
     ap.add_argument("--wait", type=float, default=4.0, help="max s to wait for a fresh full capture")
+    ap.add_argument("--deframe", action="store_true",
+                    help="TPIU-deframe to pure ETM stream-2 bytes before sending "
+                         "(orbuculum's own TPIU decoder can't lock our sparse-sync "
+                         "stitched stream; etm35lib's adaptive re-lock can). Feed "
+                         "orbuculum WITHOUT -T when using this.")
+    ap.add_argument("--reframe", action="store_true",
+                    help="deframe THEN re-wrap as a standard TPIU stream with dense "
+                         "periodic FSYNC so orbuculum locks natively and routes tag 2 "
+                         "to OFLOW :3402 (required for orbmortem/orbtop live). Feed "
+                         "orbuculum WITH -T -t 2.")
+    ap.add_argument("--stream", type=int, default=2, help="ETM stream id for --deframe")
     a = ap.parse_args()
+
+    deframe = None
+    if a.deframe or a.reframe:
+        import etm35lib as L
+        _dfw = lambda b: L.tpiu_deframe_walk(b, want_stream=a.stream)
+        if a.reframe:
+            from etm_to_tpiu import reframe as _reframe
+            deframe = lambda b: _reframe(_dfw(b))
+            print("reframe ON: deframe -> re-wrap as dense-FSYNC TPIU stream-%d "
+                  "(feed orbuculum WITH -T -t %d)" % (a.stream, a.stream), flush=True)
+        else:
+            deframe = _dfw
+            print("deframe ON: sending pure ETM stream-%d bytes "
+                  "(feed orbuculum WITHOUT -T)" % a.stream, flush=True)
 
     if a.bitlen:
         csr(a.ip, 0x03, a.bitlen & 0xFF)
@@ -119,12 +150,14 @@ def main():
             while True:
                 data, prev_gen = grab_one(rs, a.ip, a.skip, prev_gen, a.wait)
                 if data:
+                    if deframe is not None:
+                        data = deframe(data)
                     c.sendall(data)
                     total += len(data)
                     ncap += 1
                     if ncap % 5 == 0:
                         dt = time.time() - t0
-                        sync = data.count(b"\xff\xff\xff\x7f")
+                        sync = data.count(b"\xff\xff\xff\x7f") if deframe is None else -1
                         print(f"  cap#{ncap} gen={prev_gen} {len(data)}B "
                               f"sync={sync} total={total/1024:.0f}KB "
                               f"{total/dt/1024:.1f}KB/s", flush=True)
