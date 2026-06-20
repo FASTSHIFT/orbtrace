@@ -13,7 +13,15 @@
 
 `default_nettype none
 
-module selftx_test_top (
+module selftx_test_top #(
+    // r20 clean discriminator: STREAM=0 strips the self-TX FSM entirely
+    // (selects fpga_core_net g_echo_only -> pure RX echo, no self_busy), so
+    // :5001 echo isolates whether THIS new top-level's link/clock/reset is up.
+    //   echo works  -> link OK on new top  -> zero-packet bug is in FSM/header
+    //   echo silent -> link not up on new top (root-cause A) -> stop here,
+    //                  add STREAM to the known-good swo_stream_top instead.
+    parameter STREAM = 1
+) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
 
@@ -67,7 +75,7 @@ module selftx_test_top (
 
     fpga_core_net #(
         .TARGET("XILINX"),
-        .STREAM(1),
+        .STREAM(STREAM),
         .STREAM_DEST_IP({8'd192, 8'd168, 8'd10, 8'd245}),
         .STREAM_DEST_PORT(16'd5555),
         .STREAM_PKT_BYTES(16'd1024)

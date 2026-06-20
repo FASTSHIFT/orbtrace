@@ -57,7 +57,12 @@ foreach s {
 
 read_xdc $bringup/rtl/selftx.xdc
 
-synth_design -top selftx_test_top -part $part
+# r20 discriminator: STREAM=0 -> g_echo_only (no self-TX FSM), test :5001 echo
+# to isolate new-top link health. STREAM=1 -> full self-TX path.
+set stream 1
+if {[info exists ::env(STREAM)]} { set stream $::env(STREAM) }
+puts "============ SELFTX STREAM = $stream ============"
+synth_design -top selftx_test_top -part $part -generic STREAM=$stream
 opt_design
 place_design
 route_design

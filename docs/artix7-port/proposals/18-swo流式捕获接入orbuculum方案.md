@@ -199,3 +199,61 @@ TPIU 流按概率删 1 KB 块（模拟丢 UDP 包），喂 `orbuculum -s -T -N -
 
 > 落地顺序：udp2tcp.py + orbuculum 链路（阶段1）→ 连续 FIFO + 自发 UDP TX（阶段2）→
 > 实时对拍（阶段3）。每阶段独立可验，风险隔离。
+
+---
+
+## 8. 上板实测：live bridge 路径打通（✅ 已实现 — 重启后复现）
+
+r20 的 STREAM=0 判别实验把自发 TX 零包根因钉到了 **FSM/header（B/C），不是 link（A）**
+（见 §9）。在自发 TX 修复之前，按 r19/r20 一致推荐的**更稳路径**先把用户目标
+（"流式捕获接入 ./orbuculum"）**真正落地**了——零 FPGA 改动，复用已知网络正常的
+`swo_stream.bit`：
+
+**`scripts/swo_live_bridge.py`**：PC 端 TCP server（:5555）。orbuculum 连上后循环
+`re-arm → 等 full → 分 bank 读出 → sendall`，把一次性 BRAM 捕获拼成**连续字节流**。
+re-arm 之间有小间隙，但 §5b 丢包压测已证 orbuculum `-N` keep-sync 靠每帧 HSYNC 平滑越过
+间隙（退化线性、无雪崩），所以这条在**未改 FPGA**的前提下就能实时解。
+
+```
+Terminal A: python3 scripts/swo_live_bridge.py --ip 192.168.10.42 --port 5555 --bitlen 200
+Terminal B: orbuculum -s localhost:5555 -T -N -t 2
+Terminal C: orbcat -s localhost:3402 -T -t 2   (或 orbtop / orbmortem)
+```
+
+**实测结果（设备重启 → 重烧 swo_stream.bit + 重配 ETM 2M dense-sync 后）**：
+- live bridge 连续推流 **~100 KB/s**，每次捕获 90624 B，含 **4–5 个 TPIU full-sync**，
+  gen 单调递增（确认每次都是 fresh capture）。
+- 从 orbuculum legacy :3443 抓到 309 KB，etm35lib 解出 **298 个 flash 锚点，全是 proj_add
+  真实 PC**（0x8000fae loop_sum / 0x8000fc0 / 0x8000f96 setup / 0x8000f8c add / TIM handlers）。
+- orbflow :3402 与 legacy :3443 同时 listening；`orbcat -s localhost:3402` 收到 live 数据
+  （标准 orbuculum 客户端路径打通）。
+
+**结论**：**方案 A 的"实时接入 orbuculum"目标已用 PC-poll bridge 达成**，无需先攻克自发 TX。
+自发 TX（§9 的 FSM/header bug）是"FPGA 主动推流"的优化项，可在主线（并口 SI / SWO baud）
+之后再修；它不再阻塞"流式接入 orbuculum"这个用户目标。
+
+## 9. 自发 UDP TX 零包：STREAM=0 判别实验结论（r20 闭环）
+
+r20 指定的单一 next action：把 `selftx_test_top` 设 STREAM=0（摘掉自发 TX FSM，选
+`fpga_core_net` 的 `g_echo_only` 纯 RX echo），重综合后只测 :5001/:1234 echo，干净区分
+根因 A（新顶层 link 没起）vs B/C（FSM/header）。
+
+- 为此给 `selftx_test_top` 加了 `STREAM` 参数（默认 1），`run_selftx.tcl` 认 `STREAM` 环境
+  变量。STREAM=0 重综合 → 烧板 → `decode/echo_probe.py` 测 :1234 loopback。
+- **板上结果：echo 5/5 全回**（64B 原样返回）。
+- **判定：根因 A（link/时钟/复位/RGMII 没起）排除**——新顶层 `selftx_test_top` 的
+  link/RGMII/复位完全健康。零包 bug 在**自发 TX FSM / header mux（B/C）**，由排除法确认。
+
+**已板上验证的事实（只列这些）**：
+1. STREAM=0（无自发 FSM，纯 echo）→ :1234 echo 5/5 → **link 健康**。
+2. STREAM=1（自发 FSM）→ 零包（含零 ARP，前次实测）。
+3. ∴ bug 在 `g_stream` FSM/header 路径，**不在 link**。
+
+**待查候选（推测，未钉死，留主线后处理）**：`udp_complete` 的
+`UDP_CHECKSUM_GEN_ENABLE=1` 是 **store-and-forward checksum**——它先收 header、再吸完整包
+payload（STATE_SUM_PAYLOAD），最后才把 header 下传触发 ARP。我的 FSM 顺序（ST_HDR 等
+hdr_ready → ST_SEND 发 payload）在纸面上与之相容（header 会先被接受、payload 随后流入），
+所以"FSM 与 checksum 互等"的死锁**经复查并不成立**——不要把它当成已确认根因。零 ARP 的真正
+机制仍需**在板上**用 ILA / tcpdump 抓 `tx_udp_hdr_valid`/`tx_udp_hdr_ready`/payload 握手
+钉死，而不是再做代码审查。修复前必须先有这个板上证据。这条整体排在主线（并口 SI / SWO
+baud）之后；**且它已不阻塞"流式接入 orbuculum"**（§8 的 live bridge 已达成用户目标）。
