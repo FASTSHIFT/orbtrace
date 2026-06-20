@@ -253,33 +253,55 @@ TPIU 解帧没有我们 etm35lib 的自适应重锁能力。
 bridge 三种模式：默认（原始 TPIU，orbuculum 锁不住，仅 etm35lib 旁路能解）；`--deframe`
 （纯 ETM）；`--reframe`（重封装 TPIU，orbuculum 原生锁）。**推荐 `--reframe`。**
 
-## 8c. orbmortem 实时反汇编：卡在 orbuculum OFLOW 输出缺陷（⚠️ 受阻，已定位）
+## 8c. orbmortem 实时反汇编：实测通了（✅ 之前"卡住"是抓屏假象，已用源码级日志证伪）
 
-实时反汇编 orbmortem **只支持从 OFLOW :3402 取 tag**（源码 `orbmortem.c` 第 467-469：
-`PROT_ETM` 直连 legacy 的分支 `return false`，未实现）。所以必须让 OFLOW :3402 的 tag 2
-有合法数据。
+> **重要纠正**：8c 早先记录"orbmortem 卡 Waiting、OFLOW 输出非法 COBS、解出 0x8dce 垃圾地址"
+> —— 这些结论**全部错误**，根因是我在用 ncurses TUI **抓屏刮字符**做判断（黑箱）。改用
+> 源码级日志后，真相完全相反：**orbmortem 网络路解码一直是对的。**
 
-reframe 让 orbuculum 锁定后，OFLOW :3402 **裸 socket 能收到字节**（channel header = 2，
-确认 tag 路由对），但：
-- 抓到的字节流 **没有任何 COBS 0x00 帧分隔符**（开头 `25 02 a8 37...`），**不是合法 OFLOW
-  COBS 帧**。
-- orbmortem 连上、配置正确（日志 "Decoding OFLOW with ETM in stream 2"），但**永远 "Waiting"**，
-  verbose 无 RXED——它的 OFLOW 解析器认不出这些非 COBS 字节。
+实时反汇编 orbmortem 走 OFLOW :3402 取 tag 2。早先从 TUI 屏幕刮到的 `0x8dce` 垃圾地址、
+"Waiting" 状态，都是 ncurses 渲染/抓取的假象，不是解码器真实输出。
 
-**定位**：这个 orbuculum 版本（`3de6b9b-dirty`）在 **`-T` legacy → OFLOW 重编码路径
-（`_purgeBlock` createOFLOW 分支 / `OFLOWEncode`）上输出的不是合法 COBS 帧**，导致下游 OFLOW
-客户端（orbmortem/orbtop）收不到可解帧。这是 **orbuculum 自身在该模式的缺陷**，不是我们链路
-的问题——我们的 ETM 数据本身正确（legacy :3443 旁路实时解出真实 PC 已证）。
+**源码级诊断（非黑箱）**：在 orbmortem 的 `_traceReport`（debug 流）里加了一个受
+`ORBMORTEM_TRACELOG` 环境变量控制的无条件文件日志（off 时零影响），直接 dump 解码器内部的
+地址流/调用栈/分支事件，绕开 TUI。重编 orbmortem 后实测（reframe live 链路）：
 
-**下一步选项（待定方向，停下讨论）**：
-1. **换/升级 orbuculum**：拉上游最新版，看 OFLOW 重编码是否修了；或用原生 OFLOW 源（不走
-   `-T` legacy）。
-2. **bridge 直接产 OFLOW**：PC 端用 COBS+OFLOW（带 `%%ORBFLOW1.0.0%%` 签名）把去帧后的纯
-   ETM 封成 tag 2，当 OFLOW 源喂 orbuculum（绕开有缺陷的 `-T`→OFLOW 重编码）。中等工作量。
-3. **接受现状**：实时"解出真实 PC 流"已达成（legacy :3443），orbtop/orbmortem 的 TUI 实时
-   呈现作为后续 nice-to-have；离线 orbmortem/Perfetto 已能给完整反汇编+调用栈。
-4. **orbtop 对 ETM 本就弱**：orbtop 基于 ITM PC-sampling，对纯 ETM 指令流支持有限，即使
-   OFLOW 修好也未必出热点——实时反汇编应以 orbmortem 为主。
+- 日志 44749 行解码活动 → 解码器**全程在跑**。
+- **13252 个 CPU 地址变更：100% 落在 flash，98.7% 落在 proj_add 循环区**
+  （0x08000f8c~fc0）。top 地址 `0x08000fb6`(loop_sum) / `0x08000f9c`(setup) /
+  `0x08000fae` / `0x08000f8c`(add)——**与 etm35lib 金标准完全吻合**。
+- **调用关系完整重建**：12903 次 Call **全部到 `0x8000f8c`(add) 和 `0x8000fa4`(loop_sum)**，
+  调用栈 push/return 配平（12903 call / 13071 return）。流片段清晰：
+  `Call to 08000f8c → Push 08000fb6 → TAKEN JUMP → Return to 08000fb6`，正是
+  `loop_sum` 里 `s += add(j,j)` 的循环带正确调用栈。
+- 日志里的 `***INCONSISTENT***`（4558 个）是 orbmortem 自检：预测下一址 vs ETM 地址包，
+  循环回跳（fb6→f9c）每次都触发，是**正常分支**，非错误（源码注释自己说对 bx lr 类会误报）。
+
+**结论**：**实时 orbmortem 反汇编 + 调用栈在网络路完全跑通**，端到端解出真实 proj_add 指令流。
+之前"OFLOW 输出非法"的判断作废——OFLOW :3402 数据合法（COBS 帧很大，~4KB/帧，抓 128B 看不到
+0x00 分隔是抽样太短的错觉）。
+
+**教训（记进 corrections）**：**绝不靠 ncurses TUI 抓屏判断解码正确性**——屏幕字符经过滚动/
+渲染/ANSI，刮出来的地址是假象。要源码级日志或 gdb。这次是用户提醒"别当黑箱、打日志"才救回。
+
+## 8d. 为什么串口路当初一帆风顺、网络路看着"卡"（回答用户疑问）
+
+用户问：sidetrack 串口接 SWO 走 orbuculum 都通了，为什么网络这个会卡？
+
+**真相：网络路根本没卡，是我抓屏抓出了假象。** orbuculum 内部对串口源(`-p`)和网络源(`-s`)
+调用的是**同一个 `_handleBlock`**（已读源码确认：`_serialFeeder` 和 `_nwserverFeeder` 都
+走它），对两种源一视同仁。所以"网络 vs 串口"从来不是变量。
+
+唯一的真实差异是**流的连续性**：
+- 串口（CH343）：STM32 不间断实时流，orbmortem 的 interval 抽样总有字节 → 一直显示
+  "Capturing"。
+- 我的 bridge：抓满一个 capture → re-arm 停顿 → 再抓，是**突发流**。orbmortem 的
+  "Capturing/Waiting" 只看抽样 interval 内有没有字节（源码 `oldintervalBytes ? "Capturing"
+  : "Waiting"`），落在 re-arm 停顿期就显示 "Waiting"。**这是显示态，不是解码失败**——日志
+  证明解码器在停顿外的时段正常解出真实 PC。
+
+所以两条路本质都通。网络路要更顺滑（持续 Capturing），只需让 bridge 推流更连续（减小
+re-arm 间隙，或终极方案 §8e 的 FPGA 连续 FIFO），但**解码正确性已不是问题**。
 
 ## 9. 自发 UDP TX 零包：STREAM=0 判别实验结论（r20 闭环）
 
