@@ -16,7 +16,8 @@ import select
 def main():
     binp, elf, server = sys.argv[1:4]
     secs = float(sys.argv[4]) if len(sys.argv) > 4 else 10.0
-    argv = [binp, "-s", server, "-e", elf, "-P", "ETM3.5", "-t", "2", "-v", "3"]
+    extra = sys.argv[5:] if len(sys.argv) > 5 else []
+    argv = [binp, "-s", server, "-e", elf, "-P", "ETM3.5", "-t", "2", "-v", "3"] + extra
     pid, fd = pty.fork()
     if pid == 0:
         os.execv(binp, argv)

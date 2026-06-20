@@ -57,12 +57,43 @@ def read_bank(s, ip, bank, nbytes):
     return bytes(out)
 
 
+def read_timebase(s, ip):
+    """Read the FPGA capture-time base (proposal 18 §9.3). Metadata is in the
+    bank-0 status region at 0xFF06..; the per-stride 32-bit snapshot table is in
+    a dedicated readout bank (0xFE). Returns a dict compatible with
+    decode/fpga_timebase.TimeBase.load (stride/n/tick_ns/last_tick/ticks)."""
+    csr(ip, 0x05, 0)                  # bank 0 for status/metadata
+    time.sleep(0.02)
+    md = req(s, ip, 0xFF06, 9)        # stride_log2, n_lo, n_hi, tick_ns, last(4)
+    stride_log2 = md[0]
+    n = md[1] | (md[2] << 8)
+    tick_ns = md[3]
+    last_tick = md[4] | (md[5] << 8) | (md[6] << 16) | (md[7] << 24)
+    present = req(s, ip, 0xFF0E, 1)[0] & 1
+    if not present or n == 0:
+        return None
+    tbl = read_bank(s, ip, 0xFE, 4 * n)
+    ticks = [tbl[4 * k] | (tbl[4 * k + 1] << 8) | (tbl[4 * k + 2] << 16)
+             | (tbl[4 * k + 3] << 24) for k in range(n)]
+    csr(ip, 0x05, 0)                  # restore bank 0
+    return {
+        "stride": 1 << stride_log2,
+        "n": n,
+        "tick_ns": float(tick_ns),
+        "last_tick": last_tick,
+        "ticks": ticks,
+        "skip": 0,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ip", default="192.168.10.42")
     ap.add_argument("-o", "--out", default="/tmp/swo_big.bin")
     ap.add_argument("--rearm", action="store_true")
     ap.add_argument("--settle", type=float, default=1.0)
+    ap.add_argument("--timebase", action="store_true",
+                    help="also read the FPGA capture-time base into <out>.ts.json")
     a = ap.parse_args()
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -89,6 +120,23 @@ def main():
     sync = out.count(b"\xff\xff\xff\x7f")
     nz = sum(1 for x in out if x)
     print(f"  wrote {len(out)} bytes -> {a.out}  full-sync={sync} nonzero={nz}")
+
+    if a.timebase:
+        import json
+        tb = read_timebase(s, a.ip)
+        if tb is None:
+            print("  timebase: not present in this bitstream")
+        else:
+            tb["depth"] = depth
+            side = a.out + ".ts.json"
+            with open(side, "w") as f:
+                json.dump(tb, f)
+            span_us = tb["last_tick"] * tb["tick_ns"] / 1e3
+            nonmono = sum(1 for k in range(1, len(tb["ticks"]))
+                          if tb["ticks"][k] < tb["ticks"][k - 1])
+            print(f"  timebase: {tb['n']} snapshots @ every {tb['stride']} B, "
+                  f"tick {tb['tick_ns']}ns, span {span_us:.1f} us -> {side}"
+                  + (f"  ({nonmono} wrap pts)" if nonmono else ""))
     return 0
 
 

@@ -328,3 +328,83 @@ hdr_ready → ST_SEND 发 payload）在纸面上与之相容（header 会先被�
 机制仍需**在板上**用 ILA / tcpdump 抓 `tx_udp_hdr_valid`/`tx_udp_hdr_ready`/payload 握手
 钉死，而不是再做代码审查。修复前必须先有这个板上证据。这条整体排在主线（并口 SI / SWO
 baud）之后；**且它已不阻塞"流式接入 orbuculum"**（§8 的 live bridge 已达成用户目标）。
+
+
+---
+
+## 9. orbetto（Perfetto 函数级调用栈）对接 + 时间戳实测（✅ 调用栈通；时间轴需 FPGA 时间）
+
+### 9.1 对接结论
+
+orbetto（`embedded-debug-tools/ext/orbetto`）是**离线文件工具**（`-f`，不接 live
+orbuculum），用 Mortrall 解 ETM 指令流 → Perfetto **函数级调用栈**。对接链路：
+
+```
+FPGA capture (TPIU, sparse sync)
+  -> etm35lib.tpiu_deframe_walk  (自适应重锁 -> 纯 ETM stream 2)
+  -> etm_to_tpiu.reframe         (重封装成密 FSYNC TPIU，orbetto TPIUPump 要 FSYNC 才锁)
+  -> orbetto -C 168000 -t 2 -f <tpiu> -e <elf>  -> orbetto.perf
+```
+一键脚本：`scripts/swo_to_orbetto.sh`。
+
+**实测通过**：orbetto 解出 proj_add 函数级调用栈，`add` 30543 / `loop_sum` 6112 / `setup`
+5 个 slice（比例 ≈5，符合 loop_sum 调 5 次 add），PC bitmap cardinality=29，Overflows=0。
+
+**坑点**：orbetto 的 `Device()` 从 **ELF 文件名**识别芯片（stm32f765/v5x/h753/v6x/nuttx）。
+裸 app ELF 不被识别会 `assert(device.valid())` 崩。解法：把 ELF 软链成含 `nuttx` 的名字
+（orbetto 的纯 ETM 测试 device），CPU 时钟用 `-C` 覆盖。脚本已自动处理。
+
+### 9.2 时间轴：F429 ETM 给不出可用时间（三条路实测全堵死）
+
+orbetto/Mortrall 的时间轴**按 PX4 的 M7/ETMv4 设计**，用 ETM 流自带的 **cycleCount**
+（Mortrall 只响应 `EV_CH_CYCLECOUNT`）。我们是 **STM32F429（Cortex-M4 / ETMv3.5 极简
+ETM-M4）**，与 PX4（F765/H753，M7/ETMv4 + 片内 ETF + 独立 trace clock）有本质硬件差距。
+
+不带 FPGA 时间时，orbetto.perf 的指令 slice 时间轴是**塌的**。逐条实测 + 查 ETM-M4 TRM
+（DDI0440C，refs/）确认 ETM 侧给不出时间：
+
+| 时间源 | 寄存器/包 | 实测结果 | 根因（TRM 实锤） |
+|--------|-----------|----------|------|
+| cycle-accurate | ETM_CR bit12 | 写 0x1880 回读 **0x880**，写不进 | ETM-M4 硬连 0（极简实现裁掉，同 §14 地址比较器） |
+| timestamp 实现位 | ETMCCER bit22 | =1（ETMCCER=0x18541800） | **timestamp 逻辑在芯片里**（与早先误判相反） |
+| timestamp event | ETMTSEVR (**0xE00411F8**) | 配 0x6F 成功 | 之前写错成 0xE0041078 才以为 RAZ/WI；真地址 RW 正常 |
+| timestamp 包 | ETM_CR bit28 | 包能发（72 个 0x42 包）**但值恒 0** | **ETM-M4 不自带 ts 计数器**：DDI0440C §2.1.2 "system implementation **may** provide a timestamp count"——ST 在 F429 SoC **没接** timestamp 时间源 |
+| 对照：CPU 周期 | DWT_CYCCNT | 两次读 c5940f58→c596fc66，**飞涨正常** | 证明 CPU/时钟正常，是 ETM ts 的**外部时间源缺失** |
+
+**结论（TRM 权威确认）**：F429 的 ETM-M4 **timestamp 协议实现了（ETMCCER bit22=1），但
+48-bit timestamp count 是 SoC 外部输入，ST 在 F429 没把任何计数器接给它** → timestamp 包
+值恒 0。cycle-accurate 则被硬连 0 直接裁掉。CYCCNT 正常涨证明不是时钟问题。对比 PX4 的
+M7（F765/H753）SoC 接了 timestamp generator，ETM timestamp 才有值——这是 M4/M7 trace
+子系统的 SoC 级差距，不是配置问题。**A1（用 ETM timestamp）在 F429 不可行已被 TRM 实锤。**
+**这正是本项目当初魔改 orbetto `-F`（FPGA per-byte 时间戳）的根本原因。**
+
+### 9.3 出路：`-F` FPGA 时间戳（A2，✅ 已实现并打通）
+
+要给 SWO→orbetto 这条配正确时间轴，只能用 FPGA 在抓字节时打硬件时间戳（`-F`，抗变频）。
+已给 `swo_stream_top` 加 `TIMEBASE` 参数（默认 1），照搬 `trace_stream_top` 的方案：
+
+- **FPGA 侧**：free-running cap_clk 计数器（CAP500=0 时 clk200=5ns/tick），每 256 字节
+  （TS_STRIDE）快照进 `tsmem` 表。表放**专用读出 bank 0xFE**（不碰 banked 数据 bank 0/1），
+  元数据（stride_log2 / 表项数 / tick_ns / 末尾 tick / present 标志）放 status 区 0xFF06。
+- **PC 侧**：`swo_dump_banked.py --timebase` 从 0xFF06 读元数据 + bank 0xFE 读表，写出
+  `<out>.ts.json`（`fpga_timebase.TimeBase` 格式）。`swo_make_orbetto_time.py` 用
+  `tpiu_deframe_walk_offsets` 跟踪每个 ETM 字节的源 RAW 偏移 → 经 TimeBase 映射成 per-byte ns
+  → reframe 成 TPIU，输出 `<p>.tpiu` + `<p>.fpga_ns`（u64 LE，每 ETM 字节一个 ns）。
+- **orbetto**：`orbetto -C 168000 -t 2 -f <p>.tpiu -e <elf> -F <p>.fpga_ns`。`-F` 数组按
+  ETM 字节序，reframe 是 ETM 字节↔TPIU 1:1，orbetto 再去帧得到相同字节序，ns 1:1 对齐。
+
+**实测打通（重烧带 TIMEBASE 的 swo_stream.bit 后）**：
+- FPGA timebase 读出正常：385 快照 @ 256B，5ns/tick，span ~655ms（含 stall 导致的
+  TRACECLK idle gap，被如实记录为真实时间间隙——这正是 FPGA 时间相对线性插值的价值）。
+- per-byte ns：91344 ETM 字节，span **491ms，单调递增**。
+- orbetto 日志确认 **"FPGA time base: 91344 ns entries (overrides cycleCount)"**，
+  Overflows=0，PC bitmap cardinality=29，函数级调用栈正确（add/loop_sum/setup）。
+- 源码确认（mortrall.hpp `_flush_proto_buffer`）：`use_fpga_time` 时
+  `ns = fpga_ns_buffer[i]` → `event->set_timestamp(ns)`，FPGA 时间真正写进每个 slice。
+
+**结论**：A2 打通。SWO→orbetto 现在有**真实墙钟时间轴**（FPGA 提供，抗变频，idle gap 如实），
+解决了 §9.2 的"时间轴塌"问题。一键：`scripts/swo_to_orbetto.sh`（无时间）/
+`swo_dump_banked.py --timebase` + `swo_make_orbetto_time.py`（带 FPGA 时间）。
+
+> 注：验证 perf 时间轴时，perfetto 官方 trace_processor 需联网下载 prebuilt（本机无外网，
+> exit 35），改由"输入 ns 单调性 + orbetto 日志 + 源码 set_timestamp 路径"三方实锤时间已用上。

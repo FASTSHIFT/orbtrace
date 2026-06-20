@@ -31,8 +31,15 @@ module swo_stream_top #(
                                      //    2x sample rate, toward ORBTrace 500MSa/s
                                      //    (proposal 17). bitlen is then in
                                      //    sample-tick units.
-    parameter CAP500 = 0             // IDDR sample clock: 0=clk200(400MSa/s,
+    parameter CAP500 = 0,            // IDDR sample clock: 0=clk200(400MSa/s,
                                      // timing-clean), 1=clk250(500MSa/s)
+    parameter TIMEBASE = 1           // 1: snapshot a free-running cap_clk counter
+                                     // into a table every TS_STRIDE captured bytes
+                                     // so the PC can put a real wall-clock on each
+                                     // byte (doc 15 §24.2 / proposal 18 §9.3). The
+                                     // F429 ETM has NO usable time (TRM: ts count
+                                     // is an unconnected SoC input), so the FPGA
+                                     // is the authoritative time source.
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -208,6 +215,65 @@ module swo_stream_top #(
     wire [RAW_AW-1:0] rd_addr = {bank_csr, ext_addr}[RAW_AW-1:0];
     reg [7:0] rrd;
     always @(posedge clk125) rrd <= rawmem[rd_addr];
+
+    // ---- FPGA capture-time base (doc 15 §24.2 / proposal 18 §9.3) --------
+    // The F429 ETM emits NO usable time (ETM-M4 TRM: the 48-bit timestamp count
+    // is an unconnected SoC input on this part -> ts packets read 0; cycle-acc
+    // is hardwired off). So WE timestamp on the capture side: a free-running
+    // cap_clk counter snapshotted into a small table every TS_STRIDE captured
+    // bytes. This is real wall-clock, INDEPENDENT of the SWO baud, so it adapts
+    // to any frequency and records idle gaps as genuine time gaps. The PC maps
+    // captured-byte-index -> ns by interpolating the table (fpga_timebase.py).
+    //
+    // tick_ns: cap_clk = clk200 (5 ns) for CAP500=0, clk250 (4 ns) for CAP500=1.
+    localparam TS_STRIDE_LOG2 = 8;                    // snapshot every 256 bytes
+    localparam TS_N  = (DEPTH >> TS_STRIDE_LOG2) + 1; // table entries
+    localparam TS_IW = $clog2(TS_N);
+    localparam [15:0] TS_N16 = TS_N[15:0];
+
+    reg  [31:0] cap_clk_cnt = 32'd0;                  // free-run cap_clk ticks
+    reg  [31:0] cap_clk_last = 32'd0;                 // tick at last byte (tail)
+    (* ram_style = "distributed" *)
+    reg  [31:0] tsmem [0:TS_N-1];
+    wire [7:0]  ts_tick_ns = (CAP500 == 1) ? 8'd4 : 8'd5;
+
+    generate
+    if (TIMEBASE == 1) begin : g_timebase
+        wire             ts_snap = cap_valid && !rfull &&
+                                   (rwr[TS_STRIDE_LOG2-1:0] == 0);
+        wire [TS_IW-1:0] ts_widx = rwr[RAW_AW-1:TS_STRIDE_LOG2];
+        always @(posedge cap_clk) begin
+            if (sys_rst || cap_rearm) cap_clk_cnt <= 32'd0;
+            else                      cap_clk_cnt <= cap_clk_cnt + 1'b1;
+        end
+        always @(posedge cap_clk) if (ts_snap) tsmem[ts_widx] <= cap_clk_cnt;
+        always @(posedge cap_clk)
+            if (cap_valid && !rfull) cap_clk_last <= cap_clk_cnt;
+    end
+    endgenerate
+
+    // sync the tail tick into clk125 for the metadata read
+    reg [31:0] cclast_s0 = 0, cclast_125 = 0;
+    always @(posedge clk125) begin
+        cclast_s0  <= cap_clk_last;
+        cclast_125 <= cclast_s0;
+    end
+
+    // Timebase readout: the snapshot table lives in a DEDICATED readout bank
+    // (TS_BANK = 0xFE), 4 bytes/entry, little-endian; metadata sits in the
+    // status region (bank 0, 0xFF06..). This keeps the banked DATA path (bank
+    // 0/1) untouched. PC: select bank 0xFE, read TS_N*4 bytes.
+    localparam [7:0] TS_BANK = 8'hFE;
+    wire             ts_bank_sel = (bank_csr == TS_BANK);
+    wire [TS_IW-1:0] ts_ridx = ext_addr[TS_IW+1:2];   // /4
+    reg  [31:0]      tsrd;
+    reg  [1:0]       ts_lane_d;
+    always @(posedge clk125) begin
+        tsrd      <= tsmem[ts_ridx];
+        ts_lane_d <= ext_addr[1:0];
+    end
+    wire [7:0] ts_byte = tsrd[8*ts_lane_d +: 8];
+
     // Status bytes live in bank 0 at a fixed high offset (0xFF00..), away from
     // the data, so the PC reads DEPTH/full/gen without colliding with the 128 KB
     // data region. DEPTH is reported as a 32-bit value (it exceeds 16 bits).
@@ -219,8 +285,21 @@ module swo_stream_top #(
                       (ext_addr == 16'hFF02) ? NB[23:16] :
                       (ext_addr == 16'hFF03) ? NB[31:24] :
                       (ext_addr == 16'hFF04) ? {7'b0, rfull} :
-                      (ext_addr == 16'hFF05) ? cap_gen_125 : 8'h00;
-    assign ext_data = status_sel ? status_byte : rrd;
+                      (ext_addr == 16'hFF05) ? cap_gen_125 :
+                      // timebase metadata: stride_log2, entry count(16b),
+                      // tick_ns, tail tick(32b), timebase-present flag.
+                      (ext_addr == 16'hFF06) ? TS_STRIDE_LOG2[7:0] :
+                      (ext_addr == 16'hFF07) ? TS_N16[7:0] :
+                      (ext_addr == 16'hFF08) ? TS_N16[15:8] :
+                      (ext_addr == 16'hFF09) ? ts_tick_ns :
+                      (ext_addr == 16'hFF0A) ? cclast_125[7:0] :
+                      (ext_addr == 16'hFF0B) ? cclast_125[15:8] :
+                      (ext_addr == 16'hFF0C) ? cclast_125[23:16] :
+                      (ext_addr == 16'hFF0D) ? cclast_125[31:24] :
+                      (ext_addr == 16'hFF0E) ? {7'b0, TIMEBASE[0]} : 8'h00;
+    assign ext_data = status_sel  ? status_byte :
+                      ts_bank_sel ? ts_byte :
+                                    rrd;
     assign led1 = ~rfull;
 
     // ---- Ethernet UDP readout (same core as the parallel top) -----------
