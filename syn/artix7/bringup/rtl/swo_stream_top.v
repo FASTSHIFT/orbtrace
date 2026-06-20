@@ -235,7 +235,8 @@ module swo_stream_top #(
         .uart_rxd(1'b1), .uart_txd(),
         .dbg_rx_good_frame(), .dbg_rx_bad_fcs(), .dbg_tx_axis_tvalid(),
         .ext_addr(ext_addr), .ext_data(ext_data),
-        .csr_addr(csr_addr_w), .csr_data(csr_data_w), .csr_we(csr_we_w)
+        .csr_addr(csr_addr_w), .csr_data(csr_data_w), .csr_we(csr_we_w),
+        .stream_tdata(8'h0), .stream_tvalid(1'b0), .stream_tready()
     );
 
     assign phy_mdio = 1'bz;

@@ -45,7 +45,17 @@ THE SOFTWARE.
  */
 module fpga_core_net #
 (
-    parameter TARGET = "GENERIC"
+    parameter TARGET = "GENERIC",
+    // Self-initiated UDP streaming TX (proposal 18 stage 2). When STREAM=1 a
+    // standalone FSM sends UDP packets to a fixed dest (STREAM_DEST_IP:
+    // STREAM_DEST_PORT) WITHOUT any RX trigger, pulling payload from the
+    // stream_* AXIS input. The RX-echo TX path (:5001/:5002 etc.) is preserved
+    // and arbitrated: self-TX only drives the UDP TX input when no RX-echo is
+    // in flight. STREAM=0 keeps the original RX-echo-only behaviour.
+    parameter STREAM = 0,
+    parameter [31:0] STREAM_DEST_IP = {8'd192, 8'd168, 8'd10, 8'd245},
+    parameter [15:0] STREAM_DEST_PORT = 16'd5555,
+    parameter [15:0] STREAM_PKT_BYTES = 16'd1024   // payload bytes per UDP packet
 )
 (
     /*
@@ -117,7 +127,18 @@ module fpga_core_net #
      */
     output reg  [7:0]  csr_addr,
     output reg  [7:0]  csr_data,
-    output reg         csr_we
+    output reg         csr_we,
+
+    /*
+     * Self-initiated streaming TX input (proposal 18, STREAM=1). AXIS byte
+     * stream of payload to push out over UDP to STREAM_DEST_IP:PORT. The core
+     * packetises STREAM_PKT_BYTES per UDP frame. stream_tready backpressures
+     * the producer (the SWO FIFO) when the TX path / ARP is busy. Tie
+     * stream_tvalid=0 if unused (STREAM=0).
+     */
+    input  wire [7:0]  stream_tdata,
+    input  wire        stream_tvalid,
+    output wire        stream_tready
 );
 
 // AXI between MAC and Ethernet modules
@@ -406,23 +427,100 @@ always @(posedge clk) begin
     end
 end
 
-assign tx_udp_hdr_valid = rx_udp_hdr_valid && match_cond;
-assign rx_udp_hdr_ready = (tx_eth_hdr_ready && match_cond) || no_match;
-assign tx_udp_ip_dscp = 0;
-assign tx_udp_ip_ecn = 0;
-assign tx_udp_ip_ttl = 64;
-assign tx_udp_ip_source_ip = local_ip;
-assign tx_udp_ip_dest_ip = rx_udp_ip_source_ip;
-assign tx_udp_source_port = rx_udp_dest_port;
-assign tx_udp_dest_port = rx_udp_source_port;
-assign tx_udp_length = rx_udp_length;
-assign tx_udp_checksum = 0;
+// ---- TX UDP input: RX-echo (always) optionally arbitrated with self-TX ----
+generate
+if (STREAM == 0) begin : g_echo_only
+    // Original behaviour: TX UDP driven purely by the RX-echo path.
+    assign tx_udp_hdr_valid = rx_udp_hdr_valid && match_cond;
+    assign rx_udp_hdr_ready = (tx_eth_hdr_ready && match_cond) || no_match;
+    assign tx_udp_ip_dscp = 0;
+    assign tx_udp_ip_ecn = 0;
+    assign tx_udp_ip_ttl = 64;
+    assign tx_udp_ip_source_ip = local_ip;
+    assign tx_udp_ip_dest_ip = rx_udp_ip_source_ip;
+    assign tx_udp_source_port = rx_udp_dest_port;
+    assign tx_udp_dest_port = rx_udp_source_port;
+    assign tx_udp_length = rx_udp_length;
+    assign tx_udp_checksum = 0;
 
-assign tx_udp_payload_axis_tdata = tx_fifo_udp_payload_axis_tdata;
-assign tx_udp_payload_axis_tvalid = tx_fifo_udp_payload_axis_tvalid;
-assign tx_fifo_udp_payload_axis_tready = tx_udp_payload_axis_tready;
-assign tx_udp_payload_axis_tlast = tx_fifo_udp_payload_axis_tlast;
-assign tx_udp_payload_axis_tuser = tx_fifo_udp_payload_axis_tuser;
+    assign tx_udp_payload_axis_tdata  = tx_fifo_udp_payload_axis_tdata;
+    assign tx_udp_payload_axis_tvalid = tx_fifo_udp_payload_axis_tvalid;
+    assign tx_fifo_udp_payload_axis_tready = tx_udp_payload_axis_tready;
+    assign tx_udp_payload_axis_tlast  = tx_fifo_udp_payload_axis_tlast;
+    assign tx_udp_payload_axis_tuser  = tx_fifo_udp_payload_axis_tuser;
+
+    assign stream_tready = 1'b0;
+end else begin : g_stream
+    // Self-initiated streaming TX (proposal 18 stage 2), arbitrated with the
+    // RX-echo path. Priority: an in-flight RX-echo reply (so :5001/:5002 still
+    // work); when idle, the self-TX FSM sends a UDP packet of STREAM_PKT_BYTES
+    // to the fixed dest, pulling payload from stream_*.
+    //
+    // FSM: IDLE -> wait until stream has data AND no echo in flight -> assert
+    // tx_udp_hdr_valid with fixed dest -> SEND payload bytes (count to
+    // STREAM_PKT_BYTES, tlast on the last) -> back to IDLE.
+    localparam ST_IDLE = 2'd0, ST_HDR = 2'd1, ST_SEND = 2'd2;
+    reg [1:0]  st;
+    reg [15:0] bcnt;
+
+    // RX-echo wants the TX path this cycle?
+    wire echo_req = rx_udp_hdr_valid && match_cond;
+    // self-TX owns the path while not IDLE
+    wire self_busy = (st != ST_IDLE);
+
+    // RX-echo header handshake: only when self-TX is idle (echo has priority on
+    // a fresh request, but cannot interrupt an in-flight self packet).
+    // The single udp_complete header-valid input is the OR of echo and self-TX.
+    assign tx_udp_hdr_valid = (echo_req && !self_busy) || (st == ST_HDR);
+    assign rx_udp_hdr_ready  = ((tx_eth_hdr_ready && match_cond) || no_match) && !self_busy;
+
+    // header field mux: echo uses RX-derived fields, self-TX uses fixed dest
+    wire use_self_hdr = (st == ST_HDR);
+    assign tx_udp_ip_dscp = 0;
+    assign tx_udp_ip_ecn  = 0;
+    assign tx_udp_ip_ttl  = 64;
+    assign tx_udp_ip_source_ip = local_ip;
+    assign tx_udp_ip_dest_ip = use_self_hdr ? STREAM_DEST_IP   : rx_udp_ip_source_ip;
+    assign tx_udp_source_port = use_self_hdr ? STREAM_DEST_PORT : rx_udp_dest_port;
+    assign tx_udp_dest_port   = use_self_hdr ? STREAM_DEST_PORT : rx_udp_source_port;
+    assign tx_udp_length      = use_self_hdr ? (16'd8 + STREAM_PKT_BYTES) : rx_udp_length;
+    assign tx_udp_checksum = 0;
+
+    // self header valid is folded into tx_udp_hdr_valid above (ST_HDR).
+
+    // payload mux: echo from tx_fifo, self from stream_*
+    assign tx_udp_payload_axis_tdata  = self_busy ? stream_tdata
+                                                  : tx_fifo_udp_payload_axis_tdata;
+    assign tx_udp_payload_axis_tvalid = self_busy ? (st == ST_SEND && stream_tvalid)
+                                                  : tx_fifo_udp_payload_axis_tvalid;
+    assign tx_udp_payload_axis_tlast  = self_busy ? (st == ST_SEND && (bcnt == STREAM_PKT_BYTES-1))
+                                                  : tx_fifo_udp_payload_axis_tlast;
+    assign tx_udp_payload_axis_tuser  = self_busy ? 1'b0 : tx_fifo_udp_payload_axis_tuser;
+    assign tx_fifo_udp_payload_axis_tready = !self_busy && tx_udp_payload_axis_tready;
+    assign stream_tready = (st == ST_SEND) && tx_udp_payload_axis_tready;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            st <= ST_IDLE; bcnt <= 0;
+        end else case (st)
+            ST_IDLE:
+                // start a self packet when a full packet's worth is available
+                // (here: just when stream has data and echo is not requesting)
+                if (stream_tvalid && !echo_req) begin
+                    st <= ST_HDR; bcnt <= 0;
+                end
+            ST_HDR:
+                if (tx_udp_hdr_ready) st <= ST_SEND;
+            ST_SEND:
+                if (tx_udp_payload_axis_tvalid && tx_udp_payload_axis_tready) begin
+                    if (bcnt == STREAM_PKT_BYTES-1) begin
+                        st <= ST_IDLE; bcnt <= 0;
+                    end else bcnt <= bcnt + 1'b1;
+                end
+        endcase
+    end
+end
+endgenerate
 
 assign rx_fifo_udp_payload_axis_tdata = ext_reg    ? ext_data :
                                         golden_reg ? golden_byte :
