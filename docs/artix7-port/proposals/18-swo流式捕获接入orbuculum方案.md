@@ -110,6 +110,32 @@ PC 端循环 `swo_dump_banked --rearm` 拼接成长流喂 orbuculum -f（或管�
 
 ---
 
+## 4b. 地基实测验证（r19 Q1 — 已通过 ✅）
+
+红方 r19 Q1 质疑"orbuculum 能吃我们的字节格式"是未验证的对冲假设，可能 OFLOW 自动判别
+导致裸 TPIU 字节全 COBS error。**按 r19 建议用零 FPGA、干净数据钉死了这条地基：**
+
+实验（`decode/feed_tcp.py` + `decode/probe_orbuculum_out.py`）：
+1. 拿一段 etm35lib 已验证 0.535% / 93 锚点的干净 UART-decoded TPIU 字节流（`/tmp/raw.bin`，
+   含 5 个 TPIU full-sync）。
+2. `feed_tcp.py` 当 TCP server（:5555）循环吐这段字节。
+3. `orbuculum -s localhost:5555 -T -N -t 2` 连它。
+4. `probe_orbuculum_out.py` 连 orbuculum 的 legacy tag-2 口 :3443，抓它**剥 TPIU 后转发**
+   的字节，用 etm35lib 验证。
+
+**结果**：
+- orbuculum 收下字节，**进 legacy 模式**（不是 OFLOW），日志 "Will decode tag 2, exported
+  Legacy interface on port 3443"、持续 "RXED Packet"、**无 COBS/OFLOW error**。
+- 从 :3443 抓到 335 KB，etm35lib 解出 **308 个 flash 锚点，PC 全是 proj_add 真实地址**
+  （0x8000fae loop_sum / 0x8000f8c add / 0x8000f96 setup / 0x8000fc0）。
+
+**结论**：地基成立。`orbuculum -s` 网络源**接受我们 UART-decoded 的 TPIU formatter 字节**，
+`-T -N -t 2` 正确剥 TPIU + 路由 ETM stream 2。r19 Q1 担心的"OFLOW 判别拦路"未发生。
+§1 之前的"/或"对冲假设现已坐实为：**legacy 模式 + -T 吃裸 TPIU 字节**。剩余风险（自发 TX
+复杂度 Q2、丢包 Q3）不影响地基，按 r19 顺序在阶段 2 前单独处理。
+
+---
+
 ## 5. 带宽与背压（诚实评估）
 
 | baud | SWO 字节率 | vs 千兆 | vs orbuculum |
