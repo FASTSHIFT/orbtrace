@@ -306,16 +306,47 @@ unknown 率计算。**作为把"中速全频段都 golden"做扎实的下一步�
 - `scripts/trace_stream_rx.py`:host 收流、剥序列号、检测 gap、落盘、测吞吐。
 - `fpga_flow/run_trace_mmcm_stream.tcl`:构建脚本。
 
-**卡点(实测,未解):FPGA self-TX 路径不发包。** 烧 `trace_mmcm_stream.bit` 后网络栈整个
-不响应(连 ARP 都不回);进一步用上游**专门验证 self-TX 的** `selftx_test_top`(STREAM=1,
-固定 ramp 负载)单独测:ARP 能解析(RX 栈活着),但 **:5555 上 0 包,FPGA MAC 不发任何
-ARP/UDP**(tcpdump 实测)。即 `fpga_core_net` 的 self-TX FSM(g_stream,proposal 18 stage2)
-**在板上从未真正发过包** —— 它进 ST_HDR 后 udp_complete 没有对 dest 发起 ARP/发包。
+**卡点(已解,§8.1):FPGA self-TX 路径不发包。** 烧 `trace_mmcm_stream.bit` 后网络栈不响应
+(连 ARP 都不回);进一步用上游**专门验证 self-TX 的** `selftx_test_top` 单独测,确认
+self-TX 从未真正发过包。
 
-**结论:流式的拦路石不是 MMCM 捕获(那已 golden),而是上游 self-TX 发送 FSM 未验证。**
-这需要仿真/ILA 定位(ST_HDR→udp_complete 的 ARP 发起),不宜在板上盲调。下一步候选:
-1. 给 self-TX FSM 写 testbench(s_udp_hdr 握手 + ARP 触发),在仿真里看它为何不发;
-2. 或换 orbtrace 原生的 orbflow/UDP 发送路径(若有已验证的连续 TX);
-3. 捕获侧已就绪,任一发送路径打通即可端到端流式抓 LVGL。
+### 8.1 ★ 根因 + 修复:UDP checksum-gen 在连续流下卡死(全栈仿真定位)
 
-> 当前可用交付:一次性 64KB 窗口(21M golden,§7.5)。流式待 self-TX 修通。
+按"先仿真定位、不盲调"的纪律,把 self-TX FSM 抽成独立 `udp_tx_streamer.v`,配真 `udp_complete`
+(+ip/arp)写全栈 TB(`rtl/sim/udp_tx_streamer_tb.v`,带行为级 ARP 应答 peer),板上现象在
+仿真里精确复现:
+
+- UDP 头被接受、payload 全部排空、`udp_checksum_gen` FSM 跑到 FINISH_SUM —— 但它的 header
+  FIFO 不前进,`m_udp_hdr_valid` 永不拉高 → udp.v 不出 IP 头 → ip_complete 不发 ARP →
+  网线上 0 帧(连 ARP 都没有)。**verilog-ethernet 的 `udp_checksum_gen` 在连续自发起流下
+  卡死**(RX-echo 路径因 payload 来自 FIFO、帧间有空隙而绕过了它)。
+- **修复:`UDP_CHECKSUM_GEN_ENABLE=0`。** UDP 校验和对 IPv4 是可选的(0=未计算,RFC 768),
+  host 照收;trace 流不需要逐包 UDP 校验和。关掉后仿真干净直流:1 ARP → 应答 → 65 连续
+  IP/UDP 帧(PASS)。`fpga_core_net` 加 `UDP_CHECKSUM_GEN_ENABLE` 参数(默认 1 保持 echo 行为),
+  流式顶层设 0。
+
+### 8.2 ★ 板上实测:连续流跑通,golden 质量,可抓 LVGL
+
+烧 `trace_mmcm_stream.bit`(21M,checksum 关),STM32 HCLK /4:
+
+| 指标 | 实测 |
+|------|------|
+| 吞吐 | **20.9–21.1 MB/s**(= 21M TRACECLK × 1 byte/周期,满速无节流)|
+| UDP 丢包(序列号) | **0**(lost_pkts=0)|
+| FPGA 捕获侧 lost_cnt | 213355(**仅启动瞬间**,ARP 解析时 FIFO 填满;之后稳定不增长)|
+| unknown 字节率(启动后窗口)| **0.0022%**(= one-shot golden,§7.5)|
+| 重建指令数 | **2,042,512**(单次连续窗口)|
+| loop_sum×5 顺序+次数 | **31890/31914 完美(99.92%)** |
+
+**结论:流式高容量传输打通,质量与 one-shot golden 一致,吞吐跟得上 21M 满速且零持续丢包。
+可以开始抓 LVGL。** 唯一 artifact 是启动瞬间 ARP 解析期间 FIFO 填满丢的一段(一次性,
+~213KB),抓取时丢弃开头一段或加一次 re-arm 即可;稳态零丢包。
+
+> 注:`trace_stream_rx.py` 收流剥 4 字节序列号、检 gap、落盘;`mmcm_decode.py` 解码;
+> `orbetm`+`verify_flow.py` 做逐指令重建 + 顺序/次数核对。
+
+### 8.3 遗留(次要)
+- 启动 ARP 期间的一次性 FIFO 丢弃:可在顶层加"ARP 解析完成前不计数/丢弃"或加更深 FIFO +
+  host 端丢弃首包窗口。不影响稳态。
+- self-TX FSM 仍内联在 fork 的 `fpga_core_net` g_stream 里;独立 `udp_tx_streamer.v` 已抽出
+  并仿真验证,后续可切过去让 core 回归纯以太网核(架构清理 B,见对话记录)。
