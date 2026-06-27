@@ -63,9 +63,14 @@ module trace_capture_mmcm #(
         .CLKOUT1_DIVIDE(DIVID),
         .CLKOUT0_PHASE(0.0),
         .CLKOUT1_PHASE(PHASE),           // sample-clock phase (deg, generic).
-        // 90 deg is the textbook eye-centre, but board sweep (proposal 22 §7.3)
-        // shows the optimum rises with frequency due to fixed data-clock skew:
-        // 21M->90, 42M/84M->135. Set PHASE per target frequency at build.
+        // Board-verified eye-centre phase RISES with frequency (fixed
+        // data-clock skew is a growing fraction of the shrinking UI). Measured
+        // optima (proposal 22 §7.5, by min unknown-byte rate, NOT anchor count):
+        //   21M -> 90.0   (0.002% unknown, golden)
+        //   84M -> 112.5  (0.01%  unknown, golden)
+        // The optimum is narrow at 84M (UI=11.9ns): 135 deg gives 1.2%, 112.5
+        // gives 0.01% -- so PHASE MUST be set per target frequency at build.
+        // (Runtime dynamic phase calibration is the robust long-term fix.)
         .STARTUP_WAIT("FALSE")
     ) u_mmcm (
         .CLKIN1(trace_clk_bufg),

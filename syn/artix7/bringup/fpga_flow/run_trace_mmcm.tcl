@@ -1,8 +1,15 @@
-# Build trace_mmcm_top: mid-speed parallel trace via MMCM 90-deg phase-shift
-# sampling (proposal 22 §7.1). Output: trace_mmcm.bit
+# Build trace_mmcm_top: mid-speed parallel trace via MMCM phase-shift sampling
+# (proposal 22 §7.1). Output: trace_mmcm.bit
 #   cd build && MULT=40 DIVID=40 vivado -mode batch -source ../fpga_flow/run_trace_mmcm.tcl
-# MULT/DIVID set the trace-clk MMCM (VCO=TRACECLK*MULT must be 600-1200MHz).
-# For TRACECLK 21MHz: MULT=40 DIVID=40 (VCO=840MHz).
+# MULT/DIVID set the trace-clk MMCM (VCO=TRACECLK*MULT must be 600-1440MHz).
+#
+# Board-VERIFIED golden recipes (proposal 22 §7.5, min unknown-byte rate):
+#   21M TRACECLK (HCLK/4): MULT=40 DIVID=40 TRACE_PERIOD=47.6 PHASE=90.0
+#                          -> 0.002% unknown  (default; -> trace_mmcm.bit)
+#   84M TRACECLK (HCLK/1): MULT=10 DIVID=10 TRACE_PERIOD=11.9 PHASE=112.5
+#                          -> 0.01% unknown   (OUTBIT=trace_mmcm_84m_p112.bit)
+# PHASE is the eye-centre and MUST be set per frequency (the 84M eye is narrow;
+# 135 deg gives 1.2%, 112.5 gives 0.01%). Decode with decode/mmcm_decode.py.
 
 set part      xc7a35tfgg484-2
 set bdir      [file dirname [info script]]
