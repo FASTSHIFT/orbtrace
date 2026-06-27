@@ -67,8 +67,10 @@ set eye 4
 if {[info exists ::env(EYE)]} { set eye $::env(EYE) }
 set selftest 0
 if {[info exists ::env(SELFTEST)]} { set selftest $::env(SELFTEST) }
-puts "============ TAP = $tap  CAP_RAW = $capraw  EYE = $eye  SELFTEST = $selftest ============"
-synth_design -top trace_stream_top -part $part -generic TAP=$tap -generic CAP_RAW=$capraw -generic EYE=$eye -generic SELFTEST=$selftest
+set twidth 4
+if {[info exists ::env(TRACE_WIDTH)]} { set twidth $::env(TRACE_WIDTH) }
+puts "============ TAP = $tap  CAP_RAW = $capraw  EYE = $eye  SELFTEST = $selftest  TRACE_WIDTH = $twidth ============"
+synth_design -top trace_stream_top -part $part -generic TAP=$tap -generic CAP_RAW=$capraw -generic EYE=$eye -generic SELFTEST=$selftest -generic TRACE_WIDTH=$twidth
 opt_design
 place_design
 route_design

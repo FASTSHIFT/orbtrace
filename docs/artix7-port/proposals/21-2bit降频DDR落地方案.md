@@ -78,15 +78,26 @@ ETM 码率 ≈ CPU_MHz × 0.78（IPC~0.7 × 1.12 bit/指令，**proj_add 量级�
 
 ### 3.3 推荐起点（保守、SI 友好、不 stall）
 
-- **CPU 降到 48 MHz**（HSI 16M ×PLL 或 HSE 分频），ETM ~37 Mbit/s。
-- **TRACECLK ~12-15 MHz**（TPIU prescale），2-bit DDR 40-60 Mbit/s，**码率有余量 → 不开
-  stall → 拿到不被拖慢的完整函数级流**。
-- TRACECLK 12-15M **远低于 r18 GPIO Fmax 50M、r16 出问题的频率**，杜邦线 SI 友好。
-- **br_out=0**（只要调用栈，省带宽；间接分支地址 + P-header 重建 BL 目标）。
+> **关键事实修正（实测依据：`target/downclock.cfg`）**：F429 的并口 **TRACECLK 直接由
+> HCLK 派生，没有独立分频器**（TPIU_ACPR 只对 SWO 异步模式有效，对并口无效）。所以**唯一
+> 的频率旋钮是 RCC_CFGR.HPRE 分频 HCLK**——降 HCLK 同时降 CPU 算力和 TRACECLK。
+>
+> 这反而让方案更干净：**CPU 算力与 trace 带宽天然同比例缩放、自动匹配**。不存在"满速 CPU +
+> 慢 trace"（那只能靠 stall）。用户"先降频"的策略正好是并口唯一可行的非 stall 路。
 
-> 诚实标注：§3.2 码率是 proj_add 量级估算，真实调用密集代码更高（r21 Q1）。若实测码率超
-> 余量 → 要么再降 CPU、要么升 TRACECLK（但保持 < Fmax）、要么开轻 stall。降频的好处正是
-> **这些都是连续可调的旋钮，不是赌满速**。
+- **HPRE 降频**：`DIV=4`（HCLK 168→42 MHz）或 `DIV=8`（→21 MHz）。降频用现成
+  `downclock.cfg`（不 reset，避免固件 restore HPRE）。
+- **TRACECLK 随之降**到 ~10-21 MHz 区间（DDR 下 TRACECLK 与 HCLK 的确切比值 = HCLK 或
+  HCLK/2，**待示波器实测确认**），远低于 r18 GPIO Fmax 50M、r16 出问题频率 → SI 友好。
+- **2-bit DDR 带宽与 ETM 码率同比例缩放**：降频后 CPU 慢了，ETM 码率也按比例降，2-bit 通道
+  带宽（随 TRACECLK）同步降——两者比值不变。**所以"够不够"由 2-bit DDR vs ETM 码率的
+  比值决定，与降频倍数无关**（§3.1/§3.2 的比值在任何 HPRE 下都成立）。
+- **br_out=0**（只要调用栈，省带宽）。
+
+> 重新表述核心权衡：降频不改变"2-bit DDR 带宽 vs ETM 码率"的比值，它只把两者一起拉到 SI
+> 友好的低频。**真正决定不-stall 可行性的，是 2-bit DDR 每 HCLK 能搬多少 bit vs ETM 每
+> CPU 周期产多少 bit**——这个比值 §3.1（4 bit/TRACECLK 周期）vs §3.2（~0.78 bit/CPU周期）
+> 才是关键，PoC 要量的就是它。
 
 ---
 

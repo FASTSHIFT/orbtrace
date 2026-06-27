@@ -35,7 +35,7 @@ module trace_stream_top #(
                                       // /64 (~1.3 MHz) is ~380 ns (~76 cyc) so
                                       // ~38 is dead-centre. Swept on-board to
                                       // find the lowest bit-error point.
-    parameter       SELFTEST = 0      // 1: feed the OVERSAMPLE sampler an
+    parameter       SELFTEST = 0,     // 1: feed the OVERSAMPLE sampler an
                                       // FPGA-internal, asynchronous (phy_rx_clk
                                       // domain), clean edge-aligned pseudo-trace
                                       // (DDR ramp +7 mod 16 per edge) instead of
@@ -45,6 +45,11 @@ module trace_stream_top #(
                                       // captured stream must be an exact +7
                                       // mod-16 ramp; any deviation = the async
                                       // oversampling architecture itself errs.
+    parameter       TRACE_WIDTH = 4   // TPIU parallel port width: 4 or 2 bits
+                                      // (proposal 21: 2-bit downclocked DDR).
+                                      // Drives traceIF.width and which data
+                                      // lanes are used. 2-bit uses TRACED0/1
+                                      // only (pins F13/E14); TRACED2/3 ignored.
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -170,10 +175,12 @@ module trace_stream_top #(
 
     wire        fr_avail;
     wire [127:0] frame;
+    // traceIF width encoding: 2'b11 = 4-bit, 2'b10 = 2-bit (CoreSight TPIU-Lite).
+    localparam [1:0] TIF_WIDTH = (TRACE_WIDTH == 2) ? 2'b10 : 2'b11;
     traceIF #(.MAXBUSWIDTH(4)) u_traceif (
         .rst(sys_rst | ~idelayctrl_rdy),
         .traceDina(trace_a), .traceDinb(trace_b), .traceClkin(trace_clk),
-        .width(2'b11), .edgeOutput(), .FrAvail(fr_avail), .Frame(frame)
+        .width(TIF_WIDTH), .edgeOutput(), .FrAvail(fr_avail), .Frame(frame)
     );
     // Isolate FrAvail (which has an async reset in traceIF) from the BRAM
     // write-enable path with a reset-less flop, then form the toggle strobe
