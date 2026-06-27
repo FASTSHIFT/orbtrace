@@ -55,7 +55,14 @@ module fpga_core_net #
     parameter STREAM = 0,
     parameter [31:0] STREAM_DEST_IP = {8'd192, 8'd168, 8'd10, 8'd245},
     parameter [15:0] STREAM_DEST_PORT = 16'd5555,
-    parameter [15:0] STREAM_PKT_BYTES = 16'd1024   // payload bytes per UDP packet
+    parameter [15:0] STREAM_PKT_BYTES = 16'd1024,   // payload bytes per UDP packet
+    // UDP TX checksum generation. The verilog-ethernet udp_checksum_gen stage
+    // stalls under a continuous self-TX stream (header FIFO never advances ->
+    // no IP frame / ARP egress; root-caused in rtl/sim/udp_tx_streamer_tb.v).
+    // UDP checksum is optional for IPv4 (0 = "not computed", RFC 768), so the
+    // streaming top disables it. Echo path is unaffected (it already sends
+    // checksum=0). Default 1 preserves the original behaviour.
+    parameter UDP_CHECKSUM_GEN_ENABLE = 1
 )
 (
     /*
@@ -663,7 +670,9 @@ eth_axis_tx_inst (
     .busy()
 );
 
-udp_complete
+udp_complete #(
+    .UDP_CHECKSUM_GEN_ENABLE(UDP_CHECKSUM_GEN_ENABLE)
+)
 udp_complete_inst (
     .clk(clk),
     .rst(rst),

@@ -198,6 +198,8 @@ module trace_mmcm_stream_top #(
     fpga_core_net #(
         .TARGET("XILINX"),
         .STREAM(1),
+        .UDP_CHECKSUM_GEN_ENABLE(0),   // see fpga_core_net: checksum gen stalls
+                                       // a continuous self-TX stream (sim-proven)
         .STREAM_DEST_IP(DEST_IP),
         .STREAM_DEST_PORT(DEST_PORT),
         .STREAM_PKT_BYTES(PKT[15:0])
