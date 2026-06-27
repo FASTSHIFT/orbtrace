@@ -291,3 +291,31 @@ unknown 率计算。**作为把"中速全频段都 golden"做扎实的下一步�
 - IDDR 换边沿在我们板上只验过"开眼吐帧",**未端到端解出真 PC**。
 - tap=78ps 仅在 REFCLK=200MHz 时成立;若改 300MHz refclk,tap≈52ps、总范围更小,下限频率
   更高(约 150MHz)。
+
+
+---
+
+## 8. 流式高容量传输:RTL 写好,卡在上游 self-TX 路径未验证(诚实状态)
+
+为抓 LVGL(代码量远超 64KB 一次性窗口),把 MMCM 捕获改成连续流式:
+
+- `trace_mmcm_stream_top.v`:MMCM 前端 → `axis_async_fifo`(clk90→clk125 CDC)→
+  打包器(每包 `[4字节大端序列号][PAYLOAD trace字节]`,FIFO 深度门控避免半包欠载)→
+  `fpga_core_net` self-TX(STREAM=1)连续 UDP 到 host:5555。丢包计数 `lost_cnt`(捕获侧
+  FIFO 满)+ 序列号(传输侧丢包)双重核账。**综合/布线干净,时序收敛(WNS +0.70ns)。**
+- `scripts/trace_stream_rx.py`:host 收流、剥序列号、检测 gap、落盘、测吞吐。
+- `fpga_flow/run_trace_mmcm_stream.tcl`:构建脚本。
+
+**卡点(实测,未解):FPGA self-TX 路径不发包。** 烧 `trace_mmcm_stream.bit` 后网络栈整个
+不响应(连 ARP 都不回);进一步用上游**专门验证 self-TX 的** `selftx_test_top`(STREAM=1,
+固定 ramp 负载)单独测:ARP 能解析(RX 栈活着),但 **:5555 上 0 包,FPGA MAC 不发任何
+ARP/UDP**(tcpdump 实测)。即 `fpga_core_net` 的 self-TX FSM(g_stream,proposal 18 stage2)
+**在板上从未真正发过包** —— 它进 ST_HDR 后 udp_complete 没有对 dest 发起 ARP/发包。
+
+**结论:流式的拦路石不是 MMCM 捕获(那已 golden),而是上游 self-TX 发送 FSM 未验证。**
+这需要仿真/ILA 定位(ST_HDR→udp_complete 的 ARP 发起),不宜在板上盲调。下一步候选:
+1. 给 self-TX FSM 写 testbench(s_udp_hdr 握手 + ARP 触发),在仿真里看它为何不发;
+2. 或换 orbtrace 原生的 orbflow/UDP 发送路径(若有已验证的连续 TX);
+3. 捕获侧已就绪,任一发送路径打通即可端到端流式抓 LVGL。
+
+> 当前可用交付:一次性 64KB 窗口(21M golden,§7.5)。流式待 self-TX 修通。
