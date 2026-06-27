@@ -60,14 +60,23 @@ def main():
     raw = open(a.stream, "rb").read()
     data, parity = recover_assemble(raw)
 
-    # deframe with source-offset tracking (offsets index into `data`, which is
-    # 1:1 with TRACECLK periods, so offset*period = wall-clock ns)
+    # deframe to clean ETM. Use the continuous re-aligning WALKER (re-locks per
+    # ~1KB window, doc 14 §19) over ALL stream data -- the F429 capture is a
+    # single-source bare-ETM-in-TPIU stream, so do NOT filter by stream id
+    # (want_stream=2 drops bytes mis-assigned to spurious stream switches and
+    # corrupts the stream: 8.9% unknown vs the walker's 2.9%; the offset-
+    # tracking variant uses a non-relocking phase and is also worse, ~10%).
     if L.has_tpiu_sync(data):
-        etm, offs = L.tpiu_deframe_walk_offsets(data, want_stream=2)
+        etm = L.tpiu_deframe_walk(data)
     else:
         etm = data
-        offs = list(range(len(data)))
-    ns = [int(round(o * a.period_ns)) for o in offs]
+    # Uniform wall-clock: the capture is a constant 1 byte / TRACECLK period, so
+    # spread the known window span evenly across the ETM bytes. (The walker
+    # drops HSYNC fillers, so a per-byte source offset isn't 1:1 available; the
+    # even spread is monotonic and matches the true mean rate.)
+    span_ns = int(len(raw) * a.period_ns)
+    n = max(1, len(etm))
+    ns = [int(k * span_ns / n) for k in range(len(etm))]
 
     tpiu = reframe(etm)
     out_tpiu = a.out_prefix + ".tpiu"

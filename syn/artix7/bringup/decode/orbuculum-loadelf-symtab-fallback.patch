@@ -1,0 +1,148 @@
+commit b03286ba7f8f167b8f6125fee86d4fd2fb8d30db
+Author: VIFEX <vifextech@foxmail.com>
+Date:   Sun Jun 28 00:27:15 2026 +0800
+
+    fix(loadelf): resolve symtab-only functions missing from DWARF
+    
+    symbolFunctionAt() returned NULL for functions that exist in the ELF symbol
+    table but have no usable DWARF DW_TAG_subprogram low/high_pc (common with LTO,
+    hand-written asm, or vendor libs that ship line info but incomplete function
+    DIEs). Downstream (orbetto/Mortrall) then renders Perfetto call-stack slices as
+    raw "0x........" instead of the function name.
+    
+    Add _addSymtabFunctions(): after DWARF processing, walk .symtab and append a
+    symbolFunctionStore for every STT_FUNC symbol whose [value, value+size) is not
+    already covered by a DWARF function. Purely additive — DWARF entries (which
+    carry source lines) always win where present; the symtab only fills gaps.
+    
+    Measured on an STM32F429 LVGL ELF: previously NULL for millis / lv_tick_get /
+    lv_tick_elaps (real functions), now resolved. In the orbetto LVGL trace, named
+    call-stack slices went 0% -> 98% (raw-address slices were symtab-only funcs).
+
+diff --git a/Src/loadelf.c b/Src/loadelf.c
+index e10652c..269fdb1 100644
+--- a/Src/loadelf.c
++++ b/Src/loadelf.c
+@@ -200,6 +200,107 @@ static bool _readProg( struct symbol *p )
+ 
+ // ====================================================================================================
+ 
++static bool _addSymtabFunctions( struct symbol *p )
++
++/* Fallback function resolution from the ELF symbol table (.symtab). DWARF
++ * function DIEs can be incomplete (some functions have line info but no usable
++ * DW_TAG_subprogram low/high_pc, esp. with LTO / hand-written asm / vendor
++ * libs), leaving symbolFunctionAt() == NULL for real functions -> Perfetto
++ * slices show a raw "0x........" instead of the name. The ELF symbol table is
++ * complete, so for every STT_FUNC symbol whose [value,value+size) is NOT
++ * already covered by a DWARF function, append a function store entry. Purely
++ * additive: DWARF entries (with source lines) always win where they exist. */
++
++{
++    Elf *e;
++    Elf_Scn *scn = NULL;
++    GElf_Shdr shdr;
++    unsigned added = 0;
++    unsigned ndwarf = p->nfunc;    /* DWARF funcs occupy [0,ndwarf), stay sorted */
++
++    if ( elf_version( EV_CURRENT ) == EV_NONE )
++    {
++        return false;
++    }
++
++    if ( ( e = elf_begin( p->fd, ELF_C_READ, NULL ) ) == NULL )
++    {
++        return false;
++    }
++
++    while ( ( scn = elf_nextscn( e, scn ) ) != NULL )
++    {
++        if ( gelf_getshdr( scn, &shdr ) != &shdr )
++        {
++            continue;
++        }
++
++        if ( shdr.sh_type != SHT_SYMTAB )
++        {
++            continue;
++        }
++
++        Elf_Data *data = elf_getdata( scn, NULL );
++        int nsym = ( shdr.sh_entsize ) ? ( shdr.sh_size / shdr.sh_entsize ) : 0;
++
++        for ( int i = 0; i < nsym; i++ )
++        {
++            GElf_Sym sym;
++
++            if ( gelf_getsym( data, i, &sym ) != &sym )
++            {
++                continue;
++            }
++
++            if ( GELF_ST_TYPE( sym.st_info ) != STT_FUNC || sym.st_size == 0 )
++            {
++                continue;
++            }
++
++            symbolMemaddr lo = sym.st_value & ~( symbolMemaddr )1; /* drop Thumb bit */
++            symbolMemaddr hi = lo + sym.st_size - 1;
++
++            /* already covered by a DWARF function? bsearch the sorted DWARF
++             * prefix [0,ndwarf) only (appended symtab entries are unsorted). */
++            struct symbolFunctionStore **fp =
++                ( struct symbolFunctionStore ** )bsearch( &lo, p->func, ndwarf,
++                        sizeof( struct symbolFunctionStore * ), _matchFunc );
++
++            if ( fp )
++            {
++                continue;
++            }
++
++            const char *name = elf_strptr( e, shdr.sh_link, sym.st_name );
++
++            if ( !name || !name[0] )
++            {
++                continue;
++            }
++
++            p->func = ( struct symbolFunctionStore ** )realloc( p->func,
++                      sizeof( struct symbolFunctionStore * ) * ( p->nfunc + 1 ) );
++            struct symbolFunctionStore *nf = p->func[p->nfunc] =
++                        ( struct symbolFunctionStore * )calloc( 1, sizeof( struct symbolFunctionStore ) );
++            p->nfunc++;
++            nf->funcname = strdup( name );
++            nf->lowaddr  = lo;
++            nf->highaddr = hi;
++            added++;
++        }
++    }
++
++    if ( added )
++    {
++        qsort( p->func, p->nfunc, sizeof( struct symbolFunctionStore * ), _compareFunc );
++    }
++
++    elf_end( e );
++    return added > 0;
++}
++
++// ====================================================================================================
++
+ int _findOrAddString( const char *stringToFindorAdd, char ***table, unsigned int *elementCount )
+ 
+ {
+@@ -1169,6 +1270,14 @@ struct symbol *symbolAcquire( char *filename, bool loadmem, bool loadsource )
+         return NULL;
+     }
+ 
++    /* Fallback: fill in any functions present in the ELF symbol table but
++     * missing from DWARF, so symbolFunctionAt() resolves them (otherwise
++     * Perfetto slices show raw 0x addresses for symtab-only functions). */
++    if ( loadmem )
++    {
++        _addSymtabFunctions( p );
++    }
++
+     /* ...finally, the source code if requested. This can only be done if mem or functions we requested */
+     if ( ( loadsource && loadmem )  && !_loadSource( p ) )
+     {
