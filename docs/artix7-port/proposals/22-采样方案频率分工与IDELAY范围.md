@@ -110,10 +110,41 @@ ARM TPIU 并口是 **源同步 edge-aligned DDR**:数据在 TRACECLK 两个沿�
 
 ---
 
-## 7. 诚实边界
+## 7. 频率扫描实测(本轮补,纠正旧估)
 
-- OVERSAMPLE 上限 ~10M 是 doc 旧估 + 本轮"1.3M 通 / 168M 失锁"两点佐证,中间(10-50M)
-  确切失锁点未逐点实测。
+逐档扫 STM32 HCLK,测 OVERSAMPLE 4-bit 通路解出的 flash I-sync 锚点
+(`scripts/freq_scan_oversample.sh`):
+
+| HCLK | I-sync 锚点 | distinct PC | 状态 |
+|------|------------|------------|------|
+| 1.3 MHz (/128) | 16 | 3 | ✅ |
+| 10.5 MHz (/16) | 15 | 3 | ✅ |
+| 21 MHz (/8) | 18 | 5 | ✅ |
+| **42 MHz (/4)** | **0** | **0** | ❌ 失锁 |
+| 84 MHz (/2) | — | — | ❌(把 FPGA 网络搞挂,需重烧恢复) |
+
+**OVERSAMPLE 实测可用上限 ≈ 21M HCLK,42M 崩。** 且 42M 下**扫遍 EYE_DELAY=1..12
+(`scripts/eye_scan_42m.sh`)全部 0 锚点** —— 失锁**不是** mid-eye 点位置(改 EYE 救不活),
+而是**过采样率根本不够**(42M 下每半位 ref_200m 采样点太少,边沿检测/配对失效)。
+
+> duty 统计在真实信号 + 过采样多检下持续失真(测出 ms 级假"半周期"),**不可用于判
+> TRACECLK 频率或物理连通**,本轮多次被它误导,改用锚点解码 + boundary-scan 判定。真实
+> TRACECLK 频率待 LA 直接读数(HCLK↔TRACECLK 分频:etm_enable 注释 /16 prescale vs
+> downclock.cfg "直接 HCLK 派生无独立分频",两处矛盾,需实测)。
+
+### 7.1 中速(>21M)方案:MMCM 90° 移相(中速可行,低速不行)
+
+要中速,§3 的"换边沿"在中速段有低速做不到的实现:**MMCM 对 TRACECLK 移相 90°**(=DDR
+半位)落眼心,免 IDELAY 绝对延时。低速(<10M)TRACECLK < MMCM 最低输入锁不住;**中速
+(TRACECLK 10-50M)MMCM 能锁** → 正好填 OVERSAMPLE(≤21M)与 IDELAY(≳100M)之间的空档。
+前提:真实 TRACECLK ≥ ~10M(待实测)。若 TRACECLK=HCLK/16 则也锁不住,得提过采样钟或
+IDDR 换边沿配对。**TRACECLK 实测频率是下一步 PoC 第一问。**
+
+---
+
+## 8. 诚实边界(更新)
+
+- OVERSAMPLE 上限 ~21M HCLK 已逐档实测(§7),非旧估。
 - §2 的 ~100MHz 下限是 IDELAY 2.496ns + edge-aligned DDR 的物理推导,**未在板上撞到**
   (我们从没跑到 100MHz TRACECLK)。
 - IDDR 换边沿在我们板上只验过"开眼吐帧",**未端到端解出真 PC**。
