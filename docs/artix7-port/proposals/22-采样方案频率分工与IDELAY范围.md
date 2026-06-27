@@ -102,6 +102,7 @@ ARM TPIU 并口是 **源同步 edge-aligned DDR**:数据在 TRACECLK 两个沿�
 |------|------|----------|------|
 | **现在就要函数级 trace** | OVERSAMPLE 降频 | 1.3-10M | ✅ 已通(4-bit 解真 PC) |
 | 中速 + 函数级 | IDDR 换边沿(免移相) | 10-50M | 需做:换边沿采 + 端到端解码(V2 只到开眼) |
+| 中速 + 函数级 | **MMCM 90° 移相** | **21M(HCLK 42M)** | **✅ 已通,板上解出真 PC(§7.2)** |
 | 高速/满速 | IDDR + IDELAY 移相 | ≳100M(§2 下限)| 命门:此频段 SI + IDELAY 对眼,未触及 |
 
 **最务实**:用 OVERSAMPLE 降频(已通)交付函数级 trace 能力,接 orbetto 出调用栈+时间轴;
@@ -139,6 +140,32 @@ ARM TPIU 并口是 **源同步 edge-aligned DDR**:数据在 TRACECLK 两个沿�
 (TRACECLK 10-50M)MMCM 能锁** → 正好填 OVERSAMPLE(≤21M)与 IDELAY(≳100M)之间的空档。
 前提:真实 TRACECLK ≥ ~10M(待实测)。若 TRACECLK=HCLK/16 则也锁不住,得提过采样钟或
 IDDR 换边沿配对。**TRACECLK 实测频率是下一步 PoC 第一问。**
+
+### 7.2 MMCM 90° 移相 —— 板上验证成功(✅ 实测,本轮)
+
+`trace_capture_mmcm.v` + `trace_mmcm_top.v`(独立顶层,不动已验证的 OVERSAMPLE
+`trace_stream_top`)在 **STM32 HCLK=42MHz(TRACECLK=21MHz)** 实测:
+
+- **MMCM 锁定**:capture MMCM(`u_cap/u_mmcm`,CLKIN=21M,VCO=21M×40=840M)
+  `locked=1`,buffer `rfull=1` —— 21MHz 远高于 MMCM 最低输入,稳定锁定。
+- **解出真实函数级 trace**(`/tmp/mmcm_best.bin`,16 I-sync 锚点 / 44 branches):
+  - `0x08000f8c _Z3addii` → main.cpp:54
+  - `0x08000fb2 _Z8loop_sumi` → main.cpp:61
+  - `0x08000e90 TIM8_UP_TIM13_IRQHandler` → timer.c:483
+- **采集频率 = OVERSAMPLE 上限的 2×**:OVERSAMPLE 在 42M HCLK 失锁(§7),MMCM 90°
+  在 42M HCLK / 21M TRACECLK **解出真 PC** —— stage4 以来第二个在 FPGA 通路解出真实
+  函数的方案,且把可用频率从 21M HCLK 抬到 ≥42M HCLK。
+
+#### 关键实测细节:半位配对偏移一拍
+naive 打包 `{trace_b[k], trace_a[k]}`(同周期上/下半位)**解不出**(0 锚点)。板上暴力
+搜索(`decode/mmcm_halfbit_search.py`,扫 offset×nibble序×lane序)得唯一可解组合:
+**`cap_byte = {trace_a[k] (高nibble), trace_b[k-1] (低nibble)}`** —— 即字节边界比"同
+周期两半位"偏移一个半位。根因:IDDR `SAME_EDGE_PIPELINED` 把当前上沿与**上一周期**下沿
+配在一起(流水线相位)。已据此改 `trace_capture_mmcm.v`(`trace_b_q` 打一拍),使板上
+直出字节即可解码(为后续 orbuculum 实时喂流准备)。
+
+> 诚实标注:21M 已实测解出真 PC;更高(42M TRACECLK / 84M HCLK)MMCM 仍能锁(VCO 需
+> 调 MULT,如 42M×20=840M),但 84M HCLK 曾把 FPGA 网络搞挂(§7),未在该频段验证解码。
 
 ---
 
