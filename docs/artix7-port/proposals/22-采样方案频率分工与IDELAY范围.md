@@ -103,6 +103,7 @@ ARM TPIU 并口是 **源同步 edge-aligned DDR**:数据在 TRACECLK 两个沿�
 | **现在就要函数级 trace** | OVERSAMPLE 降频 | 1.3-10M | ✅ 已通(4-bit 解真 PC) |
 | 中速 + 函数级 | IDDR 换边沿(免移相) | 10-50M | 需做:换边沿采 + 端到端解码(V2 只到开眼) |
 | 中速 + 函数级 | **MMCM 90° 移相** | **21M(HCLK 42M)** | **✅ 已通,板上解出真 PC(§7.2)** |
+| 中/高速 + 函数级 | **MMCM 移相(phase 135°)** | **42M / 84M(满速)** | **✅ 已通,打到 F429 满速上限(§7.3)** |
 | 高速/满速 | IDDR + IDELAY 移相 | ≳100M(§2 下限)| 命门:此频段 SI + IDELAY 对眼,未触及 |
 
 **最务实**:用 OVERSAMPLE 降频(已通)交付函数级 trace 能力,接 orbetto 出调用栈+时间轴;
@@ -164,8 +165,48 @@ naive 打包 `{trace_b[k], trace_a[k]}`(同周期上/下半位)**解不出**(0 �
 配在一起(流水线相位)。已据此改 `trace_capture_mmcm.v`(`trace_b_q` 打一拍),使板上
 直出字节即可解码(为后续 orbuculum 实时喂流准备)。
 
-> 诚实标注:21M 已实测解出真 PC;更高(42M TRACECLK / 84M HCLK)MMCM 仍能锁(VCO 需
-> 调 MULT,如 42M×20=840M),但 84M HCLK 曾把 FPGA 网络搞挂(§7),未在该频段验证解码。
+> 诚实标注:21M 已实测解出真 PC。更高频段(42M/84M TRACECLK)的频率上限扫描见 §7.3。
+
+### 7.3 频率上限扫描 —— 实测到 F429 满速 84M TRACECLK(本轮)
+
+把 TRACECLK 逐档往上推(TRACECLK=HCLK/2,HPRE 只有 /1、/2、/4 三档可用),每档配
+匹配的 MMCM MULT 保持 VCO≈840MHz(在 600-1440MHz 内),实测每档能否锁定 + 解出真 PC。
+`trace_capture_mmcm.v` 的 `MULT`/`CLKIN_PERIOD`/`PHASE` 已参数化,一套 RTL 覆盖全频段。
+
+| TRACECLK | HCLK | HPRE | MULT/DIVID | VCO | phase=90° | phase=135° | 时序(WNS) |
+|----------|------|------|-----------|-----|-----------|-----------|-----------|
+| 21M | 42M | /4 | 40/40 | 840M | **16 锚点 ✅** | — | +0.92ns |
+| 42M | 84M | /2 | 20/20 | 840M | 1 锚点 | **17 锚点 ✅** | +0.54ns |
+| **84M** | **168M(满速)** | **/1** | 10/10 | 840M | 3 锚点 | **18 锚点 ✅** | +0.51ns |
+
+每档"锚点"= `etm_decode_cli` 在 ELF .text 内解出的 I-sync;✅ = add/loop_sum/TIM8
+三个函数全部带 file:line 解出。
+
+**结论:MMCM 90°移相方案实测打到 STM32F429 的满速上限 —— HCLK 168MHz / TRACECLK
+84MHz,函数级 trace 完整解出(18 I-sync / 51 branches)。** F429 没有更高档(HPRE 已
+到 /1),所以这是器件上限而非方案上限;方案本身(VCO 840M,IO/IDDR)还有余量。
+
+#### 关键实测规律:最佳采样相位随频率上移
+- 21M:90° 完美(16 锚点)。UI=23.8ns,相位不敏感。
+- 42M/84M:90° 退化(1/3 锚点),**135° 才回到满解(17/18 锚点)**。
+- 物理解释:ETM data 相对 TRACECLK 有固定的 PCB+IO 传播 skew(几 ns)。低频时这点
+  skew 占 UI(11.9-23.8ns)比例小,90°≈眼心;高频时 UI 减半,同样的 skew 把眼心从
+  90° 推向更大相位,需 ~135° 补偿。**所以高速档把 `PHASE` 设 135° 是必须的,不是 90°。**
+- 配对方向 `{trace_a[k], trace_b[k-1]}`(offset=1,hi_first=1)**三档通用**,只有相位要随频率调。
+
+#### 一个曾掩盖结论的坑(诚实记录)
+首轮 42M 测试"全 0 锚点",一度以为 42M 解不出。两个真因:
+1. **时序未收敛**:`set_clock_groups` 写在 XDC 里,但 MMCM 生成时钟在 `read_xdc` 时
+   还不存在 → 命令空匹配静默失效,clk90↔clk125 的 CDC 路径没被切断。21M 周期长(47.6ns)
+   凑够了 setup 没暴露,42M(23.8ns)直接 setup 违例 -4.6ns。**修复:把 create_clock +
+   set_clock_groups 移到 synth 之后的 tcl 里**(此时生成时钟已存在)。
+2. **HCLK 没设对**:相位扫描脚本里 telnet 命令的 `\&` 在 heredoc 中转义出错,HCLK
+   复位回了 168M(满速),导致"42M 测试"实际跑在 84M TRACECLK 而 MULT 仍按 42M(VCO=420M)
+   → 失锁。**修复:用字面 RCC_CFGR 值(0x948a/0x940a/0x949a)写寄存器,不做 shell 算术**。
+
+> 诚实边界:以上为 proj_add 固件(小循环)实测,锚点数(16-18)反映其代码足迹小。84M
+> 已是 F429 满速,未(也无法在本器件)测更高;更高 TRACECLK 需换 MCU。phase 只扫了
+> 45/90/135/180 四点,最佳点在 135° 附近但未做更细网格。
 
 ---
 

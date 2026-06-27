@@ -29,6 +29,8 @@
 module trace_capture_mmcm #(
     parameter         MULT  = 40,        // MMCM CLKFBOUT_MULT_F; VCO=TRACECLK*MULT
     parameter integer DIVID = 40,        // CLKOUT0_DIVIDE: VCO/DIVID = TRACECLK
+    parameter         CLKIN_PERIOD = 47.6, // ns, must match real TRACECLK period
+    parameter         PHASE = 90.0,     // CLKOUT1 sample-clock phase (deg)
     parameter         WIDTH = 4          // data lanes used (2 or 4)
 ) (
     input  wire        rst,
@@ -56,11 +58,14 @@ module trace_capture_mmcm #(
         .BANDWIDTH("OPTIMIZED"),
         .CLKFBOUT_MULT_F(MULT),
         .DIVCLK_DIVIDE(1),
-        .CLKIN1_PERIOD(47.6),            // ~21 MHz (overridden by real lock range)
+        .CLKIN1_PERIOD(CLKIN_PERIOD),    // real TRACECLK period (generic)
         .CLKOUT0_DIVIDE_F(DIVID),
         .CLKOUT1_DIVIDE(DIVID),
         .CLKOUT0_PHASE(0.0),
-        .CLKOUT1_PHASE(90.0),            // 90-deg shifted sample clock
+        .CLKOUT1_PHASE(PHASE),           // sample-clock phase (deg, generic).
+        // 90 deg is the textbook eye-centre, but board sweep (proposal 22 §7.3)
+        // shows the optimum rises with frequency due to fixed data-clock skew:
+        // 21M->90, 42M/84M->135. Set PHASE per target frequency at build.
         .STARTUP_WAIT("FALSE")
     ) u_mmcm (
         .CLKIN1(trace_clk_bufg),

@@ -23,9 +23,10 @@ set_property PACKAGE_PIN D14 [get_ports {trace_data_in[2]}]
 set_property PACKAGE_PIN E16 [get_ports {trace_data_in[3]}]
 set_property IOSTANDARD LVCMOS33 [get_ports trace_clk_in]
 set_property IOSTANDARD LVCMOS33 [get_ports {trace_data_in[*]}]
-# TRACECLK = HCLK/2 = 21MHz (measured on LA). Period 47.6ns.
-# This feeds the capture MMCM: VCO = MULT * 21MHz must be 600-1200MHz.
-create_clock -period 47.600 -name trace_clk_in [get_ports trace_clk_in]
+# TRACECLK = HCLK/2. create_clock for trace_clk_in is issued from
+# run_trace_mmcm.tcl AFTER read_xdc (TRACE_PERIOD env), so one RTL/XDC covers a
+# frequency band: capture MMCM VCO = MULT*1000/period must be 600-1440MHz.
+#   21MHz->47.6/M40 ; 42MHz->23.8/M20 ; 84MHz->11.9/M10
 # D17 (MRCC) -> IBUF -> BUFG -> MMCM. Allow dedicated-route demotion.
 set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -hierarchical -filter {NAME =~ *trace_clk_ibuf*}]
 
@@ -53,15 +54,11 @@ set_property PACKAGE_PIN N18 [get_ports led1]
 set_property IOSTANDARD LVCMOS33 [get_ports led0]
 set_property IOSTANDARD LVCMOS33 [get_ports led1]
 
-set_clock_groups -asynchronous \
-    -group [get_clocks sys_clk_50] \
-    -group [get_clocks trace_clk_in] \
-    -group [get_clocks phy_rx_clk] \
-    -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT0]] \
-    -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT1]] \
-    -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT3]] \
-    -group [get_clocks -of_objects [get_pins u_cap/u_mmcm/CLKOUT0]] \
-    -group [get_clocks -of_objects [get_pins u_cap/u_mmcm/CLKOUT1]]
+# NOTE: set_clock_groups is issued from run_trace_mmcm.tcl AFTER synth +
+# create_clock, because the MMCM-generated clocks (u_sysmmcm/*, u_cap/u_mmcm/*)
+# and trace_clk_in do not exist yet at read_xdc time -- declaring the groups
+# here silently no-ops, leaving clk90<->clk125 CDC paths constrained (they pass
+# at 21M by slack luck but fail setup at 42M+).
 
 set_property BITSTREAM.CONFIG.SPI_BUSWIDTH 4 [current_design]
 set_property CONFIG_MODE SPIx4 [current_design]

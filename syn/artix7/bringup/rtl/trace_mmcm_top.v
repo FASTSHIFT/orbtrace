@@ -21,6 +21,8 @@ module trace_mmcm_top #(
     parameter DEPTH = 65536,         // captured bytes (one bank)
     parameter MULT  = 40,            // MMCM mult: VCO = TRACECLK*MULT (600-1200M)
     parameter DIVID = 40,            // CLKOUT divide: VCO/DIVID = TRACECLK
+    parameter CLKIN_PERIOD = 47.6,   // ns, real TRACECLK period
+    parameter PHASE = 90.0,          // CLKOUT1 sample-clock phase (deg)
     parameter WIDTH = 4
 ) (
     input  wire        sys_clk_50,
@@ -84,7 +86,7 @@ module trace_mmcm_top #(
     wire [3:0]  trace_a, trace_b;
     wire [7:0]  cap_byte;
     wire        cap_valid;
-    trace_capture_mmcm #(.MULT(MULT), .DIVID(DIVID), .WIDTH(WIDTH)) u_cap (
+    trace_capture_mmcm #(.MULT(MULT), .DIVID(DIVID), .CLKIN_PERIOD(CLKIN_PERIOD), .PHASE(PHASE), .WIDTH(WIDTH)) u_cap (
         .rst(sys_rst),
         .trace_clk_p(trace_clk_in), .trace_data_p(trace_data_in),
         .trace_clk(cap_clk), .clk90_out(clk90),

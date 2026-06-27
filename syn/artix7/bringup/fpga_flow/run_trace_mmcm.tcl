@@ -60,11 +60,32 @@ set mult 40
 if {[info exists ::env(MULT)]} { set mult $::env(MULT) }
 set divid 40
 if {[info exists ::env(DIVID)]} { set divid $::env(DIVID) }
-puts "============ MULT=$mult DIVID=$divid ============"
-synth_design -top trace_mmcm_top -part $part -generic MULT=$mult -generic DIVID=$divid
+set tperiod 47.6
+if {[info exists ::env(TRACE_PERIOD)]} { set tperiod $::env(TRACE_PERIOD) }
+set phase 90.0
+if {[info exists ::env(PHASE)]} { set phase $::env(PHASE) }
+puts "============ MULT=$mult DIVID=$divid TRACE_PERIOD=$tperiod PHASE=$phase ============"
+synth_design -top trace_mmcm_top -part $part -generic MULT=$mult -generic DIVID=$divid -generic CLKIN_PERIOD=$tperiod -generic PHASE=$phase
+# Issue trace_clk_in create_clock here (post-synth, port exists) so TRACE_PERIOD
+# drives the capture-MMCM VCO DRC. (Reading env inside read_xdc did not take.)
+create_clock -period $tperiod -name trace_clk_in [get_ports trace_clk_in]
+# Async clock groups issued here (post-synth) so the MMCM-generated clocks
+# actually exist and the CDC paths (clk90<->clk125 etc.) get cut. Declaring
+# this in the XDC no-ops because generated clocks are absent at read_xdc time.
+set_clock_groups -asynchronous \
+    -group [get_clocks sys_clk_50] \
+    -group [get_clocks trace_clk_in] \
+    -group [get_clocks phy_rx_clk] \
+    -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT0]] \
+    -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT1]] \
+    -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT3]] \
+    -group [get_clocks -of_objects [get_pins u_cap/u_mmcm/CLKOUT0]] \
+    -group [get_clocks -of_objects [get_pins u_cap/u_mmcm/CLKOUT1]]
 opt_design
 place_design
 route_design
 report_timing_summary -no_detailed_paths -no_header
-write_bitstream -force trace_mmcm.bit
-puts "============ TRACE MMCM BUILD DONE (MULT=$mult DIVID=$divid) ============"
+set outbit "trace_mmcm.bit"
+if {[info exists ::env(OUTBIT)]} { set outbit $::env(OUTBIT) }
+write_bitstream -force $outbit
+puts "============ TRACE MMCM BUILD DONE (MULT=$mult DIVID=$divid -> $outbit) ============"
