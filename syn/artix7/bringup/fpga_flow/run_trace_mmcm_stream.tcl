@@ -69,8 +69,10 @@ set tperiod 47.6
 if {[info exists ::env(TRACE_PERIOD)]} { set tperiod $::env(TRACE_PERIOD) }
 set phase 90.0
 if {[info exists ::env(PHASE)]} { set phase $::env(PHASE) }
-puts "============ STREAM MULT=$mult DIVID=$divid TRACE_PERIOD=$tperiod PHASE=$phase ============"
-synth_design -top trace_mmcm_stream_top -part $part -generic MULT=$mult -generic DIVID=$divid -generic CLKIN_PERIOD=$tperiod -generic PHASE=$phase
+set width 4
+if {[info exists ::env(WIDTH)]} { set width $::env(WIDTH) }
+puts "============ STREAM MULT=$mult DIVID=$divid TRACE_PERIOD=$tperiod PHASE=$phase WIDTH=$width ============"
+synth_design -top trace_mmcm_stream_top -part $part -generic MULT=$mult -generic DIVID=$divid -generic CLKIN_PERIOD=$tperiod -generic PHASE=$phase -generic WIDTH=$width
 create_clock -period $tperiod -name trace_clk_in [get_ports trace_clk_in]
 set_clock_groups -asynchronous \
     -group [get_clocks sys_clk_50] \

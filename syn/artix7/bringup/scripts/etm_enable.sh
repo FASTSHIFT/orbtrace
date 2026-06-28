@@ -15,7 +15,7 @@ set -u
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
-cfg="$root/target/etm_enable.cfg"
+cfg="${CFG:-$root/target/etm_enable.cfg}"
 TIMEOUT="${TIMEOUT:-6}"
 
 # Free any resident OpenOCD that would hold the ST-Link.

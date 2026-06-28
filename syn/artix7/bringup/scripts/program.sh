@@ -19,9 +19,11 @@ target="${1:-orbflow}"
 mode="${2:-jtag}"
 
 case "$target" in
-    orbflow) bit="trace_orbflow.bit"; mcs="trace_orbflow.mcs" ;;
-    stream)  bit="trace_stream.bit";  mcs="trace_stream.mcs"  ;;
-    *) echo "usage: $0 [orbflow|stream] [jtag|flash]"; exit 2 ;;
+    orbflow)     bit="trace_orbflow.bit";     mcs="trace_orbflow.mcs"     ;;
+    stream)      bit="trace_stream.bit";      mcs="trace_stream.mcs"      ;;
+    mmcm)        bit="trace_mmcm.bit";        mcs="trace_mmcm.mcs"        ;;
+    mmcm_stream) bit="trace_mmcm_stream.bit"; mcs="trace_mmcm_stream.mcs" ;;
+    *) echo "usage: $0 [orbflow|stream|mmcm|mmcm_stream] [jtag|flash]"; exit 2 ;;
 esac
 
 if ! command -v vivado >/dev/null 2>&1; then

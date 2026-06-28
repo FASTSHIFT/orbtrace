@@ -15,9 +15,11 @@ root="$(cd "$here/.." && pwd)"
 target="${1:-orbflow}"
 
 case "$target" in
-    orbflow) tcl="run_trace_orbflow.tcl"; bit="trace_orbflow.bit" ;;
-    stream)  tcl="run_trace_stream.tcl";  bit="trace_stream.bit"  ;;
-    *) echo "usage: $0 [orbflow|stream]"; exit 2 ;;
+    orbflow)      tcl="run_trace_orbflow.tcl";      bit="trace_orbflow.bit"      ;;
+    stream)       tcl="run_trace_stream.tcl";       bit="trace_stream.bit"       ;;
+    mmcm)         tcl="run_trace_mmcm.tcl";         bit="trace_mmcm.bit"         ;;
+    mmcm_stream)  tcl="run_trace_mmcm_stream.tcl";  bit="trace_mmcm_stream.bit"  ;;
+    *) echo "usage: $0 [orbflow|stream|mmcm|mmcm_stream]"; exit 2 ;;
 esac
 
 if ! command -v vivado >/dev/null 2>&1; then
