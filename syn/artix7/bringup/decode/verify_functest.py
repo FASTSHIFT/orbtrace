@@ -65,18 +65,26 @@ for fn, wt, v in parse(data):
 events.sort(key=lambda x: x[0])
 
 def demangle(n):
-    # Robust for our fixed known set: just find which known func_test name is a
-    # substring of the (possibly mangled) slice name. Hash digits in the
-    # anonymous-namespace mangling make length-prefix parsing unreliable, and we
-    # only need to identify the known functions.
+    # The orbetto decoder now emits already-demangled, prefix-stripped names
+    # like "mydelay(unsigned int)", "level_a(unsigned int)", "main_loop()", and
+    # sometimes still "(anonymous namespace)::foo(...)" or a raw length-prefixed
+    # mangling. Reduce any of these to the bare identifier and match the known
+    # set exactly.
     KNOWN = ("factorial","deep1","deep2","deep3","deep4","deep5","deep6",
              "op_add","op_sub","op_mul","cb_handler_a","cb_handler_b",
              "pingpong","level_a","level_b","level_c","leaf_add","leaf_mul",
              "mydelay","conditional","frame_func","indirect_caller",
              "dispatch_callback","callback_test","mixed_test","repeat_test",
              "main_loop")
+    # core identifier: drop namespace qualifier and parameter list
+    core = n
+    if "::" in core:
+        core = core.split("::")[-1]
+    core = core.split("(")[0].strip()
+    if core in KNOWN:
+        return core
+    # fallback for still-mangled forms (length-prefixed)
     for k in KNOWN:
-        # match the length-prefixed form (e.g. "9factorial") or bare
         if (str(len(k))+k) in n or n.endswith(k) or n == k:
             return k
     return n
