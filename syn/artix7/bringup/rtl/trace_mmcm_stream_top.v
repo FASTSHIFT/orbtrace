@@ -140,16 +140,49 @@ module trace_mmcm_stream_top #(
             .m_status_bad_frame(), .m_status_good_frame()
         );
     end else begin : g_trace
-        // only push real captured bytes once the trace MMCM has locked
-        wire fifo_in_valid = cap_valid & clk90_locked;
+        // Trace data path: either raw cap_byte (4-bit) or traceIF-framed (2-bit).
+        // traceIF correctly handles the 2-bit TPIU frame assembly that cannot
+        // be reliably done on the PC side.
+        wire [7:0] trace_byte;
+        wire       trace_byte_valid;
+
+        if (WIDTH == 2) begin : g_traceif
+            // 2-bit: use traceIF to assemble TPIU frames, then serialize to bytes
+            wire        fr_avail;
+            wire [127:0] frame;
+            traceIF #(.MAXBUSWIDTH(4)) u_traceif (
+                .rst(sys_rst | ~clk90_locked),
+                .traceDina(trace_a), .traceDinb(trace_b),
+                .traceClkin(cap_clk),
+                .width(2'b10),
+                .edgeOutput(), .FrAvail(fr_avail), .Frame(frame)
+            );
+
+            // Toggle → pulse conversion for FrAvail
+            reg fr_d;
+            always @(posedge cap_clk) fr_d <= fr_avail;
+            wire frame_pulse = fr_avail ^ fr_d;
+
+            // Serialize 128-bit frame to bytes (still in cap_clk domain)
+            frame_to_bytes u_f2b (
+                .clk(cap_clk), .rst(sys_rst | ~clk90_locked),
+                .frame_valid(frame_pulse), .frame_data(frame),
+                .m_tdata(trace_byte), .m_tvalid(trace_byte_valid),
+                .m_tready(fifo_in_ready)
+            );
+        end else begin : g_raw
+            // 4-bit: raw {trace_a, trace_b_q} byte, 1 per TRACECLK
+            assign trace_byte = cap_byte;
+            assign trace_byte_valid = cap_valid & clk90_locked;
+        end
 
         axis_async_fifo #(
             .DEPTH(FIFO_DEPTH), .DATA_WIDTH(8),
             .KEEP_ENABLE(0), .LAST_ENABLE(0), .USER_ENABLE(0), .FRAME_FIFO(0)
         ) u_cdc (
-            .s_clk(clk90), .s_rst(sys_rst),
-            .s_axis_tdata(cap_byte), .s_axis_tkeep(1'b0),
-            .s_axis_tvalid(fifo_in_valid), .s_axis_tready(fifo_in_ready),
+            .s_clk(cap_clk), .s_rst(sys_rst),
+            .s_axis_tdata(trace_byte), .s_axis_tkeep(1'b0),
+            .s_axis_tvalid(trace_byte_valid), .s_axis_tready(fifo_in_ready),
             .s_axis_tlast(1'b0), .s_axis_tid(8'h0), .s_axis_tdest(8'h0), .s_axis_tuser(1'b0),
             .m_clk(clk125), .m_rst(sys_rst),
             .m_axis_tdata(fifo_out_data), .m_axis_tkeep(),
@@ -175,9 +208,8 @@ module trace_mmcm_stream_top #(
         assign lost_cnt = cnt_r;
     end else begin : g_lost_t
         reg [31:0] cnt_r = 0;
-        wire fifo_push = cap_valid & clk90_locked;
-        wire drop_evt = fifo_push & ~fifo_in_ready;
-        always @(posedge clk90) begin
+        wire drop_evt = g_trace.trace_byte_valid & ~fifo_in_ready;
+        always @(posedge cap_clk) begin
             if (sys_rst) cnt_r <= 0;
             else if (drop_evt) cnt_r <= cnt_r + 1'b1;
         end

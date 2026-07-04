@@ -20,6 +20,8 @@ read_verilog $rtl/trace_capture_mmcm.v
 read_verilog $bringup/rtl/fpga_core_net.v
 read_verilog $bringup/rtl/trace_mmcm_stream_top.v
 read_verilog $bringup/rtl/led_status.v
+read_verilog $bringup/rtl/frame_to_bytes.v
+read_verilog $repo_root/verilog/traceIF.v
 
 foreach s {
     lib/eth/rtl/iddr.v
