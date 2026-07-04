@@ -466,14 +466,11 @@ end else begin : g_stream
     // FSM: IDLE -> wait until stream has data AND no echo in flight -> assert
     // tx_udp_hdr_valid with fixed dest -> SEND payload bytes (count to
     // STREAM_PKT_BYTES, tlast on the last) -> back to IDLE.
-    localparam ST_IDLE = 2'd0, ST_HDR = 2'd1, ST_SEND = 2'd2;
-    reg [1:0]  st;
-    reg [15:0] bcnt;
 
     // RX-echo wants the TX path this cycle?
     wire echo_req = rx_udp_hdr_valid && match_cond;
-    // self-TX owns the path while not IDLE
-    wire self_busy = (st != ST_IDLE);
+    // self-TX owns the path only during HDR and SEND (not IDLE or BACKOFF)
+    wire self_busy = (st == ST_HDR) || (st == ST_SEND);
 
     // RX-echo header handshake: only when self-TX is idle (echo has priority on
     // a fresh request, but cannot interrupt an in-flight self packet).
@@ -510,12 +507,20 @@ end else begin : g_stream
     // resolved), back off to IDLE so the echo/ARP RX path is unblocked. The
     // ARP module can then complete its request/reply cycle; next time around
     // the cache will be warm and ST_HDR will pass immediately.
-    reg [19:0] hdr_timeout = 0;  // ~8ms at 125MHz (2^20/125M)
+    // After a timeout, enter a cooldown (ST_BACKOFF) before retrying to avoid
+    // flooding the network with rapid ARP request bursts.
+    localparam ST_IDLE = 2'd0, ST_HDR = 2'd1, ST_SEND = 2'd2, ST_BACKOFF = 2'd3;
+    reg [1:0]  st;
+    reg [15:0] bcnt;
+
+    reg [19:0] hdr_timeout = 0;   // ~8ms at 125MHz
     wire hdr_stuck = hdr_timeout[19];
+    reg [25:0] backoff_cnt = 0;   // ~500ms at 125MHz (2^26/125M)
+    wire backoff_done = backoff_cnt[25];
 
     always @(posedge clk) begin
         if (rst) begin
-            st <= ST_IDLE; bcnt <= 0; hdr_timeout <= 0;
+            st <= ST_IDLE; bcnt <= 0; hdr_timeout <= 0; backoff_cnt <= 0;
         end else case (st)
             ST_IDLE: begin
                 hdr_timeout <= 0;
@@ -527,8 +532,10 @@ end else begin : g_stream
                 hdr_timeout <= hdr_timeout + 1'b1;
                 if (tx_udp_hdr_ready)
                     st <= ST_SEND;
-                else if (hdr_stuck)
-                    st <= ST_IDLE;  // back off, let ARP/echo through
+                else if (hdr_stuck) begin
+                    st <= ST_BACKOFF;
+                    backoff_cnt <= 0;
+                end
             end
             ST_SEND:
                 if (tx_udp_payload_axis_tvalid && tx_udp_payload_axis_tready) begin
@@ -536,6 +543,11 @@ end else begin : g_stream
                         st <= ST_IDLE; bcnt <= 0;
                     end else bcnt <= bcnt + 1'b1;
                 end
+            ST_BACKOFF: begin
+                backoff_cnt <= backoff_cnt + 1'b1;
+                if (backoff_done)
+                    st <= ST_IDLE;  // retry after cooldown
+            end
         endcase
     end
 end
