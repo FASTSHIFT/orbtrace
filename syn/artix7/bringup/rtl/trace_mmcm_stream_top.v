@@ -32,7 +32,10 @@ module trace_mmcm_stream_top #(
     parameter [31:0] DEST_IP   = {8'd192, 8'd168, 8'd10, 8'd245},
     parameter [15:0] DEST_PORT = 16'd5555,
     parameter integer PAYLOAD  = 1024,        // trace bytes per UDP packet
-    parameter integer FIFO_DEPTH = 8192       // CDC FIFO bytes (abosrb TX bursts)
+    parameter integer FIFO_DEPTH = 8192,      // CDC FIFO bytes (abosrb TX bursts)
+    parameter integer BANDWIDTH_TEST = 0      // 1: bypass trace, fill FIFO from
+                                              // free-running counter at clk125 rate
+                                              // to measure pure network throughput
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -102,35 +105,83 @@ module trace_mmcm_stream_top #(
     wire        fifo_out_valid;
     wire        fifo_out_ready;
     wire [$clog2(FIFO_DEPTH):0] m_depth;
-    // only push real captured bytes once the trace MMCM has locked
-    wire        fifo_in_valid = cap_valid & clk90_locked;
 
-    axis_async_fifo #(
-        .DEPTH(FIFO_DEPTH), .DATA_WIDTH(8),
-        .KEEP_ENABLE(0), .LAST_ENABLE(0), .USER_ENABLE(0), .FRAME_FIFO(0)
-    ) u_cdc (
-        .s_clk(clk90), .s_rst(sys_rst),
-        .s_axis_tdata(cap_byte), .s_axis_tkeep(1'b0),
-        .s_axis_tvalid(fifo_in_valid), .s_axis_tready(fifo_in_ready),
-        .s_axis_tlast(1'b0), .s_axis_tid(8'h0), .s_axis_tdest(8'h0), .s_axis_tuser(1'b0),
-        .m_clk(clk125), .m_rst(sys_rst),
-        .m_axis_tdata(fifo_out_data), .m_axis_tkeep(),
-        .m_axis_tvalid(fifo_out_valid), .m_axis_tready(fifo_out_ready),
-        .m_axis_tlast(), .m_axis_tid(), .m_axis_tdest(), .m_axis_tuser(),
-        .s_pause_req(1'b0), .s_pause_ack(), .m_pause_req(1'b0), .m_pause_ack(),
-        .s_status_depth(), .s_status_depth_commit(), .s_status_overflow(),
-        .s_status_bad_frame(), .s_status_good_frame(),
-        .m_status_depth(m_depth), .m_status_depth_commit(), .m_status_overflow(),
-        .m_status_bad_frame(), .m_status_good_frame()
-    );
+    // BANDWIDTH_TEST mode: bypass trace front-end entirely, feed the FIFO a
+    // free-running counter from clk125.  This saturates the network TX path at
+    // 125 MB/s (one byte per 125MHz clock), letting us measure the pure UDP
+    // egress throughput without needing an STM32 trace source.
+    generate if (BANDWIDTH_TEST) begin : g_bwtest
+        reg [7:0] bw_cnt = 0;
+        always @(posedge clk125)
+            if (sys_rst) bw_cnt <= 8'd0;
+            else         bw_cnt <= bw_cnt + 8'd1;
 
-    // capture-side drop: a byte arrived but the FIFO could not take it
-    wire drop_evt = fifo_in_valid & ~fifo_in_ready;
-    reg [31:0] lost_cnt = 0;
-    always @(posedge clk90) begin
-        if (sys_rst) lost_cnt <= 0;
-        else if (drop_evt) lost_cnt <= lost_cnt + 1'b1;
-    end
+        // Feed directly into the FIFO on the clk125 side (no CDC needed —
+        // producer and consumer are in the same domain).  We still instantiate
+        // the async FIFO to keep the downstream packetiser unchanged, just wire
+        // both sides to clk125.
+        axis_async_fifo #(
+            .DEPTH(FIFO_DEPTH), .DATA_WIDTH(8),
+            .KEEP_ENABLE(0), .LAST_ENABLE(0), .USER_ENABLE(0), .FRAME_FIFO(0)
+        ) u_cdc (
+            .s_clk(clk125), .s_rst(sys_rst),
+            .s_axis_tdata(bw_cnt), .s_axis_tkeep(1'b0),
+            .s_axis_tvalid(1'b1), .s_axis_tready(fifo_in_ready),
+            .s_axis_tlast(1'b0), .s_axis_tid(8'h0), .s_axis_tdest(8'h0), .s_axis_tuser(1'b0),
+            .m_clk(clk125), .m_rst(sys_rst),
+            .m_axis_tdata(fifo_out_data), .m_axis_tkeep(),
+            .m_axis_tvalid(fifo_out_valid), .m_axis_tready(fifo_out_ready),
+            .m_axis_tlast(), .m_axis_tid(), .m_axis_tdest(), .m_axis_tuser(),
+            .s_pause_req(1'b0), .s_pause_ack(), .m_pause_req(1'b0), .m_pause_ack(),
+            .s_status_depth(), .s_status_depth_commit(), .s_status_overflow(),
+            .s_status_bad_frame(), .s_status_good_frame(),
+            .m_status_depth(m_depth), .m_status_depth_commit(), .m_status_overflow(),
+            .m_status_bad_frame(), .m_status_good_frame()
+        );
+    end else begin : g_trace
+        // only push real captured bytes once the trace MMCM has locked
+        wire fifo_in_valid = cap_valid & clk90_locked;
+
+        axis_async_fifo #(
+            .DEPTH(FIFO_DEPTH), .DATA_WIDTH(8),
+            .KEEP_ENABLE(0), .LAST_ENABLE(0), .USER_ENABLE(0), .FRAME_FIFO(0)
+        ) u_cdc (
+            .s_clk(clk90), .s_rst(sys_rst),
+            .s_axis_tdata(cap_byte), .s_axis_tkeep(1'b0),
+            .s_axis_tvalid(fifo_in_valid), .s_axis_tready(fifo_in_ready),
+            .s_axis_tlast(1'b0), .s_axis_tid(8'h0), .s_axis_tdest(8'h0), .s_axis_tuser(1'b0),
+            .m_clk(clk125), .m_rst(sys_rst),
+            .m_axis_tdata(fifo_out_data), .m_axis_tkeep(),
+            .m_axis_tvalid(fifo_out_valid), .m_axis_tready(fifo_out_ready),
+            .m_axis_tlast(), .m_axis_tid(), .m_axis_tdest(), .m_axis_tuser(),
+            .s_pause_req(1'b0), .s_pause_ack(), .m_pause_req(1'b0), .m_pause_ack(),
+            .s_status_depth(), .s_status_depth_commit(), .s_status_overflow(),
+            .s_status_bad_frame(), .s_status_good_frame(),
+            .m_status_depth(m_depth), .m_status_depth_commit(), .m_status_overflow(),
+            .m_status_bad_frame(), .m_status_good_frame()
+        );
+    end endgenerate
+
+    // capture-side drop counter: counts bytes lost to FIFO overflow.
+    // Clock domain depends on mode: trace mode writes from clk90, bw test from clk125.
+    wire [31:0] lost_cnt;
+    generate if (BANDWIDTH_TEST) begin : g_lost
+        reg [31:0] cnt_r = 0;
+        always @(posedge clk125) begin
+            if (sys_rst) cnt_r <= 0;
+            else if (~fifo_in_ready) cnt_r <= cnt_r + 1'b1;
+        end
+        assign lost_cnt = cnt_r;
+    end else begin : g_lost_t
+        reg [31:0] cnt_r = 0;
+        wire fifo_push = cap_valid & clk90_locked;
+        wire drop_evt = fifo_push & ~fifo_in_ready;
+        always @(posedge clk90) begin
+            if (sys_rst) cnt_r <= 0;
+            else if (drop_evt) cnt_r <= cnt_r + 1'b1;
+        end
+        assign lost_cnt = cnt_r;
+    end endgenerate
 
     // ---- packetiser (clk125): prepend a 32-bit big-endian sequence number to
     //      each PAYLOAD-byte UDP packet so the host can detect any gap. The
@@ -192,8 +243,8 @@ module trace_mmcm_stream_top #(
         (ext_addr == 16'hFF04) ? {7'b0, clk90_locked} : 8'h00;
     assign ext_data = status_byte;
 
-    assign led0 = ~clk90_locked;
-    assign led1 = ~fifo_out_valid;     // lit when streaming (FIFO has data)
+    // ---- LED status (driven by led_status module) ----
+    wire dbg_rx_good, dbg_rx_bad, dbg_tx_valid;
 
     fpga_core_net #(
         .TARGET("XILINX"),
@@ -212,11 +263,28 @@ module trace_mmcm_stream_top #(
         .phy_reset_n(phy_reset_n),
         .phy_int_n(1'b1), .phy_pme_n(1'b1),
         .uart_rxd(1'b1), .uart_txd(),
-        .dbg_rx_good_frame(), .dbg_rx_bad_fcs(), .dbg_tx_axis_tvalid(),
+        .dbg_rx_good_frame(dbg_rx_good), .dbg_rx_bad_fcs(dbg_rx_bad), .dbg_tx_axis_tvalid(dbg_tx_valid),
         .ext_addr(ext_addr), .ext_data(ext_data),
         .csr_addr(csr_addr_w), .csr_data(csr_data_w), .csr_we(csr_we_w),
         .stream_tdata(stream_tdata), .stream_tvalid(stream_tvalid),
         .stream_tready(stream_tready)
+    );
+
+    // ---- LED status indicator ----
+    // In BANDWIDTH_TEST mode trace MMCM won't lock (no trace clock), so force
+    // the trace_mmcm_locked input high to show "streaming ok" on led1.
+    wire trace_locked_eff = BANDWIDTH_TEST ? 1'b1 : clk90_locked;
+
+    led_status u_leds (
+        .clk(clk125), .rst(sys_rst),
+        .sys_mmcm_locked(mmcm_sys_locked),
+        .rx_good_frame(dbg_rx_good),
+        .tx_axis_tvalid(dbg_tx_valid),
+        .trace_mmcm_locked(trace_locked_eff),
+        .pkt_active(pkt_active),
+        .lost_cnt(lost_125),
+        .led0(led0),
+        .led1(led1)
     );
 
     assign phy_mdio = 1'bz;

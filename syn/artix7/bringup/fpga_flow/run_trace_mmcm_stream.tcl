@@ -19,6 +19,7 @@ set rtl       $repo_root/syn/artix7/rtl
 read_verilog $rtl/trace_capture_mmcm.v
 read_verilog $bringup/rtl/fpga_core_net.v
 read_verilog $bringup/rtl/trace_mmcm_stream_top.v
+read_verilog $bringup/rtl/led_status.v
 
 foreach s {
     lib/eth/rtl/iddr.v
@@ -71,8 +72,10 @@ set phase 90.0
 if {[info exists ::env(PHASE)]} { set phase $::env(PHASE) }
 set width 4
 if {[info exists ::env(WIDTH)]} { set width $::env(WIDTH) }
-puts "============ STREAM MULT=$mult DIVID=$divid TRACE_PERIOD=$tperiod PHASE=$phase WIDTH=$width ============"
-synth_design -top trace_mmcm_stream_top -part $part -generic MULT=$mult -generic DIVID=$divid -generic CLKIN_PERIOD=$tperiod -generic PHASE=$phase -generic WIDTH=$width
+set bwtest 0
+if {[info exists ::env(BANDWIDTH_TEST)]} { set bwtest $::env(BANDWIDTH_TEST) }
+puts "============ STREAM MULT=$mult DIVID=$divid TRACE_PERIOD=$tperiod PHASE=$phase WIDTH=$width BWTEST=$bwtest ============"
+synth_design -top trace_mmcm_stream_top -part $part -generic MULT=$mult -generic DIVID=$divid -generic CLKIN_PERIOD=$tperiod -generic PHASE=$phase -generic WIDTH=$width -generic BANDWIDTH_TEST=$bwtest
 create_clock -period $tperiod -name trace_clk_in [get_ports trace_clk_in]
 set_clock_groups -asynchronous \
     -group [get_clocks sys_clk_50] \
