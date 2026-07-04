@@ -111,22 +111,23 @@ module trace_mmcm_stream_top #(
     // 125 MB/s (one byte per 125MHz clock), letting us measure the pure UDP
     // egress throughput without needing an STM32 trace source.
     generate if (BANDWIDTH_TEST) begin : g_bwtest
+        // Direct stream to fpga_core_net — NO FIFO, NO packetiser.
+        // Exactly like selftx_test_top: counter byte, always valid.
         reg [7:0] bw_cnt = 0;
         always @(posedge clk125)
             if (sys_rst) bw_cnt <= 8'd0;
-            else         bw_cnt <= bw_cnt + 8'd1;
+            else if (stream_tready) bw_cnt <= bw_cnt + 8'd1;
 
-        // Feed directly into the FIFO on the clk125 side (no CDC needed —
-        // producer and consumer are in the same domain).  We still instantiate
-        // the async FIFO to keep the downstream packetiser unchanged, just wire
-        // both sides to clk125.
+        // No FIFO needed — stub out fifo signals
+        assign fifo_in_ready = 1'b1;
+
         axis_async_fifo #(
             .DEPTH(FIFO_DEPTH), .DATA_WIDTH(8),
             .KEEP_ENABLE(0), .LAST_ENABLE(0), .USER_ENABLE(0), .FRAME_FIFO(0)
         ) u_cdc (
             .s_clk(clk125), .s_rst(sys_rst),
-            .s_axis_tdata(bw_cnt), .s_axis_tkeep(1'b0),
-            .s_axis_tvalid(1'b1), .s_axis_tready(fifo_in_ready),
+            .s_axis_tdata(8'd0), .s_axis_tkeep(1'b0),
+            .s_axis_tvalid(1'b0), .s_axis_tready(),
             .s_axis_tlast(1'b0), .s_axis_tid(8'h0), .s_axis_tdest(8'h0), .s_axis_tuser(1'b0),
             .m_clk(clk125), .m_rst(sys_rst),
             .m_axis_tdata(fifo_out_data), .m_axis_tkeep(),
@@ -188,43 +189,71 @@ module trace_mmcm_stream_top #(
     //      self-TX FSM in fpga_core_net counts STREAM_PKT_BYTES per packet and
     //      pulls a byte whenever stream_tready is high; we track that position
     //      and emit seq[0..3] for the first 4, then FIFO bytes. ----
-    localparam integer PKT = PAYLOAD + 4;
-    reg [31:0] seq = 0;
-    reg [15:0] pos = 0;                 // byte index within current packet
-    reg        pkt_active = 0;          // a packet is in flight (no underrun)
+    localparam integer PKT = BANDWIDTH_TEST ? 1024 : (PAYLOAD + 4);
     wire       stream_tready;
-    wire       in_header = (pos < 16'd4);
+    wire [7:0] stream_tdata;
+    wire       stream_tvalid;
+    reg        pkt_active = 0;
 
-    // Start a packet only when the FIFO holds a full PAYLOAD, so once started
-    // the payload phase never underruns (the self-TX FSM would otherwise stall
-    // the MAC mid-packet). While the header (4 seq bytes) goes out the FIFO
-    // keeps filling, so by payload time there is >= PAYLOAD buffered.
-    wire       can_start = (m_depth >= PAYLOAD[$clog2(FIFO_DEPTH):0]);
-    // stream is "valid" to the core only while a packet is active
-    wire       stream_tvalid = pkt_active & (in_header | fifo_out_valid);
-    wire [7:0] seq_byte = (pos == 16'd0) ? seq[31:24] :
-                          (pos == 16'd1) ? seq[23:16] :
-                          (pos == 16'd2) ? seq[15:8]  : seq[7:0];
-    wire [7:0] stream_tdata = in_header ? seq_byte : fifo_out_data;
-    // pop the FIFO only on accepted payload (non-header) beats
-    assign fifo_out_ready = pkt_active & (~in_header) & stream_tready;
+    generate if (BANDWIDTH_TEST) begin : g_pkt_bw
+        // Bypass packetiser: direct stream like selftx_test_top
+        assign stream_tvalid = 1'b1;
+        assign stream_tdata  = g_bwtest.bw_cnt;
+        assign fifo_out_ready = 1'b0;  // FIFO unused
+        always @(posedge clk125) pkt_active <= 1'b1; // for LED: always "active"
+    end else begin : g_pkt_trace
+        reg [31:0] seq = 0;
+        reg [15:0] pos = 0;
+        wire       in_header = (pos < 16'd4);
 
-    always @(posedge clk125) begin
-        if (sys_rst) begin
-            pos <= 0; seq <= 0; pkt_active <= 0;
-        end else if (!pkt_active) begin
-            if (can_start) pkt_active <= 1'b1;  // begin a packet
-            pos <= 0;
-        end else if (stream_tvalid && stream_tready) begin
-            if (pos == PKT-1) begin
+        // Heartbeat: when FIFO has insufficient data for a full packet AND
+        // ~1 second has elapsed since the last packet, send a heartbeat packet
+        // (payload = all zeros). This keeps ARP alive and lets host confirm link.
+        reg [26:0] hb_timer = 0;            // 2^27/125MHz ≈ 1.07s
+        wire       hb_due = hb_timer[26];
+        wire       can_start_data = (m_depth >= PAYLOAD[$clog2(FIFO_DEPTH):0]);
+        wire       can_start = can_start_data | hb_due;
+        reg        is_heartbeat = 0;        // current packet is a heartbeat (payload=0)
+
+        always @(posedge clk125) begin
+            if (sys_rst)
+                hb_timer <= 0;
+            else if (pkt_active)
+                hb_timer <= 0;              // reset on any packet sent
+            else
+                hb_timer <= hb_timer + 1'b1;
+        end
+
+        // Data mux: heartbeat packets send 0x00 instead of FIFO data
+        assign stream_tvalid = pkt_active & (in_header | (is_heartbeat ? 1'b1 : fifo_out_valid));
+        wire [7:0] seq_byte = (pos == 16'd0) ? seq[31:24] :
+                              (pos == 16'd1) ? seq[23:16] :
+                              (pos == 16'd2) ? seq[15:8]  : seq[7:0];
+        assign stream_tdata = in_header ? seq_byte : (is_heartbeat ? 8'h00 : fifo_out_data);
+        // Only pop FIFO for real data packets (not heartbeat)
+        assign fifo_out_ready = pkt_active & (~in_header) & (~is_heartbeat) & stream_tready;
+
+        always @(posedge clk125) begin
+            if (sys_rst) begin
+                pos <= 0; seq <= 0; pkt_active <= 0; is_heartbeat <= 0;
+            end else if (!pkt_active) begin
+                if (can_start) begin
+                    pkt_active <= 1'b1;
+                    is_heartbeat <= ~can_start_data;  // heartbeat if no data
+                end
                 pos <= 0;
-                seq <= seq + 1'b1;
-                pkt_active <= 1'b0;             // packet done; re-gate on depth
-            end else begin
-                pos <= pos + 1'b1;
+            end else if (stream_tvalid && stream_tready) begin
+                if (pos == PKT-1) begin
+                    pos <= 0;
+                    seq <= seq + 1'b1;
+                    pkt_active <= 1'b0;
+                    is_heartbeat <= 0;
+                end else begin
+                    pos <= pos + 1'b1;
+                end
             end
         end
-    end
+    end endgenerate
 
     // ---- CSR :5002 readback of lost_cnt (CDC clk90 -> clk125) ----
     reg [31:0] lost_s0 = 0, lost_125 = 0;

@@ -506,18 +506,30 @@ end else begin : g_stream
     assign tx_fifo_udp_payload_axis_tready = !self_busy && tx_udp_payload_axis_tready;
     assign stream_tready = (st == ST_SEND) && tx_udp_payload_axis_tready;
 
+    // ARP-deadlock breaker: if ST_HDR waits too long for hdr_ready (ARP not
+    // resolved), back off to IDLE so the echo/ARP RX path is unblocked. The
+    // ARP module can then complete its request/reply cycle; next time around
+    // the cache will be warm and ST_HDR will pass immediately.
+    reg [19:0] hdr_timeout = 0;  // ~8ms at 125MHz (2^20/125M)
+    wire hdr_stuck = hdr_timeout[19];
+
     always @(posedge clk) begin
         if (rst) begin
-            st <= ST_IDLE; bcnt <= 0;
+            st <= ST_IDLE; bcnt <= 0; hdr_timeout <= 0;
         end else case (st)
-            ST_IDLE:
-                // start a self packet when a full packet's worth is available
-                // (here: just when stream has data and echo is not requesting)
+            ST_IDLE: begin
+                hdr_timeout <= 0;
                 if (stream_tvalid && !echo_req) begin
                     st <= ST_HDR; bcnt <= 0;
                 end
-            ST_HDR:
-                if (tx_udp_hdr_ready) st <= ST_SEND;
+            end
+            ST_HDR: begin
+                hdr_timeout <= hdr_timeout + 1'b1;
+                if (tx_udp_hdr_ready)
+                    st <= ST_SEND;
+                else if (hdr_stuck)
+                    st <= ST_IDLE;  // back off, let ARP/echo through
+            end
             ST_SEND:
                 if (tx_udp_payload_axis_tvalid && tx_udp_payload_axis_tready) begin
                     if (bcnt == STREAM_PKT_BYTES-1) begin
