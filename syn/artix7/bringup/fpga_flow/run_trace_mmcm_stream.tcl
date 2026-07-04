@@ -22,6 +22,7 @@ read_verilog $bringup/rtl/trace_mmcm_stream_top.v
 read_verilog $bringup/rtl/led_status.v
 read_verilog $bringup/rtl/frame_to_bytes.v
 read_verilog $repo_root/verilog/traceIF.v
+read_verilog $repo_root/syn/artix7/tpiu_demux.v
 
 foreach s {
     lib/eth/rtl/iddr.v

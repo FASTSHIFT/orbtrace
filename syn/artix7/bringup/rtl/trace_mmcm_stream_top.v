@@ -147,29 +147,43 @@ module trace_mmcm_stream_top #(
         wire       trace_byte_valid;
 
         if (WIDTH == 2) begin : g_traceif
-            // 2-bit: use traceIF to assemble TPIU frames, then serialize to bytes
+            // 2-bit: traceIF assembles TPIU frames, tpiu_demux extracts ETM bytes
             wire        fr_avail;
             wire [127:0] frame;
             traceIF #(.MAXBUSWIDTH(4)) u_traceif (
                 .rst(sys_rst | ~clk90_locked),
-                .traceDina(trace_a), .traceDinb(trace_b),
-                .traceClkin(cap_clk),
+                .traceDina(trace_b), .traceDinb(trace_a),
+                .traceClkin(clk90),
                 .width(2'b10),
                 .edgeOutput(), .FrAvail(fr_avail), .Frame(frame)
             );
 
-            // Toggle → pulse conversion for FrAvail
+            // Toggle → pulse for FrAvail (in clk90 domain)
             reg fr_d;
-            always @(posedge cap_clk) fr_d <= fr_avail;
+            always @(posedge clk90) fr_d <= fr_avail;
             wire frame_pulse = fr_avail ^ fr_d;
 
-            // Serialize 128-bit frame to bytes (still in cap_clk domain)
-            frame_to_bytes u_f2b (
-                .clk(cap_clk), .rst(sys_rst | ~clk90_locked),
-                .frame_valid(frame_pulse), .frame_data(frame),
-                .m_tdata(trace_byte), .m_tvalid(trace_byte_valid),
-                .m_tready(fifo_in_ready)
+            // Byte-reverse frame for tpiu_demux (it expects in_frame[7:0]=first byte)
+            wire [127:0] dmux_frame;
+            genvar gi;
+            for (gi = 0; gi < 16; gi = gi + 1) begin : g_rev
+                assign dmux_frame[8*gi +: 8] = frame[8*(15-gi) +: 8];
+            end
+
+            // tpiu_demux: extracts ETM stream bytes from TPIU frames
+            wire [7:0] dmux_data;
+            wire       dmux_valid, dmux_last, dmux_ready;
+            tpiu_demux u_demux (
+                .clk(clk90), .rst(sys_rst | ~clk90_locked),
+                .in_frame(dmux_frame), .in_valid(frame_pulse), .in_ready(),
+                .bp_valid(1'b0), .bp_data(8'd0), .bp_ready(),
+                .bypass_sel(1'b0),
+                .out_data(dmux_data), .out_valid(dmux_valid),
+                .out_last(dmux_last), .out_ready(fifo_in_ready)
             );
+
+            assign trace_byte = dmux_data;
+            assign trace_byte_valid = dmux_valid;
         end else begin : g_raw
             // 4-bit: raw {trace_a, trace_b_q} byte, 1 per TRACECLK
             assign trace_byte = cap_byte;
@@ -180,7 +194,7 @@ module trace_mmcm_stream_top #(
             .DEPTH(FIFO_DEPTH), .DATA_WIDTH(8),
             .KEEP_ENABLE(0), .LAST_ENABLE(0), .USER_ENABLE(0), .FRAME_FIFO(0)
         ) u_cdc (
-            .s_clk(cap_clk), .s_rst(sys_rst),
+            .s_clk(clk90), .s_rst(sys_rst),
             .s_axis_tdata(trace_byte), .s_axis_tkeep(1'b0),
             .s_axis_tvalid(trace_byte_valid), .s_axis_tready(fifo_in_ready),
             .s_axis_tlast(1'b0), .s_axis_tid(8'h0), .s_axis_tdest(8'h0), .s_axis_tuser(1'b0),
@@ -209,7 +223,7 @@ module trace_mmcm_stream_top #(
     end else begin : g_lost_t
         reg [31:0] cnt_r = 0;
         wire drop_evt = g_trace.trace_byte_valid & ~fifo_in_ready;
-        always @(posedge cap_clk) begin
+        always @(posedge clk90) begin
             if (sys_rst) cnt_r <= 0;
             else if (drop_evt) cnt_r <= cnt_r + 1'b1;
         end
@@ -241,10 +255,18 @@ module trace_mmcm_stream_top #(
         // Heartbeat: when FIFO has insufficient data for a full packet AND
         // ~1 second has elapsed since the last packet, send a heartbeat packet
         // (payload = all zeros). This keeps ARP alive and lets host confirm link.
-        reg [26:0] hb_timer = 0;            // 2^27/125MHz ≈ 1.07s
-        wire       hb_due = hb_timer[26];
+        // Startup delay: don't send ANY packet for ~5s after reset, giving the
+        // network time to establish link + ARP before self-TX starts.
+        reg [29:0] startup_cnt = 0;
+        wire startup_done = startup_cnt[29];  // ~4.3s at 125MHz
+        always @(posedge clk125)
+            if (sys_rst) startup_cnt <= 0;
+            else if (!startup_done) startup_cnt <= startup_cnt + 1'b1;
+
+        reg [29:0] hb_timer = 0;            // 2^30/125MHz ≈ 8.6s between heartbeats
+        wire       hb_due = hb_timer[29];
         wire       can_start_data = (m_depth >= PAYLOAD[$clog2(FIFO_DEPTH):0]);
-        wire       can_start = can_start_data | hb_due;
+        wire       can_start = startup_done & (can_start_data | hb_due);
         reg        is_heartbeat = 0;        // current packet is a heartbeat (payload=0)
 
         always @(posedge clk125) begin
