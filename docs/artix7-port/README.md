@@ -25,6 +25,121 @@ docs/artix7-port/
 
 ---
 
+## Trace 引脚接线（STM32F429 → A7-Lite GPIO1）
+
+STM32F429 的 4-bit 并口 ETM trace（TPIU）引脚全部集中在端口 E（PE2~PE6），接到 A7-Lite 的 **GPIO1 排针**，再由排针连到 XC7A35T 的 BANK16 输入引脚。
+
+映射三方对齐来源：
+- **FPGA 引脚**：工程约束 `syn/artix7/bringup/rtl/trace_mmcm.xdc`（`trace_clk_in` / `trace_data_in[3:0]`）
+- **排针↔FPGA 引脚**：官方 `A7_LITE_GPIO.xlsx`（GPIO1 sheet）
+- **STM32 引脚**：ETM3.5 TPIU 固定复用（PE2=TRACECLK，PE3~PE6=TRACED0~3）
+
+| STM32 引脚 | 信号 | GPIO1 排针脚位 | 排针信号名 | FPGA 引脚 | I/O 标准 | 备注 |
+|-----------|----------|:---:|-----------|:---:|-----------|------|
+| PE2 | TRACECLK | 9 | GPIO1_4P | **D17** | LVCMOS33 | MRCC 时钟专用脚，进 MMCM |
+| PE3 | TRACED0  | 1 | GPIO1_0P | F13 | LVCMOS33 | 2-bit 模式必接 |
+| PE4 | TRACED1  | 4 | GPIO1_1N | E14 | LVCMOS33 | 2-bit 模式必接 |
+| PE5 | TRACED2  | 5 | GPIO1_2P | D14 | LVCMOS33 | 仅 4-bit 模式 |
+| PE6 | TRACED3  | 7 | GPIO1_3P | E16 | LVCMOS33 | 仅 4-bit 模式 |
+| GND | 共地 | 12 或 30 | GND | — | — | 必须共地 |
+
+> **2-bit（产品目标形态）**：只需接 PE2/PE3/PE4 → 排针脚 9/1/4（TRACECLK + TRACED0/1），IO 更省。
+> **4-bit（交叉验证用）**：再补 PE5/PE6 → 排针脚 5/7。
+> TRACECLK 落在 MRCC 引脚 D17 上，是为了让采样 MMCM 的专用时钟布线成立（见 `trace_mmcm.xdc` 注释）。
+
+### 接线图
+
+```mermaid
+flowchart LR
+    subgraph STM32["STM32F429I-DISC1 (ETM3.5 / TPIU)"]
+        direction TB
+        S_CLK["PE2 · TRACECLK"]
+        S_D0["PE3 · TRACED0"]
+        S_D1["PE4 · TRACED1"]
+        S_D2["PE5 · TRACED2"]
+        S_D3["PE6 · TRACED3"]
+        S_GND["GND"]
+    end
+
+    subgraph HDR["A7-Lite GPIO1 排针"]
+        direction TB
+        H9["脚9 · GPIO1_4P"]
+        H1["脚1 · GPIO1_0P"]
+        H4["脚4 · GPIO1_1N"]
+        H5["脚5 · GPIO1_2P"]
+        H7["脚7 · GPIO1_3P"]
+        HG["脚12/30 · GND"]
+    end
+
+    subgraph FPGA["XC7A35T BANK16 (trace_mmcm.xdc)"]
+        direction TB
+        F_CLK["D17<br/>trace_clk_in (MRCC)"]
+        F_D0["F13<br/>trace_data_in[0]"]
+        F_D1["E14<br/>trace_data_in[1]"]
+        F_D2["D14<br/>trace_data_in[2]"]
+        F_D3["E16<br/>trace_data_in[3]"]
+        F_GND["GND"]
+    end
+
+    S_CLK ==>|"时钟 (2/4-bit)"| H9 ==> F_CLK
+    S_D0 ==>|"数据 (2/4-bit)"| H1 ==> F_D0
+    S_D1 ==>|"数据 (2/4-bit)"| H4 ==> F_D1
+    S_D2 -.->|"数据 (仅4-bit)"| H5 -.-> F_D2
+    S_D3 -.->|"数据 (仅4-bit)"| H7 -.-> F_D3
+    S_GND --- HG --- F_GND
+
+    classDef clk fill:#ffe6cc,stroke:#d79b00;
+    classDef dat fill:#d5e8d4,stroke:#82b366;
+    classDef opt fill:#f5f5f5,stroke:#999,stroke-dasharray:4 3;
+    classDef gnd fill:#e1d5e7,stroke:#9673a6;
+    class S_CLK,H9,F_CLK clk;
+    class S_D0,S_D1,H1,H4,F_D0,F_D1 dat;
+    class S_D2,S_D3,H5,H7,F_D2,F_D3 opt;
+    class S_GND,HG,F_GND gnd;
+```
+
+> 图例：实线 = 2-bit / 4-bit 都需要；虚线 = 仅 4-bit 模式接。橙色=时钟，绿色=必接数据，灰虚=可选数据，紫色=地。
+
+### SWO 单线 trace（支线，与并口互斥）
+
+除并口 ETM trace 外，FPGA 还实现了 **SWO 单线** trace 前端（`swo_stream_top.v` + `swo_iddr_capture.v`，提案 15/17）。SWO 只用一根异步单线，无独立时钟——FPGA 用自由运行的 200MHz 参考时钟 + IDDR 双沿过采样（500 MSa/s）在 fabric 内解出 NRZ 字节流。SI 简单（杜邦线即可）但带宽受限（UART ≤12Mbaud≈1.2MB/s），用途见 `../swo-trace-sidetrack/`，可作满速并口的黄金对照基线。
+
+| STM32 引脚 | 信号 | GPIO1 排针脚位 | 排针信号名 | FPGA 引脚 | I/O 标准 | 备注 |
+|-----------|----------|:---:|-----------|:---:|-----------|------|
+| PB3 | SWO / TRACESWO | 50 | GPIO1_21N | **B22** | LVCMOS33 | 异步单线，200MHz IDDR 过采样 |
+| GND | 共地 | 12 或 30 | GND | — | — | 必须共地 |
+
+> 引脚来源：`syn/artix7/bringup/rtl/swo_stream.xdc`（`swo_in`=B22）+ GPIO 表（脚50=GPIO1_21N=B22）。B22 是当初通过边界扫描 SAMPLE 探到用户实际插 SWO 线的脚位。
+
+```mermaid
+flowchart LR
+    subgraph STM32B["STM32F429 (ITM/ETM over SWO)"]
+        SB3["PB3 · SWO/TRACESWO"]
+        SBG["GND"]
+    end
+
+    subgraph HDRB["A7-Lite GPIO1 排针"]
+        HB50["脚50 · GPIO1_21N"]
+        HBG["脚12/30 · GND"]
+    end
+
+    subgraph FPGAB["XC7A35T (swo_stream.xdc)"]
+        FB["B22<br/>swo_in"]
+        FBS["200MHz IDDR<br/>500MSa/s 过采样"]
+        FBG["GND"]
+    end
+
+    SB3 ==>|"单线异步 (NRZ)"| HB50 ==> FB ==> FBS
+    SBG --- HBG --- FBG
+
+    classDef swo fill:#dae8fc,stroke:#6c8ebf;
+    classDef gnd fill:#e1d5e7,stroke:#9673a6;
+    class SB3,HB50,FB,FBS swo;
+    class SBG,HBG,FBG gnd;
+```
+
+---
+
 ## 这是一场"红蓝对抗"式的选型推演
 
 为避免一拍脑袋选型，本项目用 **蓝方（提方案）vs 红方（拆台质疑）** 的多轮对抗，把一个模糊想法逼成可落地的工程决策。文档按"蓝方提案 → 红方评审 → 蓝方修正"的节奏交替推进。
