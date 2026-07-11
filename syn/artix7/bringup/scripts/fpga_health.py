@@ -157,7 +157,63 @@ def ddr3_check(ip):
     return 0
 
 
+def blackbox_check(ip):
+    """Read the trace black-box writer status page (0xFF5x, magic 0xB0) from
+    trace_ddr_blackbox_top (proposal 32 P2b-1): calib, TRACECLK activity,
+    words written to the DDR3 ring, write pointer, and capture-side loss."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(2.0)
+    global IP
+    IP = ip
+    try:
+        magic = rd8(s, 0xFF50)
+    except socket.timeout:
+        print("[FAIL] no reply on :5001 — FPGA network down (cold-boot the FPGA)")
+        return 1
+    if magic != 0xB0:
+        print(f"[WARN] black-box magic=0x{magic:02x} (expected 0xB0). Wrong "
+              f"bitstream? (need trace_ddr_blackbox)")
+        return 1
+
+    def rd_le(base, n):
+        return int.from_bytes(rd(s, base, n), "little")
+    build_id = rd_le(0xFF70, 4)
+    import datetime
+    bstr = datetime.datetime.fromtimestamp(build_id).strftime("%Y-%m-%d %H:%M:%S") \
+        if 0 < build_id < 0xFFFFFFF0 else "??"
+    flags = rd8(s, 0xFF51)
+    calib = flags & 1
+    mig_calib = (flags >> 1) & 1
+    tck_active = (flags >> 2) & 1
+    words = rd_le(0xFF52, 4)
+    lost = rd_le(0xFF56, 4)
+    wr_ptr = rd_le(0xFF5A, 4) & 0x1FFFFFFF
+    print(f"[OK]   black-box status online (magic=0xB0)")
+    print(f"       BUILD_ID = {build_id} ({bstr})")
+    print(f"       calib={calib}  mig_calib_raw={mig_calib}  TRACECLK_active={tck_active}")
+    print(f"       words_written={words} (128-bit) = {words*16} bytes  "
+          f"wr_ptr={wr_ptr} words  cap_lost={lost} bytes")
+    if not calib:
+        print("[FAIL] MIG not calibrated — cold-boot the FPGA")
+        return 2
+    if not tck_active:
+        print("[WARN] no TRACECLK activity — configure the STM32 ETM so trace "
+              "bytes flow into the black box")
+        return 0
+    if lost:
+        print(f"[WARN] {lost} capture-side bytes dropped (AsyncFIFO backpressure)")
+    if words == 0:
+        print("[WARN] TRACECLK active but 0 words written yet — read again")
+        return 0
+    print(f"[OK]   BLACK BOX RECORDING — {words*16} bytes captured to DDR3, "
+          f"cap_lost={lost}")
+    return 0
+
+
 def main():
+    # `fpga_health.py [ip] blackbox` reads the P2b-1 black-box writer status.
+    if "blackbox" in sys.argv[2:] or "bb" in sys.argv[2:]:
+        return blackbox_check(IP)
     # `fpga_health.py [ip] ddr3` reads the DDR3 self-test status page instead.
     if "ddr3" in sys.argv[2:]:
         return ddr3_check(IP)
