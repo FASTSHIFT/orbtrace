@@ -43,9 +43,23 @@ if ! pgrep -x hw_server >/dev/null 2>&1; then
 fi
 
 if [ "$mode" = "flash" ]; then
-    if [ ! -f "$root/build/$mcs" ]; then echo "ERROR: build/$mcs missing (run build.sh first)"; exit 1; fi
-    echo "==> FLASH fixation: build/$mcs -> QSPI (persists across power cycle)"
-    ( cd "$root/build" && MCS="$mcs" vivado -mode batch -source ../fpga_flow/flash_program.tcl )
+    # FLASH fixation via openFPGALoader (writes .bit straight into the A7-Lite
+    # QSPI IS25LP128F, persists across power cycles). This path replaced the
+    # Vivado cs_server route (fpga_flow/flash_program.tcl), which reliably
+    # fails with "Failure to set flash parameters" under this VMware+FT232H
+    # setup. openFPGALoader loads its own spiOverJtag bridge and drives the
+    # flash directly -- confirmed working (ISSI IS25LP128 erase+write+boot OK).
+    if [ ! -f "$root/build/$bit" ]; then echo "ERROR: build/$bit missing (run build.sh first)"; exit 1; fi
+    if ! command -v openFPGALoader >/dev/null 2>&1; then
+        echo "ERROR: openFPGALoader not installed (apt-get install openfpgaloader)"; exit 1
+    fi
+    # openFPGALoader needs exclusive access to the FT232H; free hw_server.
+    pkill -9 -f hw_server 2>/dev/null || true
+    pkill -9 -f cs_server 2>/dev/null || true
+    sleep 1
+    echo "==> FLASH fixation: build/$bit -> QSPI via openFPGALoader (persists across power cycle)"
+    openFPGALoader -c ft232 --fpga-part xc7a35tfgg484 -f "$root/build/$bit"
+    echo "==> flashed. Power-cycle (or --reset) to boot from QSPI."
 else
     if [ ! -f "$root/build/$bit" ]; then echo "ERROR: build/$bit missing (run build.sh first)"; exit 1; fi
     echo "==> JTAG volatile load: build/$bit (gone on power cycle)"
