@@ -51,6 +51,15 @@ module dbg_regfile (
     input  wire        pkt_active,
     input  wire [31:0] lost_cnt,          // capture FIFO drop counter (CDC'd)
 
+    // ---- raw GPIO monitor (proposal 30, GPIO cross-check) ----
+    // Direct sample of the trace input pins in THIS (clk) domain, independent
+    // of the trace-sampling MMCM. Lets us tell "pin is physically toggling"
+    // (edges>0) from "MMCM not locked / decode error". {clk, d3..d0}.
+    input  wire        gpio_clk_level,    // live level of trace_clk_in (synced)
+    input  wire [3:0]  gpio_data_level,   // live level of trace_data_in (synced)
+    input  wire        gpio_clk_edge,     // 1-cyc pulse on any trace_clk edge
+    input  wire [3:0]  gpio_data_edge,    // per-lane edge pulse
+
     // ---- byte read port (drives the :5001 status_byte mux) ----
     input  wire [7:0]  addr,              // low byte of ext_addr (page 0xFFxx)
     output reg  [7:0]  rdata
@@ -122,6 +131,27 @@ module dbg_regfile (
         end
     end
 
+    // ---- raw GPIO edge counters (activity, independent of trace MMCM) ----
+    // 16-bit saturating counters: nonzero => that pin is physically toggling.
+    // TRACECLK toggles fastest, so it saturates quickly; the data lanes tell us
+    // per-lane activity for cross-checking against the decoded stream.
+    reg [15:0] gclk_edges;
+    reg [15:0] gd_edges [0:3];
+    integer gi;
+    always @(posedge clk) begin
+        if (rst || clr) begin
+            gclk_edges <= 16'd0;
+            for (gi=0; gi<4; gi=gi+1) gd_edges[gi] <= 16'd0;
+        end else begin
+            if (gpio_clk_edge && !(&gclk_edges)) gclk_edges <= gclk_edges + 16'd1;
+            for (gi=0; gi<4; gi=gi+1)
+                if (gpio_data_edge[gi] && !(&gd_edges[gi]))
+                    gd_edges[gi] <= gd_edges[gi] + 16'd1;
+        end
+    end
+    // live pin levels: {clk, d3,d2,d1,d0}
+    wire [7:0] gpio_level = {3'b0, gpio_clk_level, gpio_data_level};
+
     // ---- live status byte ----
     wire [7:0] live_status = {have_first, pkt_active, traceclk_active,
                               trace_mmcm_locked, sys_mmcm_locked, 1'b0,
@@ -156,6 +186,18 @@ module dbg_regfile (
             8'h24: rdata = c_rx_bad_frame;
             8'h25: rdata = c_tx_fifo_ovf;
             8'h26: rdata = c_rx_fifo_ovf;
+            // ---- raw GPIO monitor (cross-check pin activity) ----
+            8'h30: rdata = gpio_level;              // {0,0,0,clk,d3,d2,d1,d0}
+            8'h31: rdata = gclk_edges[7:0];         // TRACECLK edge count
+            8'h32: rdata = gclk_edges[15:8];
+            8'h33: rdata = gd_edges[0][7:0];        // TRACED0 edges
+            8'h34: rdata = gd_edges[0][15:8];
+            8'h35: rdata = gd_edges[1][7:0];        // TRACED1
+            8'h36: rdata = gd_edges[1][15:8];
+            8'h37: rdata = gd_edges[2][7:0];        // TRACED2
+            8'h38: rdata = gd_edges[2][15:8];
+            8'h39: rdata = gd_edges[3][7:0];        // TRACED3
+            8'h3A: rdata = gd_edges[3][15:8];
             default: rdata = 8'h00;
         endcase
     end

@@ -117,6 +117,12 @@ GPIO 无信号 → MMCM 没锁 → 采样错 → 去帧错 → FIFO 溢出 → s
 | `0x24` | `FIFO_OCC` / `FIFO_MAX` | capture FIFO 当前 & 历史最高水位 |
 | `0x28` | `TRACECLK_ACT` | TRACECLK 活动检测(近 N ms 有无边沿) + MMCM lock |
 | `0x2C` | `RX/TX 计数` | good/bad 帧、发包数、lost_cnt |
+| `0x30` | `GPIO_LEVEL` | **原始 trace 引脚电平快照** `{clk,d3,d2,d1,d0}` |
+| `0x31..0x3A` | `GPIO_EDGES` | **原始引脚翻转计数**（TRACECLK + TRACED0..3，各 16-bit）|
+
+> **原始 GPIO 监视器（P1 增补）**：直接在 clk125 域对 `trace_clk_in`/`trace_data_in` 双同步 + 边沿检测,**完全不经过采样 MMCM**。这是关键的**交叉验证**手段——引脚翻转计数 > 0 就证明"信号确实进到了 FPGA GPIO",从而把"引脚没信号"和"MMCM 没锁/解码错"彻底区分开。`fpga_health.py` 会据此给出定责结论：
+> - 引脚全静止 → `raw trace pins STATIC`（STM32 ETM/接线/DAP 问题）
+> - 引脚翻转但 MMCM 没锁 → `SAMPLING/FREQ issue`（TRACECLK 频率 vs 比特流,GPIO 侧没问题）
 
 ### 3.4 "一键体检"主机脚本
 

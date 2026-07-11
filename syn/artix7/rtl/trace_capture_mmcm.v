@@ -43,6 +43,13 @@ module trace_capture_mmcm #(
     output wire [3:0]  trace_b,          // second half-bit (eye centre)
     output wire        mmcm_locked,
 
+    // Post-IBUF raw pin taps for the observability monitor (proposal 30). These
+    // are the buffered (but NOT MMCM-sampled) pin signals, so the top can
+    // detect raw GPIO toggling independent of the sampling MMCM, without adding
+    // a second (illegal) IBUF on the same input pin.
+    output wire        raw_clk_ibuf,
+    output wire [3:0]  raw_data_ibuf,
+
     // clk90-domain glitch-free byte capture (mirrors trace_capture_a7)
     output reg  [7:0]  cap_byte,
     output reg         cap_valid
@@ -51,6 +58,7 @@ module trace_capture_mmcm #(
     wire trace_clk_ibuf, trace_clk_bufg;
     IBUF u_ibuf_clk (.I(trace_clk_p), .O(trace_clk_ibuf));
     BUFG u_bufg_in  (.I(trace_clk_ibuf), .O(trace_clk_bufg));
+    assign raw_clk_ibuf = trace_clk_ibuf;
 
     wire clkfb, clk0_u, clk90_u;
     wire clk90;
@@ -89,6 +97,7 @@ module trace_capture_mmcm #(
     generate
         for (i = 0; i < 4; i = i + 1) begin : g_lane
             IBUF u_ibuf (.I(trace_data_p[i]), .O(data_ibuf[i]));
+            assign raw_data_ibuf[i] = data_ibuf[i];
             IDDR #(
                 .DDR_CLK_EDGE("SAME_EDGE_PIPELINED"),
                 .INIT_Q1(1'b0), .INIT_Q2(1'b0), .SRTYPE("ASYNC")

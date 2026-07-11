@@ -29,6 +29,8 @@ A_FIRST_CODE = 0xFF16   # 2 bytes LE
 A_FIRST_TIME = 0xFF18   # 4 bytes LE
 A_FIRST_CTX  = 0xFF1C
 A_CNT_BASE   = 0xFF20   # 7 counters
+A_GPIO_LEVEL = 0xFF30   # {0,0,0,clk,d3,d2,d1,d0}
+A_GPIO_EDGES = 0xFF31   # clk(2) d0(2) d1(2) d2(2) d3(2) LE, 10 bytes
 
 ERR_NAMES = {
     0x0000: "none",
@@ -108,6 +110,33 @@ def main():
         print("[WARN] trace MMCM not locked despite TRACECLK — wrong sampling freq")
     else:
         print("[OK]   TRACECLK active + trace MMCM locked")
+
+    # ---- raw GPIO monitor (cross-check pin activity vs decode) ----
+    glevel = rd8(s, A_GPIO_LEVEL)
+    ge = rd(s, A_GPIO_EDGES, 10)
+    gclk_ed = ge[0] | (ge[1] << 8)
+    gd_ed = [ge[2 + 2 * i] | (ge[3 + 2 * i] << 8) for i in range(4)]
+    clk_lvl = (glevel >> 4) & 1
+    d_lvl = glevel & 0xF
+    # edge counts are 16-bit saturating; 0xFFFF shown as ">=65535"
+    def ec(v):
+        return ">=65535" if v == 0xFFFF else str(v)
+    print(f"       raw GPIO: TRACECLK level={clk_lvl} edges={ec(gclk_ed)}  "
+          f"TRACED[3:0] level={d_lvl:04b} edges=[{','.join(ec(x) for x in gd_ed)}]")
+    if gclk_ed == 0 and all(x == 0 for x in gd_ed):
+        print("[FAIL] raw trace pins are STATIC — no signal reaching the FPGA "
+              "GPIO (check STM32 ETM pins / wiring / DAP config)")
+    elif gclk_ed == 0:
+        print("[WARN] TRACECLK pin not toggling but data lanes are — trace clock "
+              "output / PE2 wiring problem")
+    else:
+        active_lanes = [i for i, x in enumerate(gd_ed) if x > 0]
+        print(f"[OK]   raw GPIO toggling: TRACECLK + TRACED lanes {active_lanes} "
+              f"active at the pins (signal IS reaching the FPGA)")
+        if not trace_lock:
+            print("       => pins wiggle but trace MMCM not locked: this is a "
+                  "SAMPLING/FREQ issue (TRACECLK freq vs bitstream), not a "
+                  "'no signal' issue. Cross-check confirms the GPIO side is fine.")
 
     # ---- counters ----
     cnts = rd(s, A_CNT_BASE, len(CNT_NAMES))

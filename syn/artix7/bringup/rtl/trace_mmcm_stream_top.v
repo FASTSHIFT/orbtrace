@@ -89,6 +89,9 @@ module trace_mmcm_stream_top #(
     wire [3:0]  trace_a, trace_b;
     wire [7:0]  cap_byte;
     wire        cap_valid;
+    // post-IBUF raw pin taps for the observability GPIO monitor (proposal 30)
+    wire        raw_clk_ibuf;
+    wire [3:0]  raw_data_ibuf;
     trace_capture_mmcm #(.MULT(MULT), .DIVID(DIVID), .CLKIN_PERIOD(CLKIN_PERIOD),
                          .PHASE(PHASE), .WIDTH(WIDTH)) u_cap (
         .rst(sys_rst),
@@ -96,6 +99,7 @@ module trace_mmcm_stream_top #(
         .trace_clk(cap_clk), .clk90_out(clk90),
         .trace_a(trace_a), .trace_b(trace_b),
         .mmcm_locked(clk90_locked),
+        .raw_clk_ibuf(raw_clk_ibuf), .raw_data_ibuf(raw_data_ibuf),
         .cap_byte(cap_byte), .cap_valid(cap_valid)
     );
 
@@ -362,6 +366,21 @@ module trace_mmcm_stream_top #(
     always @(posedge clk125) traceclk_active_q <= traceclk_active;
     wire e_no_traceclk = traceclk_active_q & ~traceclk_active;
 
+    // ---- raw GPIO monitor: sample trace pins directly in clk125, independent
+    // of the trace-sampling MMCM (clk90). Double-sync each async pin, then
+    // edge-detect. Nonzero edge counts => the pin is physically toggling, so we
+    // can cross-check "GPIO has signal" vs "MMCM not locked / decode error".
+    // sample the POST-IBUF pin signals (raw_*_ibuf) -- not the pins directly,
+    // which would add an illegal 2nd IBUF on the same input pad.
+    reg        gclk_s0=0, gclk_s1=0, gclk_s2=0;
+    reg [3:0]  gd_s0=0,   gd_s1=0,   gd_s2=0;
+    always @(posedge clk125) begin
+        gclk_s0 <= raw_clk_ibuf;   gclk_s1 <= gclk_s0;  gclk_s2 <= gclk_s1;
+        gd_s0   <= raw_data_ibuf;  gd_s1   <= gd_s0;    gd_s2   <= gd_s1;
+    end
+    wire       gpio_clk_edge  = gclk_s1 ^ gclk_s2;      // any edge on TRACECLK
+    wire [3:0] gpio_data_edge = gd_s1 ^ gd_s2;          // per-lane edge
+
     wire [7:0] dbg_rdata;
     dbg_regfile u_dbg (
         .clk(clk125), .rst(sys_rst), .clr(1'b0),
@@ -378,6 +397,10 @@ module trace_mmcm_stream_top #(
         .selftx_state(dbg_selftx_state),
         .pkt_active(pkt_active),
         .lost_cnt(lost_125),
+        .gpio_clk_level(gclk_s2),
+        .gpio_data_level(gd_s2),
+        .gpio_clk_edge(gpio_clk_edge),
+        .gpio_data_edge(gpio_data_edge),
         .addr(ext_addr[7:0]),
         .rdata(dbg_rdata)
     );
