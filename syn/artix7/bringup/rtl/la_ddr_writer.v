@@ -34,7 +34,10 @@ module la_ddr_writer #(
     input  wire        cap_clk,
     input  wire        cap_rst,
     input  wire [7:0]  cap_byte,
-    input  wire        cap_valid,
+    input  wire        cap_valid_in,    // raw capture valid
+    input  wire        freeze,          // when 1, stop accepting new bytes
+                                        // (clk125-domain level; static ring for
+                                        // a clean readback snapshot)
 
     // ---- DDR3 side (ui_clk domain), drives ddr3_ctrl write interface ----
     input  wire        ui_clk,
@@ -57,6 +60,12 @@ module la_ddr_writer #(
     // source, never sharing the real-time path's FIFO. Depth 4096 absorbs DDR3
     // arbitration latency. Loss = a cap_valid byte arriving while the FIFO is
     // not ready (should not happen: 12.8MB/s in vs 800MB/s DDR3 out).
+    // freeze (clk125 level) synced into cap_clk; gate capture bytes off while a
+    // readback is in flight so the ring is a static snapshot.
+    reg frz0=0, frz1=0;
+    always @(posedge cap_clk) begin frz0<=freeze; frz1<=frz0; end
+    wire cap_valid = cap_valid_in & ~frz1;
+
     wire       fifo_s_ready;
     wire [7:0] fifo_out_data;
     wire       fifo_out_valid, fifo_out_ready;

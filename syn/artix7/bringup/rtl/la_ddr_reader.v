@@ -25,6 +25,9 @@ module la_ddr_reader #(
     input  wire        sys_rst,
     input  wire        arm,             // 1-cyc pulse: start a readback
     input  wire [31:0] read_words,      // number of 128-bit words to read back
+    input  wire [28:0] start_addr,      // ring word address to start reading at
+                                        // (latched at arm; e.g. wr_ptr-read_words
+                                        // to grab the most recently written data)
 
     // ---- DDR3 read interface (ui_clk), drives ddr3_ctrl ----
     input  wire        ui_clk,
@@ -52,9 +55,14 @@ module la_ddr_reader #(
     reg a0=0,a1=0,a2=0;
     always @(posedge ui_clk) begin a0<=arm_tog; a1<=a0; a2<=a1; end
     wire arm_ui = a1 ^ a2;
-    // read_words CDC: latched stable well before arm edge (host writes it first)
+    // read_words + start_addr CDC: stable well before the arm edge (both are
+    // driven from clk125 and static/slow), 2-FF synced into ui_clk.
     reg [31:0] rw_s0=0, rw_ui=0;
-    always @(posedge ui_clk) begin rw_s0<=read_words; rw_ui<=rw_s0; end
+    reg [28:0] sa_s0=0, sa_ui=0;
+    always @(posedge ui_clk) begin
+        rw_s0<=read_words; rw_ui<=rw_s0;
+        sa_s0<=start_addr; sa_ui<=sa_s0;
+    end
 
     // ---- ui_clk read FSM: issue LENGTH-word bursts until rw_ui words read ----
     localparam R_IDLE=0, R_START=1, R_RUN=2, R_NEXT=3;
@@ -81,7 +89,7 @@ module la_ddr_reader #(
             case (rst_state)
                 R_IDLE:
                     if (arm_ui) begin
-                        ddr3_rd_addr <= RING_BASE;
+                        ddr3_rd_addr <= sa_ui;      // latched start address
                         words_left   <= rw_ui;
                         rst_state    <= R_START;
                     end
