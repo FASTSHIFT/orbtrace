@@ -40,7 +40,11 @@ module la_ddr_reader #(
     output wire [7:0]  stream_tdata,
     output wire        stream_tvalid,
     input  wire        stream_tready,
-    output reg         busy            // high while a readback is in flight
+    output reg         busy,           // high while a readback is in flight
+    // observability (clk125): reader FSM state + words remaining + total done
+    output reg  [1:0]  dbg_state,
+    output reg  [31:0] dbg_words_left,
+    output reg  [31:0] dbg_words_done
 );
     // ---- arm pulse CDC clk125 -> ui_clk ----
     reg arm_tog = 0;
@@ -82,11 +86,11 @@ module la_ddr_reader #(
                         rst_state    <= R_START;
                     end
                 R_START:
-                    // only launch a burst when the FIFO can hold a whole
-                    // LENGTH-word burst (f_wr_ready is deasserted well before
-                    // full via DEPTH margin). Gate on ready to avoid dropping
-                    // words when self-TX drains slower than DDR3 reads.
-                    if (f_wr_ready) begin
+                    // Launch a burst only when the FIFO has room for a WHOLE
+                    // unpauseable LENGTH-word MIG burst (2*LENGTH margin). This
+                    // throttles the reader to the (slow) network egress so the
+                    // FIFO never overflows — the fix for the ~590-packet cap.
+                    if (fifo_has_room) begin
                         ddr3_rd_start <= 1'b1;
                         rst_state <= R_RUN;
                     end
@@ -110,20 +114,42 @@ module la_ddr_reader #(
         end
     end
 
-    // busy flag (ui_clk) synced to clk125
+    // words actually delivered into the FIFO (ui_clk)
+    reg [31:0] words_done = 0;
+    always @(posedge ui_clk) begin
+        if (ui_rst) words_done <= 0;
+        else if (arm_ui) words_done <= 0;
+        else if (f_wr_valid) words_done <= words_done + 1'b1;
+    end
+
+    // busy flag + observability (ui_clk) synced to clk125
     reg busy_ui;
     always @(posedge ui_clk) busy_ui <= (rst_state != R_IDLE);
     reg b0=0,b1=0;
-    always @(posedge clk125) begin b0<=busy_ui; b1<=b0; busy<=b1; end
+    reg [1:0]  st_s0=0;
+    reg [31:0] wl_s0=0, wd_s0=0;
+    always @(posedge clk125) begin
+        b0<=busy_ui; b1<=b0; busy<=b1;
+        st_s0 <= rst_state;      dbg_state      <= st_s0;
+        wl_s0 <= words_left;     dbg_words_left <= wl_s0;
+        wd_s0 <= words_done;     dbg_words_done <= wd_s0;
+    end
 
     // ---- AsyncFIFO ui_clk -> clk125 (128-bit wide) ----
     // DEPTH is in BYTES; 128-bit words = 16 bytes each. 512 words = 8KB holds
     // 8 read bursts (64 words) — plenty, and fits BRAM budget alongside the
     // writer's staging + Ethernet FIFOs.
+    localparam integer FIFO_WORDS = 512;
     wire [127:0] m_word;
     wire         m_valid, m_ready;
+    wire [$clog2(FIFO_WORDS):0] s_depth;
+    // free space for a whole burst? gate the reader so a 64-word MIG burst
+    // (unpauseable) never overflows the FIFO — the earlier version read at
+    // DDR3 speed (800MB/s) into a FIFO drained at 1Gb/s (~12.5MB/s), so it
+    // overflowed and only the first ~590 packets survived.
+    wire        fifo_has_room = (s_depth < (FIFO_WORDS - 2*LENGTH));
     axis_async_fifo #(
-        .DEPTH(512*16), .DATA_WIDTH(128),
+        .DEPTH(FIFO_WORDS), .DATA_WIDTH(128),
         .KEEP_ENABLE(0), .LAST_ENABLE(0), .USER_ENABLE(0), .FRAME_FIFO(0)
     ) u_rfifo (
         .s_clk(ui_clk), .s_rst(ui_rst),
@@ -135,7 +161,7 @@ module la_ddr_reader #(
         .m_axis_tvalid(m_valid), .m_axis_tready(m_ready),
         .m_axis_tlast(), .m_axis_tid(), .m_axis_tdest(), .m_axis_tuser(),
         .s_pause_req(1'b0), .s_pause_ack(), .m_pause_req(1'b0), .m_pause_ack(),
-        .s_status_depth(), .s_status_depth_commit(), .s_status_overflow(),
+        .s_status_depth(s_depth), .s_status_depth_commit(), .s_status_overflow(),
         .s_status_bad_frame(), .s_status_good_frame(),
         .m_status_depth(), .m_status_depth_commit(), .m_status_overflow(),
         .m_status_bad_frame(), .m_status_good_frame()

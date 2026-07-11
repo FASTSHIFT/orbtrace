@@ -170,6 +170,8 @@ module trace_ddr_blackbox_top #(
 
     wire [7:0] rb_tdata;
     wire       rb_tvalid, rb_tready, rb_busy;
+    wire [1:0] rd_dbg_state;
+    wire [31:0]rd_dbg_wleft, rd_dbg_wdone;
     la_ddr_reader #(.LENGTH(LENGTH), .RING_BASE(29'd0)) u_rd (
         .clk125(clk125), .sys_rst(sys_rst),
         .arm(arm_125), .read_words(READ_WORDS),
@@ -178,7 +180,9 @@ module trace_ddr_blackbox_top #(
         .ddr3_rd_addr(rd_addr), .ddr3_rd_data_vld(rd_data_vld),
         .ddr3_rd_data(rd_data), .ddr3_rd_done(rd_done),
         .stream_tdata(rb_tdata), .stream_tvalid(rb_tvalid),
-        .stream_tready(rb_tready), .busy(rb_busy)
+        .stream_tready(rb_tready), .busy(rb_busy),
+        .dbg_state(rd_dbg_state), .dbg_words_left(rd_dbg_wleft),
+        .dbg_words_done(rd_dbg_wdone)
     );
 
     // ---- CDC ui_clk status -> clk125 (atomic toggle snapshot) ----
@@ -258,13 +262,23 @@ module trace_ddr_blackbox_top #(
         (ext_addr==16'hFF5B) ? ptr_125[15:8]    :
         (ext_addr==16'hFF5C) ? ptr_125[23:16]   :
         (ext_addr==16'hFF5D) ? {3'b0, ptr_125[28:24]} :
+        // reader observability (P2b-3 debug)
+        (ext_addr==16'hFF60) ? {5'b0, rb_busy, rd_dbg_state} :
+        (ext_addr==16'hFF61) ? rd_dbg_wleft[7:0]   :
+        (ext_addr==16'hFF62) ? rd_dbg_wleft[15:8]  :
+        (ext_addr==16'hFF63) ? rd_dbg_wleft[23:16] :
+        (ext_addr==16'hFF64) ? rd_dbg_wleft[31:24] :
+        (ext_addr==16'hFF65) ? rd_dbg_wdone[7:0]   :
+        (ext_addr==16'hFF66) ? rd_dbg_wdone[15:8]  :
+        (ext_addr==16'hFF67) ? rd_dbg_wdone[23:16] :
+        (ext_addr==16'hFF68) ? rd_dbg_wdone[31:24] :
         (ext_addr==16'hFF70) ? BUILD_ID[7:0]    :
         (ext_addr==16'hFF71) ? BUILD_ID[15:8]   :
         (ext_addr==16'hFF72) ? BUILD_ID[23:16]  :
         (ext_addr==16'hFF73) ? BUILD_ID[31:24]  :
         8'h00;
     wire bb_page = (ext_addr[15:8]==8'hFF) &&
-                   ((ext_addr[7:4]==4'h5) || (ext_addr[7:4]==4'h7));
+                   ((ext_addr[7:4]==4'h5) || (ext_addr[7:4]==4'h6) || (ext_addr[7:4]==4'h7));
     assign ext_data = dbg_page ? dbg_rdata : bb_page ? bb_status : 8'h00;
 
     // STREAM=1: the DDR3 ring readback (reader) is the self-TX source; on arm
@@ -275,7 +289,10 @@ module trace_ddr_blackbox_top #(
         .UDP_CHECKSUM_GEN_ENABLE(0),
         .STREAM_DEST_IP({8'd192,8'd168,8'd10,8'd245}),
         .STREAM_DEST_PORT(16'd5555),
-        .STREAM_PKT_BYTES(16'd1028)      // 4 seq + 1024 payload (matches rx)
+        // packet payload == one DDR3 read burst (64 words * 16 = 1024 bytes) so
+        // each burst fills exactly one packet — no cross-burst straddling that
+        // would leave a final partial packet wedging the self-TX FSM.
+        .STREAM_PKT_BYTES(16'd1024)
     ) u_eth (
         .clk(clk125), .clk90(clk125_90), .rst(sys_rst),
         .btnu(1'b0), .btnl(1'b0), .btnd(1'b0), .btnr(1'b0), .btnc(1'b0),

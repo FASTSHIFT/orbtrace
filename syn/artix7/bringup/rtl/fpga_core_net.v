@@ -514,16 +514,19 @@ end else begin : g_stream
 
     // self header valid is folded into tx_udp_hdr_valid above (ST_HDR).
 
-    // payload mux: echo from tx_fifo, self from stream_*
-    assign tx_udp_payload_axis_tdata  = self_busy ? stream_tdata
+    // payload mux: echo from tx_fifo, self from stream_*. On self-TX underrun
+    // (send_pad) we substitute zero data with forced tvalid so the promised
+    // STREAM_PKT_BYTES always complete (never truncate a UDP frame).
+    assign tx_udp_payload_axis_tdata  = self_busy ? (send_pad ? 8'h00 : stream_tdata)
                                                   : tx_fifo_udp_payload_axis_tdata;
-    assign tx_udp_payload_axis_tvalid = self_busy ? (st == ST_SEND && stream_tvalid)
+    assign tx_udp_payload_axis_tvalid = self_busy ? (st == ST_SEND && (stream_tvalid || send_pad))
                                                   : tx_fifo_udp_payload_axis_tvalid;
     assign tx_udp_payload_axis_tlast  = self_busy ? (st == ST_SEND && (bcnt == STREAM_PKT_BYTES-1))
                                                   : tx_fifo_udp_payload_axis_tlast;
     assign tx_udp_payload_axis_tuser  = self_busy ? 1'b0 : tx_fifo_udp_payload_axis_tuser;
     assign tx_fifo_udp_payload_axis_tready = !self_busy && tx_udp_payload_axis_tready;
-    assign stream_tready = (st == ST_SEND) && tx_udp_payload_axis_tready;
+    // only pull real stream bytes when NOT padding
+    assign stream_tready = (st == ST_SEND) && !send_pad && tx_udp_payload_axis_tready;
 
     // ARP-deadlock breaker: if ST_HDR waits too long for hdr_ready (ARP not
     // resolved), back off to IDLE so the echo/ARP RX path is unblocked. The
@@ -539,10 +542,22 @@ end else begin : g_stream
     wire hdr_stuck = hdr_timeout[19];
     reg [25:0] backoff_cnt = 0;   // ~500ms at 125MHz (2^26/125M)
     wire backoff_done = backoff_cnt[25];
+    // ST_SEND starvation guard: a FINITE stream source (e.g. the DDR3 ring
+    // readback) can underrun mid-packet; without a guard the FSM waits forever
+    // for the promised STREAM_PKT_BYTES and wedges the SHARED TX path (echo
+    // :5001 included). If no payload beat is accepted for ~8ms, abort the
+    // packet back to IDLE so the path is freed. (The continuous real-time trace
+    // stream never triggers this.)
+    reg [19:0] send_timeout = 0;
+    wire send_stuck = send_timeout[19];
+    // pad mode: in ST_SEND, stream underran long enough -> finish packet with
+    // zeros instead of waiting (or truncating). ~8ms underrun triggers padding.
+    wire send_pad = (st == ST_SEND) && !stream_tvalid && send_stuck;
 
     always @(posedge clk) begin
         if (rst) begin
             st <= ST_IDLE; bcnt <= 0; hdr_timeout <= 0; backoff_cnt <= 0;
+            send_timeout <= 0;
         end else case (st)
             ST_IDLE: begin
                 hdr_timeout <= 0;
@@ -552,6 +567,7 @@ end else begin : g_stream
             end
             ST_HDR: begin
                 hdr_timeout <= hdr_timeout + 1'b1;
+                send_timeout <= 0;
                 if (tx_udp_hdr_ready)
                     st <= ST_SEND;
                 else if (hdr_stuck) begin
@@ -560,10 +576,19 @@ end else begin : g_stream
                 end
             end
             ST_SEND:
+                // A UDP frame MUST deliver exactly tx_udp_length bytes; you
+                // cannot abandon it mid-payload (that jams udp_complete and
+                // wedges the whole TX datapath, echo included). On a finite
+                // stream underrun we therefore PAD with zeros (see the payload
+                // mux: send_pad forces tvalid + zero data) to complete the
+                // packet cleanly, then return to IDLE.
                 if (tx_udp_payload_axis_tvalid && tx_udp_payload_axis_tready) begin
+                    if (!send_pad) send_timeout <= 0;
                     if (bcnt == STREAM_PKT_BYTES-1) begin
-                        st <= ST_IDLE; bcnt <= 0;
+                        st <= ST_IDLE; bcnt <= 0; send_timeout <= 0;
                     end else bcnt <= bcnt + 1'b1;
+                end else if (!send_pad) begin
+                    send_timeout <= send_timeout + 1'b1;
                 end
             ST_BACKOFF: begin
                 backoff_cnt <= backoff_cnt + 1'b1;

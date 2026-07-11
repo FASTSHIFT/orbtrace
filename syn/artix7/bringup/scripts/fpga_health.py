@@ -202,6 +202,15 @@ def blackbox_check(ip):
         return 0
     if lost:
         print(f"[WARN] {lost} capture-side bytes dropped (AsyncFIFO backpressure)")
+    # reader debug (P2b-3): FSM state + words left/done for the last readback
+    rdst = rd8(s, 0xFF60)
+    rd_busy = (rdst >> 2) & 1
+    rd_state = rdst & 0x3
+    wleft = rd_le(0xFF61, 4)
+    wdone = rd_le(0xFF65, 4)
+    st_name = {0: "IDLE", 1: "START", 2: "RUN", 3: "NEXT"}.get(rd_state, rd_state)
+    print(f"       reader: state={st_name} busy={rd_busy} words_left={wleft} "
+          f"words_done={wdone}")
     if words == 0:
         print("[WARN] TRACECLK active but 0 words written yet — read again")
         return 0

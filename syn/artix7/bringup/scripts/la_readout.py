@@ -36,6 +36,20 @@ def main():
     rx.bind(("0.0.0.0", STREAM_PORT))
     rx.settimeout(a.seconds)
 
+    # Warm ARP both directions first: the FPGA self-TX must resolve the host
+    # MAC before it can send; after a fresh (re)configure its ARP cache is cold
+    # and the self-TX FSM would sit in backoff, sending nothing. A few :5001
+    # echo round-trips make the FPGA learn the host MAC (and vice-versa).
+    warm = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    warm.settimeout(0.3)
+    for _ in range(5):
+        try:
+            warm.sendto(b"\x10\x00\x00\x00", (a.ip, 5001))
+            warm.recvfrom(64)
+        except socket.timeout:
+            pass
+    warm.close()
+
     # arm the readback
     ctrl = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     ctrl.sendto(bytes([REG_ARM, 1, 0, 0]), (a.ip, CTRL_PORT))
