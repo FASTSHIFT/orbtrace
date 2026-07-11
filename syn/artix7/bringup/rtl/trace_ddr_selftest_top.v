@@ -23,7 +23,11 @@
 module trace_ddr_selftest_top #(
     parameter [31:0] DEST_IP   = {8'd192, 8'd168, 8'd10, 8'd245},
     parameter [15:0] DEST_PORT = 16'd5555,
-    parameter integer LENGTH   = 64          // 128-bit words per DDR3 burst
+    parameter integer LENGTH   = 64,         // 128-bit words per DDR3 burst
+    // BUILD_ID: Unix epoch stamped in by the build TCL. Read back over :5001
+    // (0xFF70..73) to PROVE the running bitstream matches the latest build --
+    // rules out "old flash contents / flash write didn't take" as a cause.
+    parameter [31:0] BUILD_ID  = 32'hDEADBEEF
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -106,11 +110,16 @@ module trace_ddr_selftest_top #(
     reg  [28:0]  rd_addr;
     wire [127:0] rd_data;
 
+    wire mig_calib_raw;
     ddr3_ctrl u_ddr3 (
         .sys_clk    (sys_clk_200),
-        .sys_rst_n  (clk200_locked),
+        // MIG must not be released until BOTH the 200M ref clock (clock IP) and
+        // the sys MMCM are locked; releasing MIG while clocks are still settling
+        // gives a "calibrated" MIG that returns all-zero reads (observed P2a).
+        .sys_rst_n  (clk200_locked & mmcm_sys_locked),
         .ui_clk     (ui_clk),
         .ui_rst     (ui_rst),
+        .calib_complete(mig_calib_raw),
         .ddr3_busy  (ddr3_busy),
         .ddr3_wr_start(wr_start), .ddr3_wr_data_req(wr_data_req),
         .ddr3_wr_data(wr_data), .ddr3_wr_addr_req(wr_addr_req),
@@ -137,8 +146,19 @@ module trace_ddr_selftest_top #(
     reg [31:0] err_count = 0, pass_bursts = 0;
     localparam [9:0] MAX_NUM = LENGTH-1;
 
+    // pattern: every byte non-zero AND varies with the word index, so a
+    // readback of 0x00 is unambiguously "no data" (not a pattern byte that
+    // happens to be 0). Each 16-bit half = (w+k)|0x8080-ish spread.
     function [127:0] patgen(input [9:0] w);
-        patgen = {16{w[7:0]}} ^ {4{32'hA5A5_0000 | w}};
+        reg [7:0] b; integer k; reg [127:0] v;
+        begin
+            v = 0;
+            for (k = 0; k < 16; k = k + 1) begin
+                b = (w[7:0] ^ (k*8'h11)) | 8'h81;   // never zero, varies by lane+word
+                v = (v << 8) | b;
+            end
+            patgen = v;
+        end
     endfunction
 
     assign wr_start = (wr_rd_flag == 1'b0) && (st == S_ARBIT) && calib_done;
@@ -163,19 +183,40 @@ module trace_ddr_selftest_top #(
         endcase
     end
 
+    // write data: COMBINATIONAL (like vendor ddr3_generate_data). ddr3_wr_ctrl
+    // samples app_wdf_data = ddr3_wr_data on the SAME cycle ddr3_wr_data_req is
+    // high, so the data must be valid THAT cycle. A registered
+    // "wr_data <= patgen(wr_cnt) on wr_data_req" is one cycle LATE -> each
+    // stored word holds the PREVIOUS word's pattern (readback appears shifted
+    // by one word — exactly what the board showed). Drive combinationally;
+    // advance wr_cnt on the request.
+    always @(*) wr_data = patgen(wr_cnt);
     always @(posedge ui_clk) begin
         if (ui_rst) wr_cnt <= 0;
-        else if (wr_data_req) begin
-            wr_data <= patgen(wr_cnt);
-            wr_cnt  <= (wr_cnt == MAX_NUM) ? 10'd0 : wr_cnt + 1'b1;
-        end
+        else if (wr_data_req)
+            wr_cnt <= (wr_cnt == MAX_NUM) ? 10'd0 : wr_cnt + 1'b1;
     end
 
+    // FIRST-MISMATCH capture (debug, don't guess): on the very first compared
+    // word that differs, latch the word index + the low byte of expected and
+    // actual, so the readout SHOWS what is wrong instead of only a count.
+    reg [9:0]  first_bad_word = 0;
+    reg [7:0]  first_exp_lo = 0, first_got_lo = 0;
+    reg [15:0] first_exp_hi = 0, first_got_hi = 0;
+    wire [127:0] rd_expect = patgen(rd_cnt);   // intermediate (no part-select on
+                                               // a function call in V2001 synth)
     always @(posedge ui_clk) begin
         if (ui_rst) begin
             rd_cnt <= 0; err_sticky <= 0; err_count <= 0; pass_bursts <= 0;
         end else if (rd_data_vld) begin
-            if (rd_data !== patgen(rd_cnt)) begin
+            if (rd_data !== rd_expect) begin
+                if (!err_sticky) begin
+                    first_bad_word <= rd_cnt;
+                    first_exp_lo   <= rd_expect[7:0];
+                    first_got_lo   <= rd_data[7:0];
+                    first_exp_hi   <= rd_expect[127:112];
+                    first_got_hi   <= rd_data[127:112];
+                end
                 err_sticky <= 1'b1; err_count <= err_count + 1'b1;
             end
             if (rd_cnt == MAX_NUM) begin
@@ -185,22 +226,55 @@ module trace_ddr_selftest_top #(
         end
     end
 
-    // ---- CDC ui_clk-domain DDR3 status -> clk125 for the :5001 readout ----
-    // Slow-moving status; double-flop each field. err_count/pass_bursts are
-    // multi-bit but change slowly relative to clk125, and we only need
-    // approximate values for a health check, so a plain 2-FF sync is adequate
-    // (a gray-coded handshake is overkill for human-read diagnostics).
-    reg        calib_s0=0, calib_125=0;
-    reg        errs_s0=0,  errs_125=0;
-    reg [31:0] errc_s0=0,  errc_125=0;
-    reg [31:0] passb_s0=0, passb_125=0;
-    reg [1:0]  ddst_s0=0,  ddst_125=0;
-    always @(posedge clk125) begin
-        calib_s0 <= calib_done;  calib_125 <= calib_s0;
-        errs_s0  <= err_sticky;  errs_125  <= errs_s0;
-        errc_s0  <= err_count;   errc_125  <= errc_s0;
-        passb_s0 <= pass_bursts; passb_125 <= passb_s0;
-        ddst_s0  <= st;          ddst_125  <= ddst_s0;
+    // ---- CDC ui_clk-domain DDR3 status -> clk125 (ATOMIC snapshot) ----
+    // The multi-bit fields (err_count/pass_bursts/first_*) must cross as a
+    // COHERENT set, not per-bit (a naive 2-FF on each bit tears the value ->
+    // garbage like 0x98530000). Use a toggle handshake: ui_clk periodically
+    // freezes a snapshot register set and flips `snap_tog`; clk125 detects the
+    // synchronised toggle edge and latches the (now-stable) snapshot in one go.
+    reg        snap_tog = 0;
+    reg [21:0] snap_div = 0;           // ~85us @50M between snapshots
+    reg [31:0] snap_errc, snap_passb;
+    reg [9:0]  snap_bad_word;
+    reg [7:0]  snap_exp_lo, snap_got_lo;
+    reg [15:0] snap_exp_hi, snap_got_hi;
+    reg        snap_calib, snap_errs, snap_migcal;
+    reg [1:0]  snap_st;
+    always @(posedge ui_clk) begin
+        snap_div <= snap_div + 1'b1;
+        if (&snap_div) begin
+            snap_errc     <= err_count;
+            snap_passb    <= pass_bursts;
+            snap_bad_word <= first_bad_word;
+            snap_exp_lo   <= first_exp_lo;
+            snap_got_lo   <= first_got_lo;
+            snap_exp_hi   <= first_exp_hi;
+            snap_got_hi   <= first_got_hi;
+            snap_calib    <= calib_done;
+            snap_errs     <= err_sticky;
+            snap_migcal   <= mig_calib_raw;
+            snap_st       <= st;
+            snap_tog      <= ~snap_tog;
+        end
+    end
+
+    // clk125 side: sync the toggle, on edge copy the (stable) snapshot regs.
+    reg tog_s0=0, tog_s1=0, tog_s2=0;
+    always @(posedge clk125) begin tog_s0<=snap_tog; tog_s1<=tog_s0; tog_s2<=tog_s1; end
+    wire snap_valid = tog_s1 ^ tog_s2;
+    reg        calib_125=0, errs_125=0, migcal_125=0;
+    reg [31:0] errc_125=0, passb_125=0;
+    reg [1:0]  ddst_125=0;
+    reg [9:0]  badw_125=0;
+    reg [7:0]  explo_125=0, gotlo_125=0;
+    reg [15:0] exphi_125=0, gothi_125=0;
+    always @(posedge clk125) if (snap_valid) begin
+        calib_125 <= snap_calib;  errs_125  <= snap_errs;
+        migcal_125<= snap_migcal;
+        errc_125  <= snap_errc;   passb_125 <= snap_passb;
+        ddst_125  <= snap_st;     badw_125  <= snap_bad_word;
+        explo_125 <= snap_exp_lo; gotlo_125 <= snap_got_lo;
+        exphi_125 <= snap_exp_hi; gothi_125 <= snap_got_hi;
     end
 
     // ================= Ethernet + dbg_regfile (clk125 domain) ==============
@@ -235,7 +309,7 @@ module trace_ddr_selftest_top #(
                     (ext_addr[7:4] >= 4'h1) && (ext_addr[7:4] <= 4'h4);
     wire [7:0] ddr3_status =
         (ext_addr == 16'hFF50) ? 8'hD3               :  // MAGIC: DDR3 page
-        (ext_addr == 16'hFF51) ? {6'b0, errs_125, calib_125} :
+        (ext_addr == 16'hFF51) ? {5'b0, migcal_125, errs_125, calib_125} :
         (ext_addr == 16'hFF52) ? errc_125[7:0]       :
         (ext_addr == 16'hFF53) ? errc_125[15:8]      :
         (ext_addr == 16'hFF54) ? errc_125[23:16]     :
@@ -245,8 +319,23 @@ module trace_ddr_selftest_top #(
         (ext_addr == 16'hFF58) ? passb_125[23:16]    :
         (ext_addr == 16'hFF59) ? passb_125[31:24]    :
         (ext_addr == 16'hFF5A) ? {6'b0, ddst_125}    :
+        // first-mismatch capture (debug): word index + expected/actual bytes
+        (ext_addr == 16'hFF5B) ? badw_125[7:0]        :
+        (ext_addr == 16'hFF5C) ? {6'b0, badw_125[9:8]}:
+        (ext_addr == 16'hFF5D) ? explo_125            :
+        (ext_addr == 16'hFF5E) ? gotlo_125            :
+        (ext_addr == 16'hFF5F) ? exphi_125[7:0]       :
+        (ext_addr == 16'hFF60) ? exphi_125[15:8]      :
+        (ext_addr == 16'hFF61) ? gothi_125[7:0]       :
+        (ext_addr == 16'hFF62) ? gothi_125[15:8]      :
+        // BUILD_ID (compile timestamp) — proves the running bitstream identity
+        (ext_addr == 16'hFF70) ? BUILD_ID[7:0]        :
+        (ext_addr == 16'hFF71) ? BUILD_ID[15:8]       :
+        (ext_addr == 16'hFF72) ? BUILD_ID[23:16]      :
+        (ext_addr == 16'hFF73) ? BUILD_ID[31:24]      :
         8'h00;
-    wire ddr3_page = (ext_addr[15:4] == 12'hFF5);
+    wire ddr3_page = (ext_addr[15:8] == 8'hFF) &&
+                     (ext_addr[7:4] >= 4'h5) && (ext_addr[7:4] <= 4'h7);
     assign ext_data = dbg_page  ? dbg_rdata   :
                       ddr3_page ? ddr3_status : 8'h00;
 

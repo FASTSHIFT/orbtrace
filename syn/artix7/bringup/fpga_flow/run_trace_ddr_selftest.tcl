@@ -73,7 +73,12 @@ foreach s {
 
 read_xdc $bringup/rtl/trace_ddr_selftest.xdc
 
-synth_design -top trace_ddr_selftest_top -part $part
+# BUILD_ID = Unix epoch at synth time, stamped into a readout register (0xFF70)
+# so the host can PROVE the running bitstream == latest build (rules out stale
+# flash / failed flash write).
+set build_id [clock seconds]
+puts "BUILD_ID = $build_id ([clock format $build_id])"
+synth_design -top trace_ddr_selftest_top -part $part -generic BUILD_ID=$build_id
 # Print all clocks so we can see the real names (sys MMCM, clock-IP 200M, MIG
 # internal, phy) for debugging the async grouping.
 puts "==== CLOCKS ===="

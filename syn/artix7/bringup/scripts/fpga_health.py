@@ -55,6 +55,12 @@ A_DDR3_FLAGS = 0xFF51   # {..., err_sticky, calib_done}
 A_DDR3_ERRC  = 0xFF52   # 4 bytes LE  (compare error count)
 A_DDR3_PASSB = 0xFF56   # 4 bytes LE  (bursts verified error-free)
 A_DDR3_STATE = 0xFF5A   # 2-bit FSM state (0=ARBIT 1=WRITE 2=READ)
+A_DDR3_BADW  = 0xFF5B   # first-mismatch word index (10-bit: 5B lo, 5C hi2)
+A_DDR3_EXPLO = 0xFF5D   # expected byte[0] at first mismatch
+A_DDR3_GOTLO = 0xFF5E   # actual   byte[0] at first mismatch
+A_DDR3_EXPHI = 0xFF5F   # expected byte[15:14] (2 bytes LE)
+A_DDR3_GOTHI = 0xFF61   # actual   byte[15:14] (2 bytes LE)
+A_BUILD_ID   = 0xFF70   # 4 bytes LE — Unix epoch stamped at synth (build identity)
 FREQ_WINDOW_S = (1 << 21) / 125e6   # 16.777 ms
 CLK_NS = 8.0                        # clk125 period (ns)
 
@@ -110,20 +116,39 @@ def ddr3_check(ip):
     flags = rd8(s, A_DDR3_FLAGS)
     calib = flags & 1
     err_sticky = (flags >> 1) & 1
+    mig_calib = (flags >> 2) & 1
     errc = rd_le(A_DDR3_ERRC, 4)
     passb = rd_le(A_DDR3_PASSB, 4)
     state = rd8(s, A_DDR3_STATE) & 0x3
     st_name = {0: "ARBIT", 1: "WRITE", 2: "READ"}.get(state, state)
+    build_id = rd_le(A_BUILD_ID, 4)
+    import datetime
+    bstr = datetime.datetime.fromtimestamp(build_id).strftime("%Y-%m-%d %H:%M:%S") \
+        if 0 < build_id < 0xFFFFFFF0 else "??"
     print(f"[OK]   DDR3 status page online (magic=0xD3)")
-    print(f"       calib_done={calib}  err_sticky={err_sticky}  "
-          f"err_count={errc}  pass_bursts={passb}  fsm={st_name}")
+    print(f"       BUILD_ID = {build_id} ({bstr})  <- verify this matches the "
+          f"latest build log")
+    print(f"       calib_done={calib}  mig_calib_raw={mig_calib}  "
+          f"err_sticky={err_sticky}  err_count={errc}  pass_bursts={passb}  fsm={st_name}")
     if not calib:
         print("[FAIL] MIG DDR3 NOT calibrated — cold-boot the FPGA (SRAM load "
               "leaves MIG mis-calibrated; needs a clean power cycle)")
         return 2
     if err_sticky or errc:
+        badw = rd8(s, A_DDR3_BADW) | ((rd8(s, A_DDR3_BADW + 1) & 0x3) << 8)
+        exp_lo = rd8(s, A_DDR3_EXPLO); got_lo = rd8(s, A_DDR3_GOTLO)
+        exp_hi = rd_le(A_DDR3_EXPHI, 2); got_hi = rd_le(A_DDR3_GOTHI, 2)
         print(f"[FAIL] DDR3 data compare MISMATCH (err_count={errc}) — datapath "
               f"or timing problem")
+        print(f"       first bad @ word[{badw}]:  "
+              f"byte0 exp=0x{exp_lo:02x} got=0x{got_lo:02x}   "
+              f"byte15:14 exp=0x{exp_hi:04x} got=0x{got_hi:04x}")
+        if got_lo == 0 and got_hi == 0:
+            print("       -> readback is all-zero: DDR3 not returning data "
+                  "(read path / addr / calibration marginal)")
+        elif badw == 0:
+            print("       -> first word wrong: likely address/burst-align or a "
+                  "systematic pattern/CDC issue, not random bit errors")
         return 2
     if passb == 0:
         print("[WARN] calibrated but no verified bursts yet — read again")

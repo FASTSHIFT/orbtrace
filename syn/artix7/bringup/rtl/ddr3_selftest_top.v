@@ -89,6 +89,7 @@ module ddr3_selftest_top #(
         .sys_rst_n  (clk_locked),      // MIG sys_rst is ACTIVE LOW; release on lock
         .ui_clk     (ui_clk),
         .ui_rst     (ui_rst),
+        .calib_complete(),
         .ddr3_busy  (ddr3_busy),
         .ddr3_wr_start   (wr_start),
         .ddr3_wr_data_req(wr_data_req),
@@ -173,13 +174,14 @@ module ddr3_selftest_top #(
         end
     end
 
-    // write data on each wr_data_req
+    // write data: COMBINATIONAL — ddr3_wr_ctrl samples app_wdf_data on the same
+    // cycle it asserts wr_data_req, so a registered update is one cycle late
+    // (stores the previous word). Drive from wr_cnt combinationally.
+    always @(*) wr_data = patgen(wr_cnt);
     always @(posedge ui_clk) begin
         if (ui_rst) wr_cnt <= 0;
-        else if (wr_data_req) begin
-            wr_data <= patgen(wr_cnt);
-            wr_cnt  <= (wr_cnt == MAX_NUM) ? 10'd0 : wr_cnt + 1'b1;
-        end
+        else if (wr_data_req)
+            wr_cnt <= (wr_cnt == MAX_NUM) ? 10'd0 : wr_cnt + 1'b1;
     end
 
     // compare read data on each rd_data_vld

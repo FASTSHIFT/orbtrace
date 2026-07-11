@@ -47,6 +47,7 @@ module ddr3_ctrl(
 /*************应用层接口以及时钟**********/
         output        ui_clk  ,
         output        ui_rst  ,
+        output        calib_complete, //MIG init_calib_complete (raw, observability)
         output        ddr3_busy,      //置1表明ddr3忙碌
 /**********写控制信号**************/
          input          ddr3_wr_start   ,   //写开始信号
@@ -79,6 +80,7 @@ module ddr3_ctrl(
         output [0:0]		    ddr3_odt   
      );
  wire         init_calib_complete;//MIG初始化完成
+ assign       calib_complete = init_calib_complete;
  wire         ui_clk_sync_rst;  //MIG应用接口的复位信号 
  wire         app_rdy     ;
  wire         app_wr_en      ;//写命令使能
