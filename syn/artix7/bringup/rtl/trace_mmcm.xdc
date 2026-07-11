@@ -49,8 +49,10 @@ set_property PACKAGE_PIN M20 [get_ports phy_mdio]
 set_property IOSTANDARD LVCMOS33 [get_ports phy_*]
 create_clock -period 8.000 -name phy_rx_clk [get_ports phy_rx_clk]
 
-set_property PACKAGE_PIN M18 [get_ports led0]
-set_property PACKAGE_PIN N18 [get_ports led1]
+# LED pins swapped so physical positions match function: led0=NETWORK, led1=TRACE
+# (board silkscreen order was reversed vs the led_status assignment).
+set_property PACKAGE_PIN N18 [get_ports led0]
+set_property PACKAGE_PIN M18 [get_ports led1]
 set_property IOSTANDARD LVCMOS33 [get_ports led0]
 set_property IOSTANDARD LVCMOS33 [get_ports led1]
 
