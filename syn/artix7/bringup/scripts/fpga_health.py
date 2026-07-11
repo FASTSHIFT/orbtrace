@@ -49,6 +49,12 @@ A_GPIO_LEVEL = 0xFF30   # {0,0,0,clk,d3,d2,d1,d0}
 A_GPIO_EDGES = 0xFF31   # clk(2) d0(2) d1(2) d2(2) d3(2) LE, 10 bytes
 A_FREQ       = 0xFF3B   # TRACECLK edges per 16.777ms window, 3 bytes LE
 A_GAP        = 0xFF3E   # gap_count(2) gap_max(2) LE
+# DDR3 self-test status page (proposal 32 P2a), in trace_ddr_selftest_top
+A_DDR3_MAGIC = 0xFF50   # 0xD3
+A_DDR3_FLAGS = 0xFF51   # {..., err_sticky, calib_done}
+A_DDR3_ERRC  = 0xFF52   # 4 bytes LE  (compare error count)
+A_DDR3_PASSB = 0xFF56   # 4 bytes LE  (bursts verified error-free)
+A_DDR3_STATE = 0xFF5A   # 2-bit FSM state (0=ARBIT 1=WRITE 2=READ)
 FREQ_WINDOW_S = (1 << 21) / 125e6   # 16.777 ms
 CLK_NS = 8.0                        # clk125 period (ns)
 
@@ -82,7 +88,54 @@ def rd8(s, addr):
     return rd(s, addr, 1)[0]
 
 
+def ddr3_check(ip):
+    """Read the DDR3 self-test status page (0xFF5x) from trace_ddr_selftest_top
+    (proposal 32 P2a) and report calib / compare-error / pass-burst state."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(2.0)
+    global IP
+    IP = ip
+    try:
+        magic = rd8(s, A_DDR3_MAGIC)
+    except socket.timeout:
+        print("[FAIL] no reply on :5001 — FPGA network down (cold-boot the FPGA)")
+        return 1
+    if magic != 0xD3:
+        print(f"[WARN] DDR3 status magic=0x{magic:02x} (expected 0xD3). This "
+              f"bitstream may not have the DDR3 self-test (need trace_ddr_selftest).")
+        return 1
+
+    def rd_le(base, n):
+        return int.from_bytes(rd(s, base, n), "little")
+    flags = rd8(s, A_DDR3_FLAGS)
+    calib = flags & 1
+    err_sticky = (flags >> 1) & 1
+    errc = rd_le(A_DDR3_ERRC, 4)
+    passb = rd_le(A_DDR3_PASSB, 4)
+    state = rd8(s, A_DDR3_STATE) & 0x3
+    st_name = {0: "ARBIT", 1: "WRITE", 2: "READ"}.get(state, state)
+    print(f"[OK]   DDR3 status page online (magic=0xD3)")
+    print(f"       calib_done={calib}  err_sticky={err_sticky}  "
+          f"err_count={errc}  pass_bursts={passb}  fsm={st_name}")
+    if not calib:
+        print("[FAIL] MIG DDR3 NOT calibrated — cold-boot the FPGA (SRAM load "
+              "leaves MIG mis-calibrated; needs a clean power cycle)")
+        return 2
+    if err_sticky or errc:
+        print(f"[FAIL] DDR3 data compare MISMATCH (err_count={errc}) — datapath "
+              f"or timing problem")
+        return 2
+    if passb == 0:
+        print("[WARN] calibrated but no verified bursts yet — read again")
+        return 0
+    print(f"[OK]   DDR3 PASS — calibrated + {passb} bursts byte-exact, 0 errors")
+    return 0
+
+
 def main():
+    # `fpga_health.py [ip] ddr3` reads the DDR3 self-test status page instead.
+    if "ddr3" in sys.argv[2:]:
+        return ddr3_check(IP)
     # optional: `fpga_health.py [ip] reset` pulses a soft reset first, so the
     # readout that follows reflects a fresh (cleared) state.
     if "reset" in sys.argv[2:]:
