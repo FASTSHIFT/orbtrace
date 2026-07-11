@@ -18,7 +18,17 @@
 //
 // Reuses the vendor DDR3 abstraction layer (ddr3_ctrl + wr/rd/arbit), which is
 // board-proven, plus the vendor clock + MIG IP (read via .xci in the build TCL).
-// ddr3_wr_ctrl/ddr3_rd_ctrl move LENGTH 128-bit words per burst (default 8).
+// ddr3_wr_ctrl/ddr3_rd_ctrl move LENGTH 128-bit words per burst (default 64).
+//
+// BOARD-VERIFIED (2026-07-11): led0 solid + led1 ~1.5Hz blink = PASS (MIG
+// calibrated, write/readback byte-exact).
+//
+// IMPORTANT POWER-UP NOTE: an openFPGALoader SRAM load is NOT enough for the
+// DDR3 path -- after SRAM load the LEDs showed calib-ok/data-FAIL, and only a
+// clean POWER CYCLE (re-plug / flash-boot) brought MIG up correctly (led1
+// blinking). The MIG reset/power-up sequence does not complete cleanly on a
+// bare SRAM reconfig. => ALL DDR3 bitstreams must be validated after a cold
+// boot, not just an SRAM load (consistent with the network-PHY cold-boot rule).
 
 `default_nettype none
 
@@ -131,13 +141,20 @@ module ddr3_selftest_top #(
     assign wr_start = (wr_rd_flag == 1'b0) && (st == S_ARBIT) && calib_done;
     assign rd_start = (wr_rd_flag == 1'b1) && (st == S_ARBIT) && calib_done;
 
-    // addresses: hold at 0; the vendor wr/rd ctrl + generate-style stride is
-    // handled inside ddr3_wr_ctrl/ddr3_rd_ctrl via addr_req. We drive the base
-    // address; ctrls issue LENGTH commands from it. (P1 verifies the datapath,
-    // not full-array addressing — one LENGTH-word region round-trips.)
+    // Addresses: the vendor ddr3_wr_ctrl/ddr3_rd_ctrl transparently pass
+    // app_addr = ddr3_wr_addr/ddr3_rd_addr (they do NOT stride the address
+    // themselves). The DATA SOURCE must advance the address on each addr_req,
+    // exactly like the vendor ddr3_generate_data: +8 per app command (4:1 PHY,
+    // one UI 128-bit word spans 8 DDR3 column addresses). Write and read each
+    // advance independently but in lock-step across alternating bursts, so a
+    // read burst always targets the region the matching write burst just wrote.
     always @(posedge ui_clk) begin
-        wr_addr <= 29'd0;
-        rd_addr <= 29'd0;
+        if (ui_rst) wr_addr <= 29'd0;
+        else if (wr_addr_req) wr_addr <= wr_addr + 29'd8;
+    end
+    always @(posedge ui_clk) begin
+        if (ui_rst) rd_addr <= 29'd0;
+        else if (rd_addr_req) rd_addr <= rd_addr + 29'd8;
     end
 
     always @(posedge ui_clk) begin
@@ -192,6 +209,13 @@ module ddr3_selftest_top #(
     wire pass = (pass_bursts != 0) && !err_sticky;
     assign led0 = calib_done;
     assign led1 = pass ? hb[24] : 1'b0;
+
+    // Status outputs for the integrated readout path (proposal 32 P2):
+    // exposed to the caller so they can be surfaced via the existing :5001
+    // dbg_regfile readout (fpga_health.py DDR3 detector), instead of a
+    // throwaway VIO/JTAG channel. In this standalone P1 top they also drive the
+    // LEDs above; the integrated top wires them into dbg_regfile.
+    // (kept as regs already: calib_done, err_sticky, err_count, pass_bursts)
 
 endmodule
 
