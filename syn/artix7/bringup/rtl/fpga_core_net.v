@@ -114,6 +114,24 @@ module fpga_core_net #
     output wire       dbg_tx_axis_tvalid,
 
     /*
+     * Observability taps (proposal 30, P1). Expose internal FSM/error state
+     * that was previously invisible or discarded, so the host debug regfile
+     * can pinpoint which pipeline stage failed instead of guessing from
+     * "0 packets". All in the clk (125MHz) domain.
+     *   dbg_selftx_state   : self-TX FSM state (0=IDLE 1=HDR 2=SEND 3=BACKOFF)
+     *   dbg_selftx_stuck   : pulses when ST_HDR times out (ARP not resolved) ->
+     *                        the self-TX/ARP deadlock (HANDOFF 7.1); error 0x401
+     *   dbg_tx_fifo_overflow / dbg_rx_fifo_overflow : MAC FIFO overflows
+     *                        (were tied off and thrown away)
+     *   dbg_rx_bad_frame   : MAC RX bad-frame pulse (was tied off)
+     */
+    output wire [1:0] dbg_selftx_state,
+    output wire       dbg_selftx_stuck,
+    output wire       dbg_tx_fifo_overflow,
+    output wire       dbg_rx_fifo_overflow,
+    output wire       dbg_rx_bad_frame,
+
+    /*
      * External readout source (Stage-4 V1): when a UDP frame arrives on
      * port EXT_PORT (5001), the reply payload bytes come from this external
      * source instead of an echo. ext_addr is the in-frame byte position
@@ -457,6 +475,10 @@ if (STREAM == 0) begin : g_echo_only
     assign tx_udp_payload_axis_tuser  = tx_fifo_udp_payload_axis_tuser;
 
     assign stream_tready = 1'b0;
+
+    // No self-TX FSM in echo-only mode: report IDLE, never stuck.
+    assign dbg_selftx_state = 2'd0;
+    assign dbg_selftx_stuck = 1'b0;
 end else begin : g_stream
     // Self-initiated streaming TX (proposal 18 stage 2), arbitrated with the
     // RX-echo path. Priority: an in-flight RX-echo reply (so :5001/:5002 still
@@ -550,6 +572,11 @@ end else begin : g_stream
             end
         endcase
     end
+
+    // Observability taps (proposal 30): current FSM state + a one-cycle pulse
+    // when HDR times out (the self-TX/ARP deadlock signature -> error 0x401).
+    assign dbg_selftx_state = st;
+    assign dbg_selftx_stuck = (st == ST_HDR) && hdr_stuck;
 end
 endgenerate
 
@@ -628,12 +655,12 @@ eth_mac_inst (
     .rgmii_txd(phy_txd),
     .rgmii_tx_ctl(phy_tx_ctl),
 
-    .tx_fifo_overflow(),
+    .tx_fifo_overflow(dbg_tx_fifo_overflow),
     .tx_fifo_bad_frame(),
     .tx_fifo_good_frame(),
-    .rx_error_bad_frame(),
+    .rx_error_bad_frame(dbg_rx_bad_frame),
     .rx_error_bad_fcs(dbg_rx_bad_fcs),
-    .rx_fifo_overflow(),
+    .rx_fifo_overflow(dbg_rx_fifo_overflow),
     .rx_fifo_bad_frame(),
     .rx_fifo_good_frame(dbg_rx_good_frame),
     .speed(),

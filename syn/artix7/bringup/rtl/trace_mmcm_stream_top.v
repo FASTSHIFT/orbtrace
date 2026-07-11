@@ -313,21 +313,89 @@ module trace_mmcm_stream_top #(
     reg [31:0] lost_s0 = 0, lost_125 = 0;
     always @(posedge clk125) begin lost_s0 <= lost_cnt; lost_125 <= lost_s0; end
 
+    // ---- forward declarations for the debug taps + readout below ----
     wire [7:0]  csr_addr_w, csr_data_w;
     wire        csr_we_w;
     wire [15:0] ext_addr;
     wire [7:0]  ext_data;
-    // status readout (paged :5001 like the one-shot top): lost_cnt + locked
+    wire        dbg_rx_good, dbg_rx_bad, dbg_tx_valid;
+    wire [1:0]  dbg_selftx_state;
+    wire        dbg_selftx_stuck;
+    wire        dbg_tx_fifo_ovf, dbg_rx_fifo_ovf, dbg_rx_bad_frame;
+
+    // ==================================================================
+    // Observability taps -> dbg_regfile (proposal 30 P1). All in clk125.
+    // ==================================================================
+    // clk90_locked / cap_valid are in other domains; sync into clk125.
+    reg trace_lock_s0=0, trace_lock_125=0, trace_lock_125_q=0;
+    always @(posedge clk125) begin
+        trace_lock_s0   <= clk90_locked;
+        trace_lock_125  <= trace_lock_s0;
+        trace_lock_125_q<= trace_lock_125;
+    end
+    // TRACECLK activity: toggle a flag in clk90 on each cap_valid, sync + edge-
+    // detect in clk125; "active" if it changed within a ~13ms window.
+    reg cap_tog = 0;
+    always @(posedge clk90) if (cap_valid) cap_tog <= ~cap_tog;
+    reg cap_tog_s0=0, cap_tog_125=0, cap_tog_125_q=0;
+    always @(posedge clk125) begin
+        cap_tog_s0<=cap_tog; cap_tog_125<=cap_tog_s0; cap_tog_125_q<=cap_tog_125;
+    end
+    wire cap_edge = cap_tog_125 ^ cap_tog_125_q;
+    reg [20:0] noact_cnt = 0;          // ~13.4ms at 125MHz before "no TRACECLK"
+    reg traceclk_active = 0;
+    always @(posedge clk125) begin
+        if (cap_edge) begin noact_cnt <= 0; traceclk_active <= 1'b1; end
+        else if (!noact_cnt[20]) noact_cnt <= noact_cnt + 1'b1;
+        else traceclk_active <= 1'b0;
+    end
+    // lost_cnt increment -> capture overflow pulse
+    reg [31:0] lost_125_q = 0;
+    always @(posedge clk125) lost_125_q <= lost_125;
+    wire e_cap_overflow = (lost_125 != lost_125_q);
+    // trace MMCM lost lock (falling edge), only meaningful once it locked once
+    reg trace_locked_ever = 0;
+    always @(posedge clk125) if (trace_lock_125) trace_locked_ever <= 1'b1;
+    wire e_mmcm_unlock = trace_locked_ever & trace_lock_125_q & ~trace_lock_125;
+    // no-TRACECLK error: became inactive after having been active (edge to 0)
+    reg traceclk_active_q = 0;
+    always @(posedge clk125) traceclk_active_q <= traceclk_active;
+    wire e_no_traceclk = traceclk_active_q & ~traceclk_active;
+
+    wire [7:0] dbg_rdata;
+    dbg_regfile u_dbg (
+        .clk(clk125), .rst(sys_rst), .clr(1'b0),
+        .e_no_traceclk (e_no_traceclk),
+        .e_mmcm_unlock (e_mmcm_unlock),
+        .e_cap_overflow(e_cap_overflow),
+        .e_selftx_stuck(dbg_selftx_stuck),
+        .e_rx_bad_frame(dbg_rx_bad_frame),
+        .e_tx_fifo_ovf (dbg_tx_fifo_ovf),
+        .e_rx_fifo_ovf (dbg_rx_fifo_ovf),
+        .sys_mmcm_locked(mmcm_sys_locked),
+        .trace_mmcm_locked(trace_lock_125),
+        .traceclk_active(traceclk_active),
+        .selftx_state(dbg_selftx_state),
+        .pkt_active(pkt_active),
+        .lost_cnt(lost_125),
+        .addr(ext_addr[7:0]),
+        .rdata(dbg_rdata)
+    );
+
+    // status readout (paged :5001 like the one-shot top): lost_cnt + locked,
+    // plus the dbg_regfile at page 0xFF1x..0xFF3x (proposal 30 P1).
+    wire        dbg_page = (ext_addr[15:8] == 8'hFF) &&
+                           (ext_addr[7:4] >= 4'h1) && (ext_addr[7:4] <= 4'h3);
     wire [7:0] status_byte =
         (ext_addr == 16'hFF00) ? lost_125[7:0]   :
         (ext_addr == 16'hFF01) ? lost_125[15:8]  :
         (ext_addr == 16'hFF02) ? lost_125[23:16] :
         (ext_addr == 16'hFF03) ? lost_125[31:24] :
-        (ext_addr == 16'hFF04) ? {7'b0, clk90_locked} : 8'h00;
+        (ext_addr == 16'hFF04) ? {7'b0, clk90_locked} :
+        dbg_page                ? dbg_rdata : 8'h00;
     assign ext_data = status_byte;
 
-    // ---- LED status (driven by led_status module) ----
-    wire dbg_rx_good, dbg_rx_bad, dbg_tx_valid;
+    // ---- LED status + observability taps declared above (before dbg_regfile) ----
 
     fpga_core_net #(
         .TARGET("XILINX"),
@@ -347,6 +415,9 @@ module trace_mmcm_stream_top #(
         .phy_int_n(1'b1), .phy_pme_n(1'b1),
         .uart_rxd(1'b1), .uart_txd(),
         .dbg_rx_good_frame(dbg_rx_good), .dbg_rx_bad_fcs(dbg_rx_bad), .dbg_tx_axis_tvalid(dbg_tx_valid),
+        .dbg_selftx_state(dbg_selftx_state), .dbg_selftx_stuck(dbg_selftx_stuck),
+        .dbg_tx_fifo_overflow(dbg_tx_fifo_ovf), .dbg_rx_fifo_overflow(dbg_rx_fifo_ovf),
+        .dbg_rx_bad_frame(dbg_rx_bad_frame),
         .ext_addr(ext_addr), .ext_data(ext_data),
         .csr_addr(csr_addr_w), .csr_data(csr_data_w), .csr_we(csr_we_w),
         .stream_tdata(stream_tdata), .stream_tvalid(stream_tvalid),
