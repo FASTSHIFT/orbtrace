@@ -27,6 +27,7 @@ read_verilog $bringup/rtl/ddr3/ddr3_rd_ctrl.v
 read_verilog $bringup/rtl/ddr3/ddr3_arbit.v
 read_verilog $rtl/trace_capture_direct.v
 read_verilog $bringup/rtl/la_ddr_writer.v
+read_verilog $bringup/rtl/la_ddr_reader.v
 read_verilog $bringup/rtl/fpga_core_net.v
 read_verilog $bringup/rtl/dbg_regfile.v
 read_verilog $bringup/rtl/trace_ddr_blackbox_top.v

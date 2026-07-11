@@ -116,10 +116,9 @@ module trace_ddr_blackbox_top #(
     wire        wr_start, wr_data_req, wr_addr_req, wr_done;
     wire [127:0]wr_data;
     wire [28:0] wr_addr;
-    // read interface unused in P2b-1 (tie off)
-    wire        rd_start = 1'b0;
-    wire        rd_addr_req, rd_data_vld, rd_done;
-    wire [28:0] rd_addr = 29'd0;
+    // read interface driven by la_ddr_reader (P2b-2 readback)
+    wire        rd_start, rd_addr_req, rd_data_vld, rd_done;
+    wire [28:0] rd_addr;
     wire [127:0]rd_data;
     wire        mig_calib_raw;
 
@@ -156,6 +155,30 @@ module trace_ddr_blackbox_top #(
         .ddr3_wr_addr(wr_addr), .ddr3_wr_done(wr_done),
         .wr_ptr_words(wr_ptr_words), .words_written(words_written),
         .wr_lost_bytes(wr_lost_bytes)
+    );
+
+    // ================= black-box reader (P2b-2 readback) ===================
+    // A :5002 CSR write to REG_ARM (0x20) arms a one-shot readback of
+    // READ_WORDS 128-bit words from the ring start; the byte stream is sent via
+    // the fpga_core_net self-TX path to the host (:5555), received by
+    // trace_stream_rx.py. Host disables the STM32 ETM first so the ring is
+    // static (clean snapshot) during readback.
+    localparam [7:0] REG_ARM = 8'h20;
+    localparam [31:0] READ_WORDS = 32'd262144;   // 256K words = 4MB snapshot
+    reg  arm_125 = 0;
+    always @(posedge clk125) arm_125 <= csr_we_w && (csr_addr_w == REG_ARM);
+
+    wire [7:0] rb_tdata;
+    wire       rb_tvalid, rb_tready, rb_busy;
+    la_ddr_reader #(.LENGTH(LENGTH), .RING_BASE(29'd0)) u_rd (
+        .clk125(clk125), .sys_rst(sys_rst),
+        .arm(arm_125), .read_words(READ_WORDS),
+        .ui_clk(ui_clk), .ui_rst(ui_rst | ~calib_done),
+        .ddr3_rd_start(rd_start), .ddr3_rd_addr_req(rd_addr_req),
+        .ddr3_rd_addr(rd_addr), .ddr3_rd_data_vld(rd_data_vld),
+        .ddr3_rd_data(rd_data), .ddr3_rd_done(rd_done),
+        .stream_tdata(rb_tdata), .stream_tvalid(rb_tvalid),
+        .stream_tready(rb_tready), .busy(rb_busy)
     );
 
     // ---- CDC ui_clk status -> clk125 (atomic toggle snapshot) ----
@@ -244,7 +267,16 @@ module trace_ddr_blackbox_top #(
                    ((ext_addr[7:4]==4'h5) || (ext_addr[7:4]==4'h7));
     assign ext_data = dbg_page ? dbg_rdata : bb_page ? bb_status : 8'h00;
 
-    fpga_core_net #(.TARGET("XILINX"), .STREAM(0)) u_eth (
+    // STREAM=1: the DDR3 ring readback (reader) is the self-TX source; on arm
+    // it streams READ_WORDS*16 bytes to :5555 (received by trace_stream_rx.py).
+    // Each packet carries the 4-byte seq prefix so the host detects any gap.
+    fpga_core_net #(
+        .TARGET("XILINX"), .STREAM(1),
+        .UDP_CHECKSUM_GEN_ENABLE(0),
+        .STREAM_DEST_IP({8'd192,8'd168,8'd10,8'd245}),
+        .STREAM_DEST_PORT(16'd5555),
+        .STREAM_PKT_BYTES(16'd1028)      // 4 seq + 1024 payload (matches rx)
+    ) u_eth (
         .clk(clk125), .clk90(clk125_90), .rst(sys_rst),
         .btnu(1'b0), .btnl(1'b0), .btnd(1'b0), .btnr(1'b0), .btnc(1'b0),
         .sw(8'h0), .led(),
@@ -258,7 +290,7 @@ module trace_ddr_blackbox_top #(
         .dbg_rx_bad_frame(dbg_rx_bad_frame),
         .ext_addr(ext_addr), .ext_data(ext_data),
         .csr_addr(csr_addr_w), .csr_data(csr_data_w), .csr_we(csr_we_w),
-        .stream_tdata(8'h0), .stream_tvalid(1'b0), .stream_tready()
+        .stream_tdata(rb_tdata), .stream_tvalid(rb_tvalid), .stream_tready(rb_tready)
     );
 
     // ---- LED ----
