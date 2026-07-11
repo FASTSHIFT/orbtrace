@@ -20,6 +20,22 @@ import sys
 
 IP = sys.argv[1] if len(sys.argv) > 1 else "192.168.10.42"
 PORT = 5001
+CTRL_PORT = 5002
+REG_SOFTRST = 0x10   # CSR: soft-reset the trace capture path (MMCM/FIFO/debug)
+
+
+def soft_reset(ip):
+    """Trigger the FPGA trace-path soft reset via :5002 (proposal 30). Recovers
+    a stuck capture MMCM / clears sticky debug counters without a power cycle."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(1.0)
+    s.sendto(bytes([REG_SOFTRST, 1, 0, 0]), (ip, CTRL_PORT))
+    try:
+        s.recvfrom(2048)
+    except socket.timeout:
+        pass
+    s.close()
+    print("soft reset pulsed (trace MMCM/FIFO + debug counters cleared)")
 
 # dbg_regfile address map (low byte of ext_addr, page 0xFF1x..0xFF3x)
 A_MAGIC      = 0xFF10
@@ -67,6 +83,13 @@ def rd8(s, addr):
 
 
 def main():
+    # optional: `fpga_health.py [ip] reset` pulses a soft reset first, so the
+    # readout that follows reflects a fresh (cleared) state.
+    if "reset" in sys.argv[2:]:
+        soft_reset(IP)
+        import time
+        time.sleep(0.2)
+
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.settimeout(2.0)
 

@@ -82,6 +82,22 @@ module trace_mmcm_stream_top #(
         else     rst_sync <= {rst_sync[2:0], ~mmcm_sys_locked};
     wire sys_rst = rst_sync[3];
 
+    // ---- CSR-triggered soft reset + auto-restart (proposal 30) ----
+    // A :5002 CSR write to REG_SOFTRST (0x10) pulses a soft reset of the trace
+    // capture path (MMCM + FIFOs + debug), letting us recover a stuck capture
+    // WITHOUT a power cycle. An auto-restart watchdog does the same on its own
+    // when TRACECLK is active but the capture MMCM stays unlocked too long.
+    // These signals are declared here; the CSR decode (csr_*_w) and the taps
+    // (traceclk_active, clk90_locked) are wired further down, so use regs that
+    // this block drives from clk125.
+    localparam REG_SOFTRST = 8'h10;
+    reg  soft_rst_req = 0;         // 1-cyc request (from CSR or watchdog)
+    reg  [7:0] soft_rst_cnt = 0;   // stretch the reset to >=256 clk125 cycles
+    reg  soft_rst = 0;             // active-high stretched soft reset
+    // (driven in the always block near the CSR/tap wiring below)
+    // capture front-end reset = system reset OR soft reset
+    wire cap_rst = sys_rst | soft_rst;
+
     // ---- MMCM 90-deg phase-shift capture front-end (clk90 domain) ----
     wire        cap_clk;
     wire        clk90;
@@ -94,7 +110,7 @@ module trace_mmcm_stream_top #(
     wire [3:0]  raw_data_ibuf;
     trace_capture_mmcm #(.MULT(MULT), .DIVID(DIVID), .CLKIN_PERIOD(CLKIN_PERIOD),
                          .PHASE(PHASE), .WIDTH(WIDTH)) u_cap (
-        .rst(sys_rst),
+        .rst(cap_rst),
         .trace_clk_p(trace_clk_in), .trace_data_p(trace_data_in),
         .trace_clk(cap_clk), .clk90_out(clk90),
         .trace_a(trace_a), .trace_b(trace_b),
@@ -383,7 +399,7 @@ module trace_mmcm_stream_top #(
 
     wire [7:0] dbg_rdata;
     dbg_regfile u_dbg (
-        .clk(clk125), .rst(sys_rst), .clr(1'b0),
+        .clk(clk125), .rst(sys_rst), .clr(soft_rst),
         .e_no_traceclk (e_no_traceclk),
         .e_mmcm_unlock (e_mmcm_unlock),
         .e_cap_overflow(e_cap_overflow),
@@ -404,6 +420,40 @@ module trace_mmcm_stream_top #(
         .addr(ext_addr[7:0]),
         .rdata(dbg_rdata)
     );
+
+    // ---- soft-reset generator: CSR (:5002 REG_SOFTRST) + auto-restart WDT ----
+    // CSR write to 0x10 with any value, OR the watchdog firing, requests a soft
+    // reset that is stretched to 256 clk125 cycles and drives cap_rst.
+    // Auto-restart watchdog: if TRACECLK is active but the capture MMCM has not
+    // locked for ~134ms, pulse a soft reset to try to re-lock (self-healing).
+    reg [23:0] wdt;                  // ~134ms at 125MHz (2^24/125M)
+    always @(posedge clk125) begin
+        soft_rst_req <= 1'b0;
+        // CSR-triggered reset
+        if (csr_we_w && csr_addr_w == REG_SOFTRST)
+            soft_rst_req <= 1'b1;
+        // auto-restart watchdog
+        if (soft_rst) begin
+            wdt <= 0;
+        end else if (traceclk_active && !trace_lock_125) begin
+            wdt <= wdt + 1'b1;
+            if (wdt == 24'hFFFFFF) begin
+                soft_rst_req <= 1'b1;
+                wdt <= 0;
+            end
+        end else begin
+            wdt <= 0;             // locked or no clock: hold watchdog cleared
+        end
+        // stretch the reset pulse
+        if (soft_rst_req) begin
+            soft_rst <= 1'b1;
+            soft_rst_cnt <= 8'hFF;
+        end else if (soft_rst_cnt != 0) begin
+            soft_rst_cnt <= soft_rst_cnt - 1'b1;
+        end else begin
+            soft_rst <= 1'b0;
+        end
+    end
 
     // status readout (paged :5001 like the one-shot top): lost_cnt + locked,
     // plus the dbg_regfile at page 0xFF1x..0xFF4x (proposal 30 P1).

@@ -123,6 +123,17 @@ GPIO 无信号 → MMCM 没锁 → 采样错 → 去帧错 → FIFO 溢出 → s
 > **原始 GPIO 监视器（P1 增补）**：直接在 clk125 域对 `trace_clk_in`/`trace_data_in` 双同步 + 边沿检测,**完全不经过采样 MMCM**。这是关键的**交叉验证**手段——引脚翻转计数 > 0 就证明"信号确实进到了 FPGA GPIO",从而把"引脚没信号"和"MMCM 没锁/解码错"彻底区分开。`fpga_health.py` 会据此给出定责结论：
 > - 引脚全静止 → `raw trace pins STATIC`（STM32 ETM/接线/DAP 问题）
 > - 引脚翻转但 MMCM 没锁 → `SAMPLING/FREQ issue`（TRACECLK 频率 vs 比特流,GPIO 侧没问题）
+>
+> **TRACECLK 频率计 + gap 检测器（P1 增补）**：频率计用固定 16.78ms 窗口数引脚边沿 → 实测频率（regfile 0xFF3B-3D）；gap 检测器数 TRACECLK 停顿 >8 clk 的次数 + 最长 gap（0xFF3E-41）。用于区分"频率不对"(freq)、"时钟断续导致 MMCM flap"(gap)、"频率对且连续但仍不锁"(需查 MMCM 复位/相位) 三种情况。
+
+## 软件触发复位 + 自动重启（P1 增补,自愈）
+
+调试中反复遇到"FPGA 卡死只能物理断电重插"的痛点。加了两条恢复机制,**不用断电**：
+
+1. **软件触发复位**：`:5002` CSR 写 `REG_SOFTRST(0x10)` → 拉伸 256 clk125 周期的软复位,复位 trace 采集前端（MMCM + FIFO）+ 清 dbg_regfile sticky 计数。`fpga_health.py <ip> reset` 一键触发。用途：卡住时先软复位试图恢复,顺便清零 sticky 计数以获得干净读数（解决之前 sticky 计数无法清零、误导判断的问题）。
+2. **自动重启看门狗**：若 TRACECLK 有活动但采集 MMCM 持续 ~134ms 未锁,自动脉冲一次软复位尝试重锁（self-healing）。针对 MMCM 上电偶发不锁 / 相位边界抖动。
+
+> 这直接解决了"出问题方便恢复"的诉求——大多数卡死不再需要 openFPGALoader 重烧或物理断电。
 
 ### 3.4 "一键体检"主机脚本
 
