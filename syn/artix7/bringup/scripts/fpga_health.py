@@ -31,6 +31,10 @@ A_FIRST_CTX  = 0xFF1C
 A_CNT_BASE   = 0xFF20   # 7 counters
 A_GPIO_LEVEL = 0xFF30   # {0,0,0,clk,d3,d2,d1,d0}
 A_GPIO_EDGES = 0xFF31   # clk(2) d0(2) d1(2) d2(2) d3(2) LE, 10 bytes
+A_FREQ       = 0xFF3B   # TRACECLK edges per 16.777ms window, 3 bytes LE
+A_GAP        = 0xFF3E   # gap_count(2) gap_max(2) LE
+FREQ_WINDOW_S = (1 << 21) / 125e6   # 16.777 ms
+CLK_NS = 8.0                        # clk125 period (ns)
 
 ERR_NAMES = {
     0x0000: "none",
@@ -123,6 +127,29 @@ def main():
         return ">=65535" if v == 0xFFFF else str(v)
     print(f"       raw GPIO: TRACECLK level={clk_lvl} edges={ec(gclk_ed)}  "
           f"TRACED[3:0] level={d_lvl:04b} edges=[{','.join(ec(x) for x in gd_ed)}]")
+    # TRACECLK frequency meter: edges over a fixed window -> MHz
+    fb = rd(s, A_FREQ, 3)
+    freq_edges = fb[0] | (fb[1] << 8) | (fb[2] << 16)
+    # edges = 2 * f * window  ->  f = edges / (2*window)
+    f_mhz = freq_edges / (2 * FREQ_WINDOW_S) / 1e6
+    print(f"       TRACECLK freq meter: {freq_edges} edges/16.78ms "
+          f"=> ~{f_mhz:.2f} MHz at the pin")
+    # TRACECLK gap detector: gaps => the H7 TPIU stopping the clock between
+    # bursts, which makes the capture MMCM lose lock (flapping).
+    gb = rd(s, A_GAP, 4)
+    gap_count = gb[0] | (gb[1] << 8)
+    gap_max = gb[2] | (gb[3] << 8)
+    gc = ">=65535" if gap_count == 0xFFFF else str(gap_count)
+    gm_ns = gap_max * CLK_NS
+    print(f"       TRACECLK gaps: count={gc}  longest={gap_max} clk ({gm_ns:.0f} ns)")
+    if gap_count > 0:
+        print(f"[FAIL] TRACECLK is DISCONTINUOUS ({gc} gaps, up to {gm_ns:.0f} ns): "
+              f"the H7 TPIU stops the clock between trace bursts. The capture "
+              f"MMCM loses lock on every gap (flapping) -> sample errors. This is "
+              f"the root cause of the ~7-9% unknown, NOT a frequency mismatch.")
+        print(f"       => fix options: (a) keep TRACECLK continuous (TPIU "
+              f"continuous formatting / periodic sync), or (b) use a "
+              f"gap-tolerant capture front-end that re-locks fast / free-runs.")
     if gclk_ed == 0 and all(x == 0 for x in gd_ed):
         print("[FAIL] raw trace pins are STATIC — no signal reaching the FPGA "
               "GPIO (check STM32 ETM pins / wiring / DAP config)")

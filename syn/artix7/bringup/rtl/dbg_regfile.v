@@ -152,6 +152,59 @@ module dbg_regfile (
     // live pin levels: {clk, d3,d2,d1,d0}
     wire [7:0] gpio_level = {3'b0, gpio_clk_level, gpio_data_level};
 
+    // ---- TRACECLK gap detector (why the trace MMCM flaps) ----
+    // A continuous 50MHz TRACECLK yields an edge every ~1.25 clk(125MHz)
+    // cycles. If >=GAP_TH clk cycles pass with no TRACECLK edge, that is a
+    // "gap" -- the H7 TPIU stopping the clock between trace bursts, which makes
+    // the capture MMCM lose lock (unlike the F429 ETM3.5 which fills with HSYNC
+    // and keeps TRACECLK continuous). Count gaps + record the longest gap
+    // (in clk cycles) so we can quantify the flapping root cause.
+    localparam GAP_TH = 8;             // clk cycles w/o edge => gap (64ns @125M)
+    reg [15:0] gap_since;              // clk cycles since last TRACECLK edge
+    reg [15:0] gap_count;              // number of gaps seen (saturating)
+    reg [15:0] gap_max;                // longest gap observed (clk cycles)
+    reg        in_gap;
+    always @(posedge clk) begin
+        if (rst || clr) begin
+            gap_since <= 0; gap_count <= 0; gap_max <= 0; in_gap <= 0;
+        end else begin
+            if (gpio_clk_edge) begin
+                gap_since <= 0;
+                in_gap    <= 1'b0;
+            end else begin
+                if (!(&gap_since)) gap_since <= gap_since + 1'b1;
+                // rising into a gap: count once when threshold first crossed
+                if (gap_since == GAP_TH && !in_gap) begin
+                    in_gap <= 1'b1;
+                    if (!(&gap_count)) gap_count <= gap_count + 1'b1;
+                end
+                // track longest gap
+                if (in_gap && gap_since > gap_max) gap_max <= gap_since;
+            end
+        end
+    end
+
+    // ---- TRACECLK frequency meter (edges per fixed clk window) ----
+    // Count TRACECLK edges over a 2^21-cycle clk window (=16.777ms @125MHz),
+    // then latch. edges = 2*Ftraceclk*window, so Ftraceclk[MHz] =
+    // edges / (2 * 0.016777s) / 1e6 = edges / 33554.4. Host computes it.
+    // 24-bit result covers up to ~250M edges/window (well past any TRACECLK).
+    reg [20:0] freq_win;
+    reg [23:0] freq_acc, freq_latch;
+    always @(posedge clk) begin
+        if (rst || clr) begin
+            freq_win <= 0; freq_acc <= 0; freq_latch <= 0;
+        end else begin
+            freq_win <= freq_win + 1'b1;
+            if (freq_win == 21'h1FFFFF) begin
+                freq_latch <= freq_acc + (gpio_clk_edge ? 24'd1 : 24'd0);
+                freq_acc   <= 0;
+            end else if (gpio_clk_edge && !(&freq_acc)) begin
+                freq_acc <= freq_acc + 24'd1;
+            end
+        end
+    end
+
     // ---- live status byte ----
     wire [7:0] live_status = {have_first, pkt_active, traceclk_active,
                               trace_mmcm_locked, sys_mmcm_locked, 1'b0,
@@ -198,6 +251,15 @@ module dbg_regfile (
             8'h38: rdata = gd_edges[2][15:8];
             8'h39: rdata = gd_edges[3][7:0];        // TRACED3
             8'h3A: rdata = gd_edges[3][15:8];
+            // ---- TRACECLK frequency meter (edges per 16.777ms window) ----
+            8'h3B: rdata = freq_latch[7:0];
+            8'h3C: rdata = freq_latch[15:8];
+            8'h3D: rdata = freq_latch[23:16];
+            // ---- TRACECLK gap detector (MMCM flap root cause) ----
+            8'h3E: rdata = gap_count[7:0];
+            8'h3F: rdata = gap_count[15:8];
+            8'h40: rdata = gap_max[7:0];
+            8'h41: rdata = gap_max[15:8];
             default: rdata = 8'h00;
         endcase
     end

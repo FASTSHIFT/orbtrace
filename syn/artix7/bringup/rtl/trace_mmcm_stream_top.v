@@ -406,9 +406,9 @@ module trace_mmcm_stream_top #(
     );
 
     // status readout (paged :5001 like the one-shot top): lost_cnt + locked,
-    // plus the dbg_regfile at page 0xFF1x..0xFF3x (proposal 30 P1).
+    // plus the dbg_regfile at page 0xFF1x..0xFF4x (proposal 30 P1).
     wire        dbg_page = (ext_addr[15:8] == 8'hFF) &&
-                           (ext_addr[7:4] >= 4'h1) && (ext_addr[7:4] <= 4'h3);
+                           (ext_addr[7:4] >= 4'h1) && (ext_addr[7:4] <= 4'h4);
     wire [7:0] status_byte =
         (ext_addr == 16'hFF00) ? lost_125[7:0]   :
         (ext_addr == 16'hFF01) ? lost_125[15:8]  :
