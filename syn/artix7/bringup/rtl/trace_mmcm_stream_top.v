@@ -33,9 +33,14 @@ module trace_mmcm_stream_top #(
     parameter [15:0] DEST_PORT = 16'd5555,
     parameter integer PAYLOAD  = 1024,        // trace bytes per UDP packet
     parameter integer FIFO_DEPTH = 8192,      // CDC FIFO bytes (abosrb TX bursts)
-    parameter integer BANDWIDTH_TEST = 0      // 1: bypass trace, fill FIFO from
+    parameter integer BANDWIDTH_TEST = 0,     // 1: bypass trace, fill FIFO from
                                               // free-running counter at clk125 rate
                                               // to measure pure network throughput
+    parameter integer DIRECT = 0             // 1: use trace_capture_direct
+                                              // (orbtrace-style TRACECLK-as-clock,
+                                              // frequency-independent, gap-tolerant,
+                                              // no MMCM lock). 0: MMCM 90-deg eye
+                                              // sampling (needs TRACECLK ~10-100M).
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -108,16 +113,34 @@ module trace_mmcm_stream_top #(
     // post-IBUF raw pin taps for the observability GPIO monitor (proposal 30)
     wire        raw_clk_ibuf;
     wire [3:0]  raw_data_ibuf;
-    trace_capture_mmcm #(.MULT(MULT), .DIVID(DIVID), .CLKIN_PERIOD(CLKIN_PERIOD),
-                         .PHASE(PHASE), .WIDTH(WIDTH)) u_cap (
-        .rst(cap_rst),
-        .trace_clk_p(trace_clk_in), .trace_data_p(trace_data_in),
-        .trace_clk(cap_clk), .clk90_out(clk90),
-        .trace_a(trace_a), .trace_b(trace_b),
-        .mmcm_locked(clk90_locked),
-        .raw_clk_ibuf(raw_clk_ibuf), .raw_data_ibuf(raw_data_ibuf),
-        .cap_byte(cap_byte), .cap_valid(cap_valid)
-    );
+    // Front-end select (proposal 22 §7): DIRECT=1 uses the orbtrace-style
+    // TRACECLK-as-clock capture (frequency-independent, gap-tolerant, no MMCM
+    // lock) -- required for the low/variable TRACECLK the H7 firmware produces
+    // (board-measured 12.8MHz, below the MMCM lock window). DIRECT=0 keeps the
+    // MMCM 90-deg eye-sampling for high fixed TRACECLK (~80-100M).
+    generate if (DIRECT) begin : g_cap_direct
+        trace_capture_direct #(.MULT(MULT), .DIVID(DIVID), .CLKIN_PERIOD(CLKIN_PERIOD),
+                               .PHASE(PHASE), .WIDTH(WIDTH)) u_cap (
+            .rst(cap_rst),
+            .trace_clk_p(trace_clk_in), .trace_data_p(trace_data_in),
+            .trace_clk(cap_clk), .clk90_out(clk90),
+            .trace_a(trace_a), .trace_b(trace_b),
+            .mmcm_locked(clk90_locked),
+            .raw_clk_ibuf(raw_clk_ibuf), .raw_data_ibuf(raw_data_ibuf),
+            .cap_byte(cap_byte), .cap_valid(cap_valid)
+        );
+    end else begin : g_cap_mmcm
+        trace_capture_mmcm #(.MULT(MULT), .DIVID(DIVID), .CLKIN_PERIOD(CLKIN_PERIOD),
+                             .PHASE(PHASE), .WIDTH(WIDTH)) u_cap (
+            .rst(cap_rst),
+            .trace_clk_p(trace_clk_in), .trace_data_p(trace_data_in),
+            .trace_clk(cap_clk), .clk90_out(clk90),
+            .trace_a(trace_a), .trace_b(trace_b),
+            .mmcm_locked(clk90_locked),
+            .raw_clk_ibuf(raw_clk_ibuf), .raw_data_ibuf(raw_data_ibuf),
+            .cap_byte(cap_byte), .cap_valid(cap_valid)
+        );
+    end endgenerate
 
     // ---- CDC AsyncFIFO: clk90 capture -> clk125 stream ----
     wire        fifo_in_ready;
