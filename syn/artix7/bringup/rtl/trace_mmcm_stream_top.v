@@ -189,49 +189,24 @@ module trace_mmcm_stream_top #(
         wire [7:0] trace_byte;
         wire       trace_byte_valid;
 
-        if (WIDTH == 2) begin : g_traceif
-            // 2-bit: traceIF assembles TPIU frames, tpiu_demux extracts ETM bytes
-            wire        fr_avail;
-            wire [127:0] frame;
-            traceIF #(.MAXBUSWIDTH(4)) u_traceif (
-                .rst(sys_rst | ~clk90_locked),
-                .traceDina(trace_b), .traceDinb(trace_a),
-                .traceClkin(clk90),
-                .width(2'b10),
-                .edgeOutput(), .FrAvail(fr_avail), .Frame(frame)
-            );
-
-            // Toggle → pulse for FrAvail (in clk90 domain)
-            reg fr_d;
-            always @(posedge clk90) fr_d <= fr_avail;
-            wire frame_pulse = fr_avail ^ fr_d;
-
-            // Byte-reverse frame for tpiu_demux (it expects in_frame[7:0]=first byte)
-            wire [127:0] dmux_frame;
-            genvar gi;
-            for (gi = 0; gi < 16; gi = gi + 1) begin : g_rev
-                assign dmux_frame[8*gi +: 8] = frame[8*(15-gi) +: 8];
-            end
-
-            // tpiu_demux: extracts ETM stream bytes from TPIU frames
-            wire [7:0] dmux_data;
-            wire       dmux_valid, dmux_last, dmux_ready;
-            tpiu_demux u_demux (
-                .clk(clk90), .rst(sys_rst | ~clk90_locked),
-                .in_frame(dmux_frame), .in_valid(frame_pulse), .in_ready(),
-                .bp_valid(1'b0), .bp_data(8'd0), .bp_ready(),
-                .bypass_sel(1'b0),
-                .out_data(dmux_data), .out_valid(dmux_valid),
-                .out_last(dmux_last), .out_ready(fifo_in_ready)
-            );
-
-            assign trace_byte = dmux_data;
-            assign trace_byte_valid = dmux_valid;
-        end else begin : g_raw
-            // 4-bit: raw {trace_a, trace_b_q} byte, 1 per TRACECLK
-            assign trace_byte = cap_byte;
-            assign trace_byte_valid = cap_valid & clk90_locked;
-        end
+        // Raw {trace_a, trace_b_q} byte stream, 1 byte per TRACECLK. The PC
+        // side runs the full pipeline (nibble assemble + tpiu_deframe_walk +
+        // decode).  Do NOT use traceIF here: traceIF drops TPIU sync words
+        // internally (`if (packet != 16'h7fff)`), so its `Frame` output is
+        // sync-less and, more importantly, still mangled (aux bits in each
+        // byte 0 of the raw TPIU frame). Reconstructing an FF-FF-FF-7F-
+        // delimited byte stream from Frame would require the full unmangle+
+        // demux chain that only orbtrace's orbflow protocol carries.
+        //
+        // The upstream 4-bit rise/fall pairing has ONE ambiguity: the DDR
+        // half-bit that starts each TPIU byte. The PC-side tpiu_deframe_walk
+        // scans for the FF FF FF 7F sync and locks to the correct alignment
+        // automatically; no parity/order search is needed.
+        assign trace_byte       = cap_byte;
+        assign trace_byte_valid = cap_valid & clk90_locked;
+        // Keep the traceIF as an unused sanity module: it still generates
+        // "Got sync" evidence internally, useful for post-hoc simulation.
+        // Not wired to any output.
 
         axis_async_fifo #(
             .DEPTH(FIFO_DEPTH), .DATA_WIDTH(8),

@@ -17,6 +17,7 @@ set ex        $repo_root/syn/external/verilog-ethernet/example/NexysVideo/fpga
 set rtl       $repo_root/syn/artix7/rtl
 
 read_verilog $rtl/trace_capture_mmcm.v
+read_verilog $rtl/trace_capture_direct.v
 read_verilog $bringup/rtl/fpga_core_net.v
 read_verilog $bringup/rtl/trace_mmcm_stream_top.v
 read_verilog $bringup/rtl/dbg_regfile.v
@@ -79,17 +80,32 @@ if {[info exists ::env(WIDTH)]} { set width $::env(WIDTH) }
 set bwtest 0
 if {[info exists ::env(BANDWIDTH_TEST)]} { set bwtest $::env(BANDWIDTH_TEST) }
 puts "============ STREAM MULT=$mult DIVID=$divid TRACE_PERIOD=$tperiod PHASE=$phase WIDTH=$width BWTEST=$bwtest ============"
-synth_design -top trace_mmcm_stream_top -part $part -generic MULT=$mult -generic DIVID=$divid -generic CLKIN_PERIOD=$tperiod -generic PHASE=$phase -generic WIDTH=$width -generic BANDWIDTH_TEST=$bwtest
+set direct 0
+if {[info exists ::env(DIRECT)]} { set direct $::env(DIRECT) }
+synth_design -top trace_mmcm_stream_top -part $part \
+    -generic MULT=$mult -generic DIVID=$divid -generic CLKIN_PERIOD=$tperiod \
+    -generic PHASE=$phase -generic WIDTH=$width \
+    -generic BANDWIDTH_TEST=$bwtest -generic DIRECT=$direct
 create_clock -period $tperiod -name trace_clk_in [get_ports trace_clk_in]
-set_clock_groups -asynchronous \
-    -group [get_clocks sys_clk_50] \
-    -group [get_clocks trace_clk_in] \
-    -group [get_clocks phy_rx_clk] \
-    -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT0]] \
-    -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT1]] \
-    -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT3]] \
-    -group [get_clocks -of_objects [get_pins u_cap/u_mmcm/CLKOUT0]] \
-    -group [get_clocks -of_objects [get_pins u_cap/u_mmcm/CLKOUT1]]
+if {$direct} {
+    set_clock_groups -asynchronous \
+        -group [get_clocks sys_clk_50] \
+        -group [get_clocks trace_clk_in] \
+        -group [get_clocks phy_rx_clk] \
+        -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT0]] \
+        -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT1]] \
+        -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT3]]
+} else {
+    set_clock_groups -asynchronous \
+        -group [get_clocks sys_clk_50] \
+        -group [get_clocks trace_clk_in] \
+        -group [get_clocks phy_rx_clk] \
+        -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT0]] \
+        -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT1]] \
+        -group [get_clocks -of_objects [get_pins u_sysmmcm/CLKOUT3]] \
+        -group [get_clocks -of_objects [get_pins u_cap/u_mmcm/CLKOUT0]] \
+        -group [get_clocks -of_objects [get_pins u_cap/u_mmcm/CLKOUT1]]
+}
 opt_design
 place_design
 route_design
