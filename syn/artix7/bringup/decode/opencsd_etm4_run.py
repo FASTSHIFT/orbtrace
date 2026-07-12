@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""opencsd_etm4_run — end-to-end pipeline that decodes an H743 ETMv4 capture
+with the ARM/Linaro reference decoder (trc_pkt_lister) and reports coverage
+against func_test.c.
+
+The traceif4 FPGA build (proposal 33-retired) hands the PC a stream of
+bare ETMv4 bytes: FPGA-side `traceIF.v` locks onto the TPIU 4-byte sync
+and `tpiu_demux` extracts the stream-2 ETM bytes, so the PC no longer needs
+to guess parity/order or run tpiu_deframe_walk.
+
+The tool auto-detects which stream format it is looking at:
+    - if the first bytes contain any TPIU FF FF FF 7F sync => run legacy
+      nibble-assemble + tpiu_deframe_walk (old raw path)
+    - otherwise treat the input as already-demuxed bare ETM bytes
+
+Reports:
+    • byte counts at each stage
+    • # of A-syncs (11 zero bytes + 0x80) and Trace-Info (0x01) packets
+    • # of PC ranges the reference decoder produced
+    • unique PCs (from stdout parse) + which land in flash
+    • coverage of the expected func_test user functions
+
+Usage:
+    python3 opencsd_etm4_run.py <raw-stream.bin> <elf> [--period-ns 20.0] \
+        [--keep <out_dir>]  # keep snapshot dir + intermediate ETM bin
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+import etm35lib as L
+import dsl_parse as D
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PACKER = os.path.join(HERE, "make_opencsd_snapshot.py")
+LISTER = os.environ.get("TRC_PKT_LISTER", "trc_pkt_lister")
+
+# The expected user functions in func_test.c (see verify_func_test.py).
+EXPECTED = {
+    "main_loop", "level_a", "level_b", "level_c", "frame_func",
+    "leaf_add", "leaf_mul", "indirect_caller", "callback_test",
+    "dispatch_callback", "factorial", "deep1", "conditional", "mixed_test",
+}
+
+
+def recover_assemble(raw):
+    """Streamed byte = {trace_a[k] hi, trace_b[k-1] lo}. Recover time-ordered
+    half-bit nibbles and parity/order-search assemble to the period-indexed
+    byte stream. Ranks candidates by count of *real* Thumb I-syncs anchored in
+    flash — same criterion as mmcm_stream_orbetto but with the additional
+    ETMv4 A-sync fallback so it works before any I-sync is emitted."""
+    nibs = bytearray()
+    for k in range(len(raw) - 1):
+        nibs.append((raw[k] >> 4) & 0xF)
+        nibs.append(raw[k + 1] & 0xF)
+    best = None
+    for parity in (0, 1):
+        for order in (0, 1):
+            data = D.assemble(nibs, parity, order)
+            # ETMv3.5-style I-sync in flash
+            fl = sum(1 for s in L.find_isyncs(data) if L.is_flash(s.addr))
+            # ETMv4 A-sync: >=11 zero bytes then 0x80
+            v4a = 0
+            zc = 0
+            for c in data:
+                if c == 0:
+                    zc += 1
+                elif c == 0x80 and zc >= 11:
+                    v4a += 1
+                    zc = 0
+                else:
+                    zc = 0
+            # A-sync count dominates for ETMv4 streams; I-sync count is a
+            # tie-breaker to avoid picking an all-zero misalignment.
+            score = v4a * 100 + fl
+            if best is None or score > best[0]:
+                best = (score, parity, order, data, fl, v4a)
+    return best
+
+
+def count_v4_syncs(etm):
+    """Count ETMv4 A-syncs (>=11 zeros + 0x80) and Trace-Info (0x01) headers
+    right after each A-sync."""
+    asyncs = 0
+    trinfo = 0
+    zc = 0
+    for i, c in enumerate(etm):
+        if c == 0:
+            zc += 1
+        elif c == 0x80 and zc >= 11:
+            asyncs += 1
+            zc = 0
+            # peek next non-empty byte
+            if i + 1 < len(etm) and etm[i + 1] == 0x01:
+                trinfo += 1
+        else:
+            zc = 0
+    return asyncs, trinfo
+
+
+def deframe(data):
+    """TPIU-deframe if syncs are present; otherwise pass through."""
+    if L.has_tpiu_sync(data):
+        return L.tpiu_deframe_walk(data)
+    return bytes(data)
+
+
+STRICT_RESERVED = frozenset({
+    0x83, 0x84, 0x87, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F,
+    0x93, 0x94, 0x97, 0x98, 0x99, 0x9C, 0x9F,
+})
+ATOM_HDRS = frozenset(range(0xC0, 0x100))
+
+
+def diagnose_bitflip(etm):
+    """MEASURE, DON'T FIX. Report the rate of Atom→reserved transitions and
+    whether flipping bit6 (0x40) would recover a legal Atom-header. If yes,
+    a specific data-lane bit is being flipped in ~30% of TRACECLK cycles
+    (see PROPOSAL 3x: capture-front-end fault, not decoder fault)."""
+    n_atom_next = 0
+    n_reserved  = 0
+    n_recoverable = 0
+    for i in range(len(etm) - 1):
+        if etm[i] in ATOM_HDRS:
+            nb = etm[i + 1]
+            n_atom_next += 1
+            if nb in STRICT_RESERVED:
+                n_reserved += 1
+                if (nb ^ 0x40) in ATOM_HDRS:
+                    n_recoverable += 1
+    return dict(
+        after_atom=n_atom_next,
+        reserved=n_reserved,
+        recoverable=n_recoverable,
+        reserved_pct=100 * n_reserved / max(1, n_atom_next),
+        recoverable_pct=100 * n_recoverable / max(1, n_reserved),
+    )
+
+
+def fix_async_alignment(etm):
+    """Every ETMv4 A-sync (>=11 zeros + 0x80) MUST be followed immediately by a
+    Trace-Info packet (header 0x01). On our capture we see ~85% of A-syncs
+    followed by an extra Atom byte (0xdb / 0xf6 / 0xf7) BEFORE the expected
+    0x01. That single stray byte comes from a 1-byte phase slip in the
+    capture pipeline (nibble-assemble boundary / DDR write-window edge —
+    verified: never inside the Trace-Info payload, always exactly one byte
+    between the 0x80 and the 0x01).
+
+    We normalise by scanning for A-sync ends and, when the next byte is not
+    0x01, dropping ONE byte to snap the alignment back. This never corrupts
+    valid streams because a correct capture already has 0x01 at that offset.
+    """
+    out = bytearray()
+    i = 0
+    zc = 0
+    n = len(etm)
+    fixed = 0
+    kept = 0
+    while i < n:
+        c = etm[i]
+        out.append(c)
+        if c == 0:
+            zc += 1
+        elif c == 0x80 and zc >= 11:
+            # We just wrote the A-sync terminator. Look ahead: if the next
+            # byte is not 0x01 but the byte AFTER it is 0x01, drop the stray.
+            if i + 2 < n and etm[i + 1] != 0x01 and etm[i + 2] == 0x01:
+                i += 1               # skip one byte
+                fixed += 1
+            elif i + 1 < n and etm[i + 1] == 0x01:
+                kept += 1
+            zc = 0
+        else:
+            zc = 0
+        i += 1
+    return bytes(out), fixed, kept
+
+
+def parse_lister_output(text):
+    """Extract PCs from trc_pkt_lister -decode output.
+
+    OpenCSD-1.4.1 emits INSTR_RANGE lines like:
+      OCSD_GEN_TRC_ELEM_INSTR_RANGE(exec range=0x8001aea:[0x8001af6] num_i(5) ...)
+    We collect the range [start, end) as the exercised PC set."""
+    pcs = set()
+    n_ranges = 0
+    n_isync = 0
+    n_pe_ctx = 0
+    n_exc = 0
+    # Two accepted forms:
+    #   "range=0x<start>:[0x<end>]"
+    #   "st_addr=0x<start>...en_addr=0x<end>"
+    re_new = re.compile(r"range=0x([0-9a-fA-F]+):\[0x([0-9a-fA-F]+)\]")
+    re_old = re.compile(r"st_addr=0x([0-9a-fA-F]+).*en_addr=0x([0-9a-fA-F]+)")
+    for line in text.splitlines():
+        if "INSTR_RANGE" in line:
+            n_ranges += 1
+            m = re_new.search(line) or re_old.search(line)
+            if m:
+                st = int(m.group(1), 16)
+                en = int(m.group(2), 16)
+                p = st
+                while p < en and p - st < 0x400:
+                    pcs.add(p)
+                    p += 2
+        elif "PE_CONTEXT" in line or "I_ADDR" in line:
+            n_pe_ctx += 1
+        elif "TRACE_ON" in line or "ISYNC" in line:
+            n_isync += 1
+        elif "EXCEPTION" in line:
+            n_exc += 1
+    return pcs, dict(instr_ranges=n_ranges, pe_context=n_pe_ctx,
+                     isync=n_isync, exception=n_exc)
+
+
+def nm_symbols(elf):
+    for tool in ("arm-none-eabi-nm", "nm"):
+        try:
+            out = subprocess.check_output([tool, "-n", elf]).decode()
+            break
+        except FileNotFoundError:
+            continue
+    else:
+        return []
+    syms = []
+    for line in out.splitlines():
+        m = re.match(r"([0-9a-fA-F]{8}) [tTwW] (\S+)", line)
+        if m:
+            syms.append((int(m.group(1), 16), m.group(2)))
+    return syms
+
+
+def func_of(syms, pc):
+    lo = None
+    for a, n in syms:
+        if a <= pc:
+            lo = n
+        else:
+            break
+    return lo
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("raw")
+    ap.add_argument("elf")
+    ap.add_argument("--period-ns", type=float, default=20.0,
+                    help="TRACECLK period (50MHz=20)")
+    ap.add_argument("--keep", type=str, default=None,
+                    help="keep the OpenCSD snapshot dir (and etm.bin) here")
+    ap.add_argument("--dump-lister", type=str, default=None,
+                    help="save trc_pkt_lister stdout to this file")
+    a = ap.parse_args()
+
+    raw = open(a.raw, "rb").read()
+    print(f"[1] raw stream: {len(raw)} bytes ({len(raw) * a.period_ns / 2e6:.2f} ms)")
+
+    # Two supported inputs:
+    #   (a) FPGA-side traceIF emits already-aligned TPIU 16-byte frames as
+    #       plain bytes. PC does TPIU deframe (etm35lib) directly, NO nibble
+    #       assemble. Detected by has_tpiu_sync AND absence of the raw {a,b}
+    #       double-byte cadence.
+    #   (b) Legacy raw {a,b} stream (old bit): 2 bytes / TRACECLK. Detected
+    #       when has_tpiu_sync returns false on the raw bytes but true on the
+    #       parity=1 assembled bytes.
+    if L.has_tpiu_sync(raw):
+        print("[2] TPIU-framed byte stream (from FPGA-side traceIF)")
+        etm = L.tpiu_deframe_walk(raw)
+        print(f"[3] deframed ETM: {len(etm)} bytes")
+    else:
+        # Try the legacy 2-byte-per-period nibble path.
+        score, parity, order, data, fl, v4a = recover_assemble(raw)
+        if L.has_tpiu_sync(data):
+            print(f"[2] legacy raw {{a,b}}: parity={parity} order={order} "
+                  f"assembled={len(data)}B  A-syncs(v4)={v4a} flash-Isync={fl}")
+            etm = L.tpiu_deframe_walk(data)
+            print(f"[3] deframed ETM: {len(etm)} bytes")
+        else:
+            print("[2] no TPIU sync detected in either raw or assembled forms;"
+                  " passing bytes through as-is")
+            etm = raw
+            print(f"[3] {len(etm)} bytes")
+
+    asyncs, trinfo = count_v4_syncs(etm)
+    print(f"    ETMv4 A-syncs={asyncs}, Trace-Info(0x01) after A-sync={trinfo}")
+
+    if a.keep:
+        os.makedirs(a.keep, exist_ok=True)
+        snapdir = a.keep
+        tmpctx = None
+    else:
+        tmpctx = tempfile.TemporaryDirectory()
+        snapdir = tmpctx.name
+
+    etm_path = os.path.join(snapdir, "input_etm.bin")
+    open(etm_path, "wb").write(etm)
+
+    r = subprocess.run(
+        [sys.executable, PACKER, etm_path, a.elf, snapdir,
+         "--protocol", "etm4"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        print("[FAIL] snapshot build:", r.stderr, file=sys.stderr)
+        return 1
+    print("[4] snapshot dir:", snapdir)
+    for line in r.stdout.splitlines()[:6]:
+        print("   ", line)
+
+    print("[5] running trc_pkt_lister -decode ...")
+    r = subprocess.run(
+        [LISTER, "-ss_dir", snapdir, "-decode", "-logstdout"],
+        capture_output=True, text=True,
+    )
+    if a.dump_lister:
+        open(a.dump_lister, "w").write(r.stdout)
+
+    text = r.stdout
+    tail = text.splitlines()[-40:]
+    if r.returncode != 0:
+        print("    lister exited with", r.returncode)
+
+    pcs, stats = parse_lister_output(text)
+    print(f"[6] decoder: INSTR_RANGE={stats['instr_ranges']}  "
+          f"PE_CONTEXT/I_ADDR={stats['pe_context']}  "
+          f"ISYNC/TRACE_ON={stats['isync']}  EXCEPTION={stats['exception']}")
+    print(f"    unique PCs: {len(pcs)}")
+
+    if not pcs:
+        print("\n---- lister tail ----")
+        for line in tail:
+            print("   ", line)
+        if tmpctx:
+            tmpctx.cleanup()
+        return 2
+
+    in_flash = [p for p in pcs if 0x08000000 <= p < 0x08200000]
+    print(f"    in flash: {len(in_flash)}/{len(pcs)} "
+          f"({100 * len(in_flash) / len(pcs):.1f}%)")
+
+    syms = nm_symbols(a.elf)
+    if syms:
+        from collections import Counter
+        cov = Counter(func_of(syms, p) for p in in_flash)
+        cov.pop(None, None)
+        seen = set(cov)
+        hit = EXPECTED & seen
+        print(f"    functions covered: {len(cov)}")
+        print(f"    func_test user funcs seen: {len(hit)}/{len(EXPECTED)}")
+        miss = EXPECTED - seen
+        if miss:
+            print(f"      missing: {sorted(miss)}")
+        print("    top-15 functions by PC count:")
+        for n, c in cov.most_common(15):
+            tag = "  <-- func_test" if n in EXPECTED else ""
+            print(f"      {n:<30} {c}{tag}")
+
+    if tmpctx:
+        tmpctx.cleanup()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
