@@ -165,15 +165,27 @@ module la_ddr_writer #(
                         if (out_idx == LENGTH-1) out_idx <= 0;
                         else out_idx <= out_idx + 1'b1;
                     end
+                    // CRITICAL: the vendor ddr3_wr_ctrl passes app_addr =
+                    // ddr3_wr_addr through unchanged and issues LENGTH commands;
+                    // the DATA SOURCE must advance the address +8 per app
+                    // command (4:1 PHY, one 128-bit UI word = 8 DDR3 column
+                    // addrs) like ddr3_generate_data. Holding it constant made
+                    // all 64 words of a burst hit the SAME address -> readback
+                    // was the last word repeated 64x (period-16 duplication).
+                    if (ddr3_wr_addr_req)
+                        ddr3_wr_addr <= ddr3_wr_addr + 29'd8;
                     if (ddr3_wr_done) wst <= W_DONE;
                 end
                 W_DONE: begin
                     words_written <= words_written + LENGTH;
-                    // advance ring pointer by LENGTH words, wrap
-                    if (wr_ptr_words + LENGTH >= RING_BASE + RING_WORDS)
+                    // app address advances +8 per 128-bit word, so a burst
+                    // spans LENGTH*8 in app-address units. Advance the ring
+                    // write pointer by the SAME amount so bursts are contiguous
+                    // and don't overlap.
+                    if (wr_ptr_words + (LENGTH<<3) >= RING_BASE + RING_WORDS)
                         wr_ptr_words <= RING_BASE;
                     else
-                        wr_ptr_words <= wr_ptr_words + LENGTH;
+                        wr_ptr_words <= wr_ptr_words + (LENGTH<<3);
                     burst_done <= 1'b1;
                     wst <= W_IDLE;
                 end

@@ -146,7 +146,9 @@ module trace_ddr_blackbox_top #(
     wire [28:0] wr_ptr_words;
     wire [31:0] words_written, wr_lost_bytes;
     la_ddr_writer #(.LENGTH(LENGTH), .RING_BASE(29'd0),
-                    .RING_WORDS(29'h0100000)) u_bb (   // 16MB ring
+                    // RING_WORDS is in DDR3 app-address units (+8/word); 0x800000
+                    // app units = 0x100000 words = 16MB ring.
+                    .RING_WORDS(29'h0800000)) u_bb (
         .cap_clk(cap_clk), .cap_rst(sys_rst | ~cap_locked),
         .cap_byte(cap_byte), .cap_valid_in(cap_valid), .freeze(rb_busy),
         .ui_clk(ui_clk), .ui_rst(ui_rst | ~calib_done), .ddr3_busy(ddr3_busy),
@@ -171,12 +173,16 @@ module trace_ddr_blackbox_top #(
     // Read the MOST RECENTLY WRITTEN region (real trace), not the fixed ring
     // start (which the idle-filler overwrites). start = wr_ptr - READ_WORDS,
     // wrapped into the ring. wr_ptr_words is ui_clk; CDC to clk125 for the calc.
-    localparam [28:0] RING_WORDS = 29'h0100000;   // must match writer
+    // NOTE: addresses are in DDR3 app-address units (+8 per 128-bit word).
+    // wr_ptr_words is the write pointer in those units; RING spans in app units.
+    // To read the freshest READ_WORDS words we go back READ_WORDS*8 app units.
+    localparam [28:0] RING_APP = 29'h0800000;      // ring span (app addr units)
+    wire [28:0] READ_SPAN = READ_WORDS[25:0] << 3; // READ_WORDS words * 8
     reg [28:0] wrptr_c0=0, wrptr_c1=0;
     always @(posedge clk125) begin wrptr_c0<=wr_ptr_words; wrptr_c1<=wrptr_c0; end
     wire [28:0] rd_start_addr =
-        (wrptr_c1 >= READ_WORDS[28:0]) ? (wrptr_c1 - READ_WORDS[28:0])
-                                       : (RING_WORDS + wrptr_c1 - READ_WORDS[28:0]);
+        (wrptr_c1 >= READ_SPAN) ? (wrptr_c1 - READ_SPAN)
+                                : (RING_APP + wrptr_c1 - READ_SPAN);
 
     wire [7:0] rb_tdata;
     wire       rb_tvalid, rb_tready, rb_busy;

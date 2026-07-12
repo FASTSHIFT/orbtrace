@@ -107,6 +107,13 @@ module la_ddr_reader #(
                         f_wr_data  <= ddr3_rd_data;   // whole word, one cycle
                         f_wr_valid <= 1'b1;
                     end
+                    // vendor ddr3_rd_ctrl passes app_addr = ddr3_rd_addr through
+                    // and issues LENGTH read commands; the address must advance
+                    // +8 per command (like the write side), else all LENGTH
+                    // words read from the SAME address -> the last word repeated
+                    // (period-16 duplication).
+                    if (ddr3_rd_addr_req)
+                        ddr3_rd_addr <= ddr3_rd_addr + 29'd8;
                     if (ddr3_rd_done) rst_state <= R_NEXT;
                 end
                 R_NEXT: begin
@@ -114,7 +121,8 @@ module la_ddr_reader #(
                         rst_state <= R_IDLE;    // done
                     end else begin
                         words_left <= words_left - LENGTH;
-                        ddr3_rd_addr <= ddr3_rd_addr + LENGTH;
+                        // ddr3_rd_addr already advanced by LENGTH*8 across the
+                        // burst via the +8/req above; just continue from here.
                         rst_state <= R_START;
                     end
                 end

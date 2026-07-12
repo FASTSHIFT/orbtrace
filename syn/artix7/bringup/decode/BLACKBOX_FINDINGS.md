@@ -43,7 +43,21 @@ P1 (ddr3_selftest) proved the vendor ddr3_ctrl write+read round-trips
 byte-exact for its OWN pattern, so the duplication is in la_ddr_writer/reader
 packing/gearbox, not the MIG core.
 
-## Next step
-Add a word-level counter/signature test (write an incrementing word pattern via
-la_ddr_writer, read via la_ddr_reader, check for the period-16 duplication) to
-localise writer vs reader, then fix the offending advance condition.
+## RESOLVED
+Root cause: BOTH la_ddr_writer and la_ddr_reader held the DDR3 app address
+CONSTANT for the whole 64-word burst. The vendor ddr3_wr_ctrl/ddr3_rd_ctrl pass
+`app_addr = ddr3_wr_addr/ddr3_rd_addr` through and issue LENGTH commands, so the
+DATA SOURCE must advance the address **+8 per command** (4:1 PHY: one 128-bit UI
+word spans 8 DDR3 column addresses), exactly like the vendor ddr3_generate_data.
+Holding it constant made all 64 words of a burst hit the SAME address -> only
+the last survived, read back as one word repeated 64x (period-16 duplication).
+
+Fix: advance ddr3_wr_addr / ddr3_rd_addr by 8 on each addr_req during the burst;
+ring/window strides in app-address units (LENGTH*8 per burst, RING 0x800000).
+
+Board-verified after fix:
+- consecutive-equal-word pairs: 12403 -> **0** (duplication gone)
+- ETMv4 A-sync density recovered; orbetto PC cardinality **0 -> 196** on a 2MB
+  slice, PCs map into func_test's flash range (0x08001864-0x08001af8).
+The black box now stores decodable ground-truth trace. (Same bug class as the
+P1 write-phase fix: the vendor DDR3 layer needs the source to drive addresses.)
