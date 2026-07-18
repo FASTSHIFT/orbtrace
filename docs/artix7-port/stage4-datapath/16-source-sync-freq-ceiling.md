@@ -1192,3 +1192,47 @@ HAL_GetTick/LED 轮询、factorial 深度随 r 变、conditional 双臂）喂端
 - 真 ETM 逐指令干净：**93.8M**（IDELAY tap 调进眼）。
 - per-lane IDELAY 基础设施就绪（CSR 0x06 + set-tap-lane + perlane_idelay_cal.py），
   当前板子无 skew 用不上，但为更高频/更差连线备好。
+
+
+## 冲击 105.5M：真 ETM 逐指令上限撞到 IDELAY 范围极限（IDELAY-only 到顶）
+
+继续提 VCO（N=36 → VCO=450, sysclk=150M 更稳）冲更高 TRACECLK。
+
+### 结果：105.5M 真 ETM 解不出，眼心超出 IDELAY 可达范围
+
+- FPGA timebase 实测 **105.5MHz**（VCO450/R2）。
+- 全 tap 扫描（0–31，A-sync 判据）：
+  - tap 0–24：全是**半 nibble 偏移**（`0xf7` 主导 ~2700，`0x7f`≈0，full-sync=0）——采样点
+    在错误半位，字节整体错位。
+  - tap 27–30：`f7` 开始塌，`7f`/full-sync 冒头。
+  - **tap=31（IDELAY 满程 2.4ns）**：对齐终于对了（`7f`=18208、`f7`=342、full-sync=1319），
+    但 **A-sync 仍=0、deframed 95B、0 PC**——眼**刚够到边、没到心**。
+- IDELAY 到顶 31 仍解不出真 ETM。
+
+### 根因：IDELAY 2.4ns 范围在 105.5M 只覆盖半个 UI
+
+- 105.5M 半-UI = 4.7ns，IDELAY 全程仅 2.4ns ≈ **半个 UI**。
+- 93.8M 眼心在 tap≈2（低端），105.5M 眼心需 tap>31（高端）——12% 频率变化眼却"移动"超过
+  整个 IDELAY 范围，是**半-UI 回卷**：采样时钟与数据的相位关系跨过半-UI 边界，眼从低-tap
+  端"绕"到 IDELAY 够不着的高-tap 端。
+- 即 **IDELAY-only 采样在 105.5M 触及物理范围极限**：能覆盖的相位窗口 < 需要的延迟。
+
+### 诚实结论：IDELAY-only 路径真 ETM 逐指令上限 = 93.8M
+
+- **采集层（规整图案 walking）干净到 200M**（早测，不依赖眼心精度，图案能容错）。
+- **真 ETM 逐指令干净：93.8M**（tap≈2 眼内，14/14、顺序 PASS、byte-err ~0.03%）。
+- **105.5M 超出 IDELAY-only 能力**：眼心超过 IDELAY 2.4ns 可达范围，tap31 仍未入心。
+- 要突破 93.8M 需**粗相位延迟超过 IDELAY 范围**：MMCM 相移采样时钟（把 IDDR 采样点整体
+  移到眼心，doc 早先 proposal 22/26 方向），或 IDDR 反沿选择 + IDELAY 微调覆盖另半 UI。
+  这是采样架构的下一步（比 per-lane 大），不是参数调整。
+
+### 频率-上限总表（本阶段最终）
+
+| 能力 | 上限 | 依据 |
+|------|-----:|------|
+| 采集层字节干净（规整图案）| ≥200M | walking best-tap 0.004%（受限于 STM32 VCO）|
+| 真 ETM 逐指令干净（IDELAY-only）| **93.8M** | 14/14 + 顺序 PASS + byte-err 0.03% |
+| 真 ETM（IDELAY 触顶失效）| 105.5M ✗ | 眼心超 IDELAY 2.4ns 范围 |
+
+要把真 ETM 逐指令上限从 93.8M 继续往上推，下一步是 MMCM 相移采样时钟（覆盖整个 UI 的
+粗延迟），IDELAY 做眼内微调 + per-lane deskew（基础设施已就绪）。
