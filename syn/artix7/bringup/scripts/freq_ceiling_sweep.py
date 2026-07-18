@@ -21,7 +21,38 @@ from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
-GOOD = {0xA5, 0x5A}
+
+# CURTPM register value + scorer per pattern.
+#   aa55    : all 4 lanes toggle together -> byte 0xA5/0x5A. LENIENT (a dropped
+#             nibble pair still reads 0xA5, and lane skew is masked).
+#   walk1   : single bit rotating across lanes -> nibbles 4,2,1,8,4,... STRICT:
+#             exposes lane skew (multi-bit nibble) and dropped/dup nibbles.
+CURTPM = {"aa55": 0x00020004, "walk1": 0x00020001, "walk0": 0x00020002}
+NEXT_ROT = {4: 2, 2: 1, 1: 8, 8: 4}
+
+
+def score_aa55(d):
+    good = sum(1 for b in d if b in (0xA5, 0x5A))
+    return 1.0 - good / len(d)
+
+
+def score_walk(d):
+    """Fraction of nibbles breaking the single-bit rotation 4->2->1->8."""
+    nibs = []
+    for b in d:
+        nibs.append((b >> 4) & 0xf); nibs.append(b & 0xf)
+    breaks = 0; prev = None
+    for x in nibs:
+        is_single = (x != 0 and (x & (x - 1)) == 0)
+        if not is_single:
+            breaks += 1; prev = None; continue
+        if prev is not None and x != NEXT_ROT[prev]:
+            breaks += 1
+        prev = x
+    return breaks / len(nibs)
+
+
+SCORER = {"aa55": score_aa55, "walk1": score_walk, "walk0": score_walk}
 
 
 def run(cmd, timeout=40, env=None):
@@ -32,9 +63,10 @@ def run(cmd, timeout=40, env=None):
                           timeout=timeout, env=e)
 
 
-def set_vco(nfield):
+def set_vco(nfield, curtpm_val):
     """Set DIVN1 field (N=nfield+1), DIVR1=0, re-arm CURTPM. Returns cfg echo."""
     e = dict(os.environ); e["PLLN_VAL"] = str(nfield)
+    e["CURTPM_VAL"] = hex(curtpm_val)
     r = subprocess.run(
         ["openocd", "-f", "interface/cmsis-dap.cfg",
          "-f", "target/stm32h7x.cfg",
@@ -43,7 +75,7 @@ def set_vco(nfield):
     return r
 
 
-def measure(ip, depth, tag):
+def measure(ip, depth, tag, scorer):
     cap = f"/tmp/fcs_{tag}.bin"
     run([sys.executable, f"{HERE}/trace_ctrl.py", "--ip", ip, "rearm"])
     time.sleep(0.25)
@@ -54,9 +86,7 @@ def measure(ip, depth, tag):
     d = open(cap, "rb").read()
     if not d:
         return None, None
-    c = Counter(d)
-    good = sum(c.get(v, 0) for v in GOOD)
-    err = 1.0 - good / len(d)
+    err = scorer(d)
     freq = None
     ts = cap + ".ts.json"
     if os.path.exists(ts):
@@ -79,18 +109,22 @@ def main():
     ap.add_argument("--taps", default="0,4,8,12,16,20,24,28",
                     help="IDELAY taps to try per frequency")
     ap.add_argument("--thresh", type=float, default=0.1,
-                    help="best-tap err%% ceiling (fraction, 0.1 = 0.1%%... "
-                         "actually fraction so 0.001=0.1%)")
+                    help="best-tap err ceiling as a FRACTION (0.001 = 0.1%)")
+    ap.add_argument("--pattern", choices=CURTPM.keys(), default="walk1",
+                    help="CURTPM test pattern: aa55 (lenient) or walk1/walk0 "
+                         "(strict, lane-desynchronised -- default)")
     a = ap.parse_args()
 
     nfields = [int(x) for x in a.n_list.split(",")]
     taps = [int(x) for x in a.taps.split(",")]
+    curtpm_val = CURTPM[a.pattern]
+    scorer = SCORER[a.pattern]
 
-    print(f"=== frequency ceiling sweep (DIVR1=0, VCO=TRACECLK) ===")
+    print(f"=== frequency ceiling sweep (DIVR1=0, VCO=TRACECLK, pattern={a.pattern}) ===")
     print(f"{'Nfield':>6} {'TRACECLK':>9} {'best-tap':>8} {'best-err%':>9} {'eye(#good taps)':>16}")
     rows = []
     for nf in nfields:
-        r = set_vco(nf)
+        r = set_vco(nf, curtpm_val)
         combined = (r.stdout or "") + (r.stderr or "")
         if "PLLN field" not in combined:
             print(f"{nf:>6}  set_pll_n failed: {combined[-200:]}")
@@ -103,7 +137,7 @@ def main():
         for t in taps:
             run([sys.executable, f"{HERE}/trace_ctrl.py", "--ip", a.ip,
                  "set-tap", str(t)])
-            err, freq = measure(a.ip, a.depth, f"n{nf}_t{t}")
+            err, freq = measure(a.ip, a.depth, f"n{nf}_t{t}", scorer)
             if err is None:
                 continue
             if freq is not None:
