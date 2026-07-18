@@ -1396,3 +1396,60 @@ conditional 76=2×38——**比例逐函数吻合**,与 66M 一致。
 **~100M 真实 TRACECLK 端到端跑通**:源同步 IDDR 采集 → orbetto ETMv4 → Perfetto,
 14/14 func_test、533 PC、顺序 PASS、采集字节错 0.071%。这是 IDELAY-only 路径的真 ETM
 逐指令上限(再高到 105.5M+ 眼心超 IDELAY 范围,需 MMCM 相移)。产物 `func_test_100m.perf`。
+
+
+## ✅✅✅ 突破 100M:clock-lane IDELAY → 112.4MHz 真实主频,零字节错端到端
+
+用户要求试突破 100M(不行就回退保最佳)。**成功突破,无需回退。**
+
+### 方案:给 TRACECLK 也加一级 IDELAY(不是 MMCM)
+
+100M 上限的物理根因:105.5M 半-UI=4.7ns,而数据 IDELAY 只有 2.4ns,眼心在 data-tap>31
+够不着。**解法比 MMCM 轻**:给采样时钟也加一级 IDELAYE2。有效采样相位 =
+Dd(data delay) − Dc(clock delay),范围从 [0,2.4ns] 扩成 [−2.4,+2.4]=4.8ns > 半-UI,
+眼心必落在可达窗口内。
+
+RTL:`trace_capture_a7.v` 时钟路径 IBUF → **IDELAYE2(SIGNAL_PATTERN=CLOCK)** → BUFIO/BUFR
+(仅 BUFR_IO 源同步模式)。`trace_stream_top.v` 加 CSR 0x07 clock-tap + CDC。工具
+`trace_ctrl set-tap-clk`。Vivado 综合布线 0 error(IDELAYE2→BUFIO 合法)。所有其它 top +
+sim testbench 的实例化补 `.tap_clk(5'd0)` 保持原行为 + CI 不破。
+
+### 结果:112.4MHz 真实,零字节错
+
+tclk106(pll1_r_ck=225M),timebase 实测 105.5M ×1.066 = **112.4MHz 真实**。
+
+- **IDELAY-only(旧 bit)**:105.5M 全 data-tap A-sync=0,眼心超范围,完全解不出(见前节)。
+- **加 clock-lane IDELAY**:二维扫 (clk-tap × data-tap) 有清晰眼:
+  - clk=8,data=0 → 90% 崩(采样点错)
+  - **clk=8,data=12 → byte-err 0.000%**(眼心)
+  - clk=0,data=8 → 0.07%
+
+最优点 **clk=8 / data=12** 完整验证:
+
+| 指标 | 值 |
+|------|-----|
+| 真实 TRACECLK | **112.4MHz** |
+| unique PC | **698,100% 落 flash** |
+| func_test | **14/14** |
+| INSTR_RANGE | 3171 |
+| RESERVED+BAD_SEQ | **0 → byte-err 0.000%** |
+| 顺序核对 | **PASS 33/33** |
+
+### Perfetto 端到端
+
+`func_test_112m.perf`(FPGA 时间基准 span 546µs)。完整链路 112.4MHz 跑通。
+
+### 结论:真 ETM 逐指令上限从 100M 提到 112.4MHz(+12%)
+
+- **clock-lane IDELAY 成功突破 100M**:112.4MHz 真实主频、零字节错、14/14、顺序 PASS。
+- 关键:采样时钟延迟把 IDELAY-only 够不着的眼心(半-UI 外)拉进 ±2.4ns 可达窗口。
+- 新上限受限于 IDELAY 组合总范围(±2.4ns)与 STM32 VCO;更高频(半-UI < clock 抖动)仍需
+  MMCM 相移,但 clock-lane IDELAY 已把上限从 100M 推到 112M,方案轻、无需 MMCM。
+- 新 bit `trace_iddr_clktap.bit`(默认 data-tap=2, clk-tap=0,≤100M 行为不变;>100M 用
+  CSR 0x07 设 clock-tap)。
+
+### 校准法(>100M)
+
+1. 二维扫 clk-tap × data-tap,A-sync 或 RESERVED 判据找零错点;
+2. clk-tap 步进约等于把眼心在 data-tap 空间平移;
+3. 眼心零字节错点即最优(如本例 clk=8/data=12)。

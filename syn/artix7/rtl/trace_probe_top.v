@@ -159,6 +159,7 @@ module trace_probe_top #(
         .tap_data1     (5'd16),
         .tap_data2     (5'd16),
         .tap_data3     (5'd16),
+        .tap_clk       (5'd0),
         .tap_load      (1'b0),
         .trace_clk     (trace_clk),
         .trace_a       (trace_a),

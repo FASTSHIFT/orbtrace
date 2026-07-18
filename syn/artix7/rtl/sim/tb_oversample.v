@@ -45,7 +45,7 @@ module tb_oversample;
         .rst(rst), .ref_200m(ref_200m),
         .trace_clk_p(trace_clk_p), .trace_data_p(trace_data_p),
         .tap_data0(5'd16), .tap_data1(5'd16), .tap_data2(5'd16), .tap_data3(5'd16),
-        .tap_load(1'b0),
+        .tap_clk(5'd0), .tap_load(1'b0),
         .test_en(1'b0), .test_clk(1'b0), .test_data(4'b0),
         .eye_delay_rt(8'd0),
         .cap_clear(1'b0),

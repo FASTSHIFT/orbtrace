@@ -107,6 +107,7 @@ module eyescan_top #(
         .tap_data1     (tap),
         .tap_data2     (tap),
         .tap_data3     (tap),
+        .tap_clk       (5'd0),
         .tap_load      (tap_load),
         .trace_clk     (trace_clk),
         .trace_a       (trace_a),

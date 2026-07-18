@@ -94,6 +94,11 @@ module trace_capture_a7 #(
     input  wire [4:0]  tap_data1,
     input  wire [4:0]  tap_data2,
     input  wire [4:0]  tap_data3,
+    // Clock-lane IDELAY tap (>100MHz eye reach): delaying TRACECLK shifts the
+    // effective sampling phase the OTHER way, so data_tap - clk_tap spans the
+    // FULL UI (±2.4ns = 4.8ns > half-UI 4.7ns @ ~105MHz). At <=100MHz leave
+    // clk_tap=0 (data tap alone reaches the eye). See doc 16.
+    input  wire [4:0]  tap_clk,
     input  wire        tap_load,
 
     // --- Self-test injection (red-team E1, doc r15) ---------------------
@@ -175,11 +180,42 @@ module trace_capture_a7 #(
     wire trace_clk_io;     // -> IDDR C
     IBUF u_ibuf_clk (.I(trace_clk_p), .O(trace_clk_ibuf));
 
+    // Clock-lane IDELAY (only meaningful for the source-sync BUFR_IO/IDDR
+    // path). Delaying the sampling clock relative to the data extends the
+    // reachable sampling phase beyond the data-only IDELAY range, so the eye
+    // centre stays inside [0..31] even above 100MHz where half-UI < 2.4ns.
+    // A BUFIO clock must come from a clock-capable path; IDELAYE2 -> BUFIO is
+    // legal on 7-series (the IDELAY sits in the IOB, BUFIO follows).
+    wire trace_clk_dly;
+
     generate
         if (CLK_BUF == "BUFR_IO") begin : g_bufr
-            BUFIO u_bufio_clk (.I(trace_clk_ibuf), .O(trace_clk_io));
+            (* IODELAY_GROUP = "trace_idelay_grp" *)
+            IDELAYE2 #(
+                .IDELAY_TYPE          ("VAR_LOAD"),
+                .DELAY_SRC            ("IDATAIN"),
+                .HIGH_PERFORMANCE_MODE("TRUE"),
+                .IDELAY_VALUE         (0),
+                .SIGNAL_PATTERN       ("CLOCK"),
+                .REFCLK_FREQUENCY     (200.0),
+                .CINVCTRL_SEL         ("FALSE"),
+                .PIPE_SEL             ("FALSE")
+            ) u_idelay_clk (
+                .C          (ref_200m),
+                .REGRST     (1'b0),
+                .LD         (tap_load),
+                .CE         (1'b0),
+                .INC        (1'b0),
+                .CINVCTRL   (1'b0),
+                .CNTVALUEIN (tap_clk),
+                .IDATAIN    (trace_clk_ibuf),
+                .DATAIN     (1'b0),
+                .DATAOUT    (trace_clk_dly),
+                .CNTVALUEOUT()
+            );
+            BUFIO u_bufio_clk (.I(trace_clk_dly), .O(trace_clk_io));
             BUFR #(.BUFR_DIVIDE("BYPASS")) u_bufr_clk (
-                .I(trace_clk_ibuf), .O(trace_clk), .CE(1'b1), .CLR(1'b0)
+                .I(trace_clk_dly), .O(trace_clk), .CE(1'b1), .CLR(1'b0)
             );
         end else begin : g_bufg
             BUFG u_bufg_clk (.I(trace_clk_ibuf), .O(trace_clk));

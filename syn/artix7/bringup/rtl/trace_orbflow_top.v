@@ -121,6 +121,7 @@ module trace_orbflow_top #(
         .rst(sys_rst), .ref_200m(clk200),
         .trace_clk_p(trace_clk_in), .trace_data_p(trace_data_in),
         .tap_data0(TAP), .tap_data1(TAP), .tap_data2(TAP), .tap_data3(TAP),
+        .tap_clk(5'd0),
         .tap_load(tap_load),
         .trace_clk(trace_clk), .trace_a(trace_a), .trace_b(trace_b),
         .idelayctrl_rdy(idelayctrl_rdy)

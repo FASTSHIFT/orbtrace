@@ -165,6 +165,7 @@ module trace_stream_top #(
         .trace_clk_p(trace_clk_in), .trace_data_p(trace_data_in),
         .tap_data0(tap0_200), .tap_data1(tap1_200),
         .tap_data2(tap2_200), .tap_data3(tap3_200),
+        .tap_clk(tapc_200),
         .tap_load(tap_load | tap_load_200),
         .test_en(SELFTEST[0]), .test_clk(st_clk), .test_data(st_data),
         .eye_delay_rt(eye_rt),
@@ -216,6 +217,7 @@ module trace_stream_top #(
     // deskew each data lane separately (proposal 33 per-lane calibration) to
     // remove inter-lane skew that a single global tap can't fix at high freq.
     reg  [4:0] tap_csr0 = TAP, tap_csr1 = TAP, tap_csr2 = TAP, tap_csr3 = TAP;
+    reg  [4:0] tap_csrc = 5'd0;               // clock-lane tap (0 = no clk delay)
     reg        tap_load_125 = 1'b0;
     always @(posedge clk125) begin
         rearm_125 <= 1'b0;
@@ -223,6 +225,7 @@ module trace_stream_top #(
         if (sys_rst) begin
             eye_csr <= 8'd0;
             tap_csr0 <= TAP; tap_csr1 <= TAP; tap_csr2 <= TAP; tap_csr3 <= TAP;
+            tap_csrc <= 5'd0;
         end else if (csr_we_w) begin
             if (csr_addr_w == 8'h01) eye_csr <= csr_data_w;
             if (csr_addr_w == 8'h02) rearm_125 <= 1'b1;
@@ -242,6 +245,10 @@ module trace_stream_top #(
                 endcase
                 tap_load_125 <= 1'b1;
             end
+            if (csr_addr_w == 8'h07) begin            // clock-lane tap (>100M eye reach)
+                tap_csrc <= csr_data_w[4:0];
+                tap_load_125 <= 1'b1;
+            end
         end
     end
     // CDC the tap values + load pulse into clk200 (IDELAY C domain).
@@ -249,6 +256,7 @@ module trace_stream_top #(
     reg [4:0] tap1_s0 = TAP, tap1_200 = TAP;
     reg [4:0] tap2_s0 = TAP, tap2_200 = TAP;
     reg [4:0] tap3_s0 = TAP, tap3_200 = TAP;
+    reg [4:0] tapc_s0 = 5'd0, tapc_200 = 5'd0;
     reg       tapld_tgl125 = 1'b0;
     always @(posedge clk125) if (tap_load_125) tapld_tgl125 <= ~tapld_tgl125;
     reg [2:0] tapld_sync200 = 3'b0;
@@ -256,6 +264,7 @@ module trace_stream_top #(
         tap0_s0 <= tap_csr0; tap0_200 <= tap0_s0;
         tap1_s0 <= tap_csr1; tap1_200 <= tap1_s0;
         tap2_s0 <= tap_csr2; tap2_200 <= tap2_s0;
+        tapc_s0 <= tap_csrc; tapc_200 <= tapc_s0;
         tap3_s0 <= tap_csr3; tap3_200 <= tap3_s0;
         tapld_sync200 <= {tapld_sync200[1:0], tapld_tgl125};
     end

@@ -23,6 +23,7 @@ REG_BITLEN_LO = 0x03
 REG_BITLEN_HI = 0x04
 REG_TAP = 0x05     # IDDR IDELAY deskew tap (0..31) for ALL lanes; loads it
 REG_TAP_LANE = 0x06  # per-lane tap: value = {lane[6:5], tap[4:0]}
+REG_TAP_CLK = 0x07   # clock-lane IDELAY tap (0..31); >100MHz eye reach
 
 
 def write_csr(ip, addr, value, timeout=1.0):
@@ -54,6 +55,9 @@ def main():
                          help="per-lane IDELAY tap: lane 0..3, tap 0..31")
     ptl.add_argument("lane", type=int)
     ptl.add_argument("value", type=int)
+    ptc = sub.add_parser("set-tap-clk",
+                         help="clock-lane IDELAY tap 0..31 (>100MHz eye reach)")
+    ptc.add_argument("value", type=int)
     sub.add_parser("rearm")
     a = ap.parse_args()
 
@@ -71,6 +75,9 @@ def main():
         val = ((a.lane & 0x3) << 5) | (a.value & 0x1F)
         write_csr(a.ip, REG_TAP_LANE, val)
         print(f"set IDELAY lane {a.lane & 0x3} tap = {a.value & 0x1F}")
+    elif a.cmd == "set-tap-clk":
+        write_csr(a.ip, REG_TAP_CLK, a.value & 0x1F)
+        print(f"set clock IDELAY tap = {a.value & 0x1F}")
     elif a.cmd == "rearm":
         write_csr(a.ip, REG_REARM, 1)
         print("soft re-arm pulsed")
