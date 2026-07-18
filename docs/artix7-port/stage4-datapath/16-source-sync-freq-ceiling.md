@@ -517,3 +517,50 @@ BRAM 存 128-bit 整帧`。烧后（BRAM 清空重填实时 ETM）抓真 ETM：
 淹没、半 nibble 偏移三个坑**一次性消除**（都在 traceIF 帧原子化里解决）。剩唯一收尾：
 对齐 traceIF 帧字节序 ↔ host demux（或直接接现成 `tpiu_demux.v` 到 FPGA 里，让 host
 只收纯 ETM）。这才是"用成熟方案"的正道。
+
+
+## traceIF 帧路径实测：架构通了，但帧字节序仍有系统性错位
+
+CAP_RAW=0 帧模式抓真 ETM，帧多样（3840 帧 / 745 种，含 func_test 循环的合理重复），
+内容是真 ETMv4 包。发现 **H743 单 trace 源，TPIU 不插 stream-ID formatter 结构**，
+traceIF 锁 sync 后组的帧**直接就是 ETM 字节流**（无需 demux）。
+
+- **端到端通了（架构验证成功）**：帧数据 as-is 直接喂 OpenCSD → **37 PC、100% 落
+  flash、解出 callback_test/factorial/mixed_test 3 个 func_test 函数**。证明 IDDR →
+  traceIF → 帧 这条上游链在硬件跑得通，且 **HSYNC 自动滤除、无 CDC 撕裂、无 nibble
+  偏移**（CAP_RAW=1 的三个坑全消失）。
+- **但质量差**：严格判据非法事件率 **99.7%**（INSTR_RANGE=10 vs RESERVED=2764），
+  只在 10 个 A-sync 附近蒙对几段。**帧字节序/边界有系统性错位**，非偶发。
+
+### 诊断纪律：用 traceIF 仿真标定字节序，别在硬件真 ETM 上试错
+
+问题是 CURTPM 图案无 TPIU sync、traceIF 锁不上，**无法用已知图案验证帧路径**。正解：
+用 traceIF 自带 testbench（`verilog/testbeds/traceIF_tb.v` 喂已知 TPIU 帧）的**确定性
+输出**标定 host 端如何解 traceIF 的帧字节序（traceIF 有 `{packet[7:0],packet[15:8]}`
+交换 + elemCount 7→0 布局），而不是在硬件真 ETM 的高熵数据上猜。
+
+### 状态与决策点
+
+上游 traceIF 帧路径架构**已验证可行**（解出真 func_test PC），剩一个**确定性的帧
+字节序对齐**问题。两条收尾路径：
+- **1b**：用 traceIF 仿真标定帧字节序 → host 正确解帧（纯软件，确定性）。
+- **2**：直接把导出的 `tpiu_demux.v`（或按 traceIF 帧布局写的对齐逻辑）接进 FPGA，
+  让 host 只收纯 ETM——但 H743 单源可能连 demux 都不需要，只需 FPGA 侧把 traceIF
+  帧按正确字节序展平后送出。
+
+
+## traceIF 帧字节序标定（仿真，确定性）
+
+跑 `verilog/testbeds/traceIF_tb.v`（喂已知 TPIU 帧 sync + `12 34 02 03...0e 0f`）：
+输出 `Frame = 0x123402030405060708090a0b0c0d0e0f` = **输入字节原序，big-endian**
+（Frame[127:120]=首字节 0x12，Frame[7:0]=末字节 0x0f）。g_frame 读出
+`cap_byte=frd[8*(15-bsel)]` 线性映射，trace_dump 线性读 → **host 收到的就是正确
+ETM 字节序**。
+
+**由此推断**：frame2.bin as-is 有 10 个真 A-sync（字节序错则 A-sync 检测不到），说明
+字节序**基本对**；99.7% 非法是 **A-sync 之间的数据坏 = traceIF 组帧丢/漏 TRACECLK
+边沿**（IDDR@48M 采样质量），不是字节序。这把问题从"host 字节序"移回"FPGA 采样/
+组帧完整性"——即 IDDR 在此频率是否漏采边沿导致帧不连续。
+
+**净状态**：traceIF 帧路径字节序已用仿真确定为正确；剩余是采样/组帧完整性（丢边沿），
+需按环节（采样→traceIF 组帧→读出）逐段用 walking 等可控输入验证，而非在解码终点反推。
