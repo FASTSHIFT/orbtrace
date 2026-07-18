@@ -592,3 +592,42 @@ FRAME[1]=00010203040506070f08090a0b0c0d0e   ← 注入后，从注入点起整�
 - 下一步真方向：解决采样漏边沿。红方 P0 剩余：R7C（traceIF 在 48/100/150/198M 的
   OOC STA，纯综合）+ R2（Artix 裸 IDDR 相位如何落眼内——若无解则必须 IDELAY/相移/
   过采，回到 proposal 22/26/33 的采样相位问题，但这次判据是"漏边沿率"而非集合覆盖）。
+
+
+## R7C 完成：traceIF 高频时序全收敛 → 组帧环彻底清白，真凶唯一锁定采样漏边沿
+
+OOC 综合 + STA（`fpga_flow/ooc_traceif_sta.tcl`，xc7a35t-2，traceIF 单模块，
+TRACECLK 驱动，input_delay=0.2×周期）：
+
+| TRACECLK | 周期 | traceIF WNS | 判定 |
+|---:|---:|---:|:--|
+| 48 MHz | 20.8 ns | **+12.69 ns** | 余量巨大 |
+| 100 MHz | 10.0 ns | **+4.99 ns** | 充裕 |
+| 150 MHz | 6.67 ns | **+2.05 ns** | 舒适 |
+| 198 MHz | 5.05 ns | **+0.79 ns** | 满足（紧但正）|
+
+**traceIF 在全部目标频率（含 198MHz）WNS 全为正、时序收敛** → 红方 R4 担忧排除，
+组帧逻辑**不需要流水化**。
+
+### 组帧环彻底清白（三重排除）
+
+- R7A（红方）：理想输入组帧 100% 正确 → 组帧逻辑对
+- R7C（本次）：48–198MHz 时序全收敛 → 组帧时序对
+- doc 16 标定：帧字节序 big-endian 原序 → host 读法对
+
+**⇒ 99.7% 非法的真凶被唯一锁定在采样漏/多边沿（IDDR 在 edge-aligned 数据采在
+跳变点）**，即红方 R2/R3 方向。这是整条链里最后一个未清白的环节。
+
+### 自测固化（CI）
+
+R7B 漏边沿仿真做成自判 testbench（`traceIF_dropedge_tb.v`，RESULT=PASS/FAIL），接入
+`iverilog_testbenches` CI job：baseline 无 drop→frame0 正确；drop 1 边沿→frame0 对、
+frame1 错位。守住"组帧逻辑无罪、采样边沿完整性是根因"这个诊断不被回归。
+
+### 下一步（真方向，红方 R2）
+
+采样漏边沿的物理机制：Artix 裸 IDDR 无 ECP5 IDDRX1F 固有延迟，采在 edge-aligned 数据
+跳变点 → setup/hold 双违例 → 亚稳/漏采。解法回到采样相位（proposal 22/26/33），但
+**判据换成"漏边沿率 / 逐帧连续正确率"**（R7B 已提供可复现的漏边沿注入模型），不再用
+集合覆盖虚荣指标。候选：(a) 单固定 IDELAY 把采样点移出跳变区（对单一目标频率）；
+(b) 相移采样时钟；(c) 过采样。先量 Artix 裸 IDDR 在各频率的实际漏边沿率作基线。

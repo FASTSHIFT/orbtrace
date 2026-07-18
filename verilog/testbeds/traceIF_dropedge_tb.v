@@ -77,19 +77,43 @@ traceIF DUT (
    endtask
 
    // Detect each frame directly on FrAvail toggling (traceIF flips FrAvail
-   // once per complete frame). Sample in the trace clock domain edges via a
-   // simple last-value compare, checked after each byte in the stimulus.
+   // once per complete frame).
    reg       fravail_last = 0;
    integer   frame_num = 0;
+   reg [127:0] frame0 = 0, frame1 = 0;
+   localparam [127:0] EXPECT = 128'h000102030405060708090a0b0c0d0e0f;
    always @(dAvail_tb) begin
       if (dAvail_tb !== fravail_last) begin
          #1 $display("FRAME[%0d]=%032x", frame_num, dout_tb);
+         if (frame_num == 0) frame0 = dout_tb;
+         if (frame_num == 1) frame1 = dout_tb;
          frame_num = frame_num + 1;
          fravail_last = dAvail_tb;
       end
    end
 
    always begin clk_tb = ~clk_tb; #2; end
+
+   // self-check verdict (r27 R7B): with no drop both frames == EXPECT ramp;
+   // with a dropped/added edge, FRAME[1] must be CORRUPTED (!= EXPECT) while
+   // FRAME[0] (before the injection) stays correct.
+   task verdict;
+      begin
+         if (DROP_AT > 100) begin
+            // baseline: expect frame0 correct
+            if (frame0 === EXPECT)
+               $display("RESULT=PASS baseline frame0 correct");
+            else
+               $display("RESULT=FAIL baseline frame0 wrong: %032x", frame0);
+         end else begin
+            // drop case: frame0 correct, frame1 corrupted
+            if (frame0 === EXPECT && frame1 !== EXPECT)
+               $display("RESULT=PASS one dropped edge corrupts the frame (frame0 ok, frame1 derailed)");
+            else
+               $display("RESULT=FAIL drop signature not reproduced (frame0=%032x frame1=%032x)", frame0, frame1);
+         end
+      end
+   endtask
 
    initial begin
       rst_tb=0; width_tb=WIDTH;
@@ -115,6 +139,7 @@ traceIF DUT (
       sendByte(8'h18); sendByte(8'h19); sendByte(8'h1a); sendByte(8'h1b);
       sendByte(8'h1c); sendByte(8'h1d); sendByte(8'h1e); sendByte(8'h1f);
       #200;
+      verdict;
       $display("DROP_AT=%0d done", DROP_AT);
       $finish;
    end

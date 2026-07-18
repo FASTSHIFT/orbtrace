@@ -127,6 +127,23 @@ jobs:
           # Real capture should at least feed bytes and detect TPIU sync words.
           grep -q 'Got sync' /tmp/out
 
+      - name: traceIF dropped-edge derails frame (r27 R7B root-cause)
+        run: |
+          # Locks in the root cause of the real-ETM 99.7% illegal rate: a SINGLE
+          # dropped/added TRACECLK edge (IDDR sampling-completeness fault on
+          # edge-aligned data) derails traceIF's construct shift register for
+          # the whole frame and after -- while framing on IDEAL input is 100%
+          # correct. Guards the diagnosis: framing logic is not the culprit,
+          # sampling edge integrity is.
+          iverilog -PtraceIF_dropedge_tb.DROP_AT=999 -o /tmp/nd \
+            verilog/traceIF.v verilog/testbeds/traceIF_dropedge_tb.v
+          vvp /tmp/nd | tee /tmp/nd.out
+          grep -q 'RESULT=PASS' /tmp/nd.out
+          iverilog -PtraceIF_dropedge_tb.DROP_AT=30 -o /tmp/dr \
+            verilog/traceIF.v verilog/testbeds/traceIF_dropedge_tb.v
+          vvp /tmp/dr | tee /tmp/dr.out
+          grep -q 'RESULT=PASS' /tmp/dr.out
+
       - name: IDDR source-sync capture gap tolerance (gapping ETM clock)
         run: |
           # Proves the source-synchronous IDDR capture path in trace_capture_a7
@@ -139,7 +156,8 @@ jobs:
           iverilog -g2012 -o /tmp/sim_gap \
             syn/artix7/bringup/sim/tb_iddr_gap.v \
             syn/artix7/rtl/trace_capture_a7.v \
-            syn/artix7/rtl/sim/xil_stubs.v
+            syn/artix7/rtl/sim/xil_stubs.v \
+            syn/external/verilog-ethernet/lib/axis/rtl/axis_async_fifo.v
           vvp /tmp/sim_gap | tee /tmp/out_gap
           grep -q 'RESULT=ALL_PASS' /tmp/out_gap
 
