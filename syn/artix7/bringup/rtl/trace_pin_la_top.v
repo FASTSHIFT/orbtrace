@@ -99,23 +99,41 @@ module trace_pin_la_top #(
     IBUF u_ib_2 (.I(trace_data_in[2]), .O(tdata_ibuf[2]));
     IBUF u_ib_3 (.I(trace_data_in[3]), .O(tdata_ibuf[3]));
 
-    // ---- pin-level sampler in the 200 MHz domain ----
-    // Simple double-flop synchroniser per line (tolerate metastability). This
-    // is a *pin activity* recorder, not a source-synchronous receiver, so we
-    // do not need edge-centred sampling.
-    reg [4:0] pin_s0 = 0, pin_s1 = 0;
+    // ---- DUAL-EDGE pin sampler: 400 MSPS via IDDR in the 200 MHz domain ----
+    // Each 200 MHz cycle the IDDR gives TWO samples per line, 2.5 ns apart:
+    //   q_rise = level at the rising edge  (the EARLIER sample of the pair)
+    //   q_fall = level at the falling edge (the LATER sample)
+    // SAME_EDGE_PIPELINED presents both on the same posedge, so we emit them
+    // as two consecutive LA bytes (rise first, then fall) -> effective 400
+    // MSPS / 2.5 ns resolution, enough to keep >=2 samples per UI up to a
+    // ~100 MHz DDR TRACECLK (5 ns UI). No source-sync alignment; still just a
+    // pin-activity recorder, now at double the rate.
+    wire [4:0] pin_rise, pin_fall;
+    wire [4:0] pin_din = {tclk_ibuf, tdata_ibuf};
+    iddr #(.TARGET("XILINX"), .IODDR_STYLE("IODDR"), .WIDTH(5)) u_iddr (
+        .clk(sys_clk_200), .d(pin_din), .q1(pin_rise), .q2(pin_fall)
+    );
+    // one pipeline stage to ease timing off the IDDR outputs
+    reg [4:0] pin_rise_q = 0, pin_fall_q = 0;
     always @(posedge sys_clk_200) begin
-        pin_s0 <= {tclk_ibuf, tdata_ibuf};
-        pin_s1 <= pin_s0;
+        pin_rise_q <= pin_rise;
+        pin_fall_q <= pin_fall;
     end
 
-    // Canary counter (red-team R8): bit[7:5] is a 3-bit modulo-8 counter
-    // incrementing every clk200 sample. On the host we check the sequence is
-    // monotonically increasing modulo 8. Any break => FPGA/DDR3 path bug, NOT
-    // a hardware SI issue.
+    // Canary counter (red-team R8): bit[7:5] is a 3-bit modulo-8 counter that
+    // MUST advance by exactly 1 per emitted BYTE. We emit 2 bytes/cycle, so
+    // byte A carries canary and byte B carries canary+1, and the counter
+    // advances by 2 each cycle. Host checks the byte stream steps by 1 mod 8.
     reg [2:0] canary = 0;
-    always @(posedge sys_clk_200) canary <= canary + 3'd1;
-    wire [7:0] la_byte = {canary, pin_s1};
+    always @(posedge sys_clk_200) canary <= canary + 3'd2;
+    wire [7:0] la_byte_a = {canary,            pin_rise_q}; // earlier sample
+    wire [7:0] la_byte_b = {(canary + 3'd1),   pin_fall_q}; // later sample
+    // 16-bit word fed to the writer: byte A (oldest) in [15:8], byte B in
+    // [7:0]. The writer shifts {cap_word[..], cap_byte} LS-first, so to keep
+    // A older-than-B in the final stream we present {A,B} and the writer will
+    // place A then B. (writer appends the whole cap_byte at the LS end; with
+    // IN_BYTES=2 the 16-bit value's MS byte lands older.)
+    wire [15:0] la_byte = {la_byte_a, la_byte_b};
     // Continuously valid. Freeze gate is driven from the reader (busy).
 
     // ---- DDR3 controller ----
@@ -158,7 +176,7 @@ module trace_pin_la_top #(
     // between arm and reader-busy where the writer would otherwise advance
     // wr_ptr further, corrupting the snapshot boundary.
     wire writer_freeze = wrptr_valid | rb_busy;
-    la_ddr_writer #(.LENGTH(LENGTH), .RING_BASE(29'd0),
+    la_ddr_writer #(.LENGTH(LENGTH), .IN_BYTES(2), .RING_BASE(29'd0),
                     .RING_WORDS(29'h0800000)) u_bb (
         .cap_clk(sys_clk_200), .cap_rst(sys_rst),
         .cap_byte(la_byte), .cap_valid_in(1'b1), .freeze(writer_freeze),
@@ -239,7 +257,7 @@ module trace_pin_la_top #(
         (ext_addr == 16'hFF05) ? wr_lost_bytes[15:8] :
         (ext_addr == 16'hFF06) ? wr_lost_bytes[23:16]:
         (ext_addr == 16'hFF07) ? wr_lost_bytes[31:24]:
-        (ext_addr == 16'hFF08) ? la_byte             :
+        (ext_addr == 16'hFF08) ? la_byte_a           :
         (ext_addr == 16'hFF09) ? {6'b0, calib_done, mig_calib_raw} :
         (ext_addr == 16'hFF0A) ? {6'b0, rd_dbg_state}:
         (ext_addr == 16'hFF0B) ? rd_dbg_wleft[7:0]   :

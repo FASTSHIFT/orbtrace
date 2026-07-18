@@ -16,7 +16,8 @@ from collections import Counter
 
 CLK_BIT = 4
 D_BITS = [0, 1, 2, 3]
-SR_NS = 5.0   # sample rate = 200 MSPS
+SR_NS = 5.0   # sample period; 5.0 = 200 MSPS (single-edge),
+              #                2.5 = 400 MSPS (IDDR dual-edge). Set via --sample-ns.
 
 
 def edges(bits):
@@ -72,7 +73,13 @@ def main():
     ap.add_argument("cap")
     ap.add_argument("--limit", type=int, default=0,
                     help="only look at first N samples (0=all)")
+    ap.add_argument("--sample-ns", type=float, default=5.0,
+                    help="sample period in ns: 5.0=200MSPS single-edge, "
+                         "2.5=400MSPS IDDR dual-edge")
     a = ap.parse_args()
+
+    global SR_NS
+    SR_NS = a.sample_ns
 
     raw = open(a.cap, "rb").read()
     if a.limit:

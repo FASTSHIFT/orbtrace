@@ -26,6 +26,9 @@
 module la_ddr_writer #(
     parameter integer LENGTH     = 64,          // 128-bit words per DDR3 burst
                                                 // (must match ddr3_wr_ctrl)
+    parameter integer IN_BYTES   = 1,           // bytes accepted per cap_clk:
+                                                // 1 = single-edge 200 MSPS,
+                                                // 2 = IDDR dual-edge 400 MSPS
     parameter [28:0]  RING_BASE  = 29'd0,       // ring start (app word address)
     parameter [28:0]  RING_WORDS = 29'd0100000  // ring size in 128-bit words
                                                 // (0x100000 = 1M words = 16MB)
@@ -33,7 +36,8 @@ module la_ddr_writer #(
     // ---- capture-source side (TRACECLK domain) ----
     input  wire        cap_clk,
     input  wire        cap_rst,
-    input  wire [7:0]  cap_byte,
+    input  wire [IN_BYTES*8-1:0] cap_byte,      // IN_BYTES samples, byte 0 =
+                                                // OLDEST (goes to MS end first)
     input  wire        cap_valid_in,    // raw capture valid
     input  wire        freeze,          // when 1, stop accepting new bytes
                                         // (clk125-domain level; static ring for
@@ -76,26 +80,34 @@ module la_ddr_writer #(
     reg frz0=0, frz1=0;
     always @(posedge cap_clk) begin frz0<=freeze; frz1<=frz0; end
 
-    // cap-domain 16-byte packer (big-endian: first byte -> MS byte).
+    // cap-domain packer: shift IN_BYTES bytes/cycle into a 128-bit word,
+    // big-endian (oldest byte -> MS end first). Completes one word every
+    // 16/IN_BYTES cycles. cap_byte is laid out with byte 0 = oldest, so we
+    // append {cap_byte} at the LS end each cycle (matching the IN_BYTES=1
+    // v2 behaviour of {cap_word[119:0], cap_byte}).
+    localparam integer IN_BITS   = IN_BYTES*8;
+    localparam integer WORDS_PER = 16/IN_BYTES;         // cap cycles per word
     reg [127:0] cap_word = 0;
-    reg [3:0]   cap_bidx = 0;
+    reg [4:0]   cap_bidx = 0;      // counts 0..WORDS_PER-1
     reg         cap_word_valid = 0;   // 1-cycle strobe when a word completes
+    // combinational "shift-in this cycle's bytes" result
+    wire [127:0] cap_word_next = {cap_word[127-IN_BITS:0], cap_byte};
     always @(posedge cap_clk) begin
         cap_word_valid <= 1'b0;
         if (cap_rst) begin
             cap_bidx <= 0; cap_word <= 0;
         end else if (cap_valid_in & ~frz1) begin
-            cap_word <= {cap_word[119:0], cap_byte};
-            if (cap_bidx == 4'd15) begin
+            cap_word <= cap_word_next;
+            if (cap_bidx == WORDS_PER-1) begin
                 cap_bidx <= 0;
-                cap_word_valid <= 1'b1;   // this cycle's {cap_word[119:0],cap_byte} is complete
+                cap_word_valid <= 1'b1;   // cap_word_next is a complete word
             end else begin
                 cap_bidx <= cap_bidx + 1'b1;
             end
         end
     end
     // the completed word value (combinational, valid when cap_word_valid=1)
-    wire [127:0] cap_word_full = {cap_word[119:0], cap_byte};
+    wire [127:0] cap_word_full = cap_word_next;
 
     wire        fifo_s_ready;
     wire [127:0]fifo_out_data;
