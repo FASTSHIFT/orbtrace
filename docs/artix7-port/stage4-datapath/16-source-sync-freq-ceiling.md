@@ -150,3 +150,38 @@ IDDR raw 抓 → `opencsd_etm4_run.py`（OpenCSD trc_pkt_lister）解码。
 
 **可复现资产**：`perf/firmware/{etmtest,tclk12}/`（自编译，ELF 匹配 flash），
 `/tmp/etm12.bin`（12M 真 ETM raw，raw 直接 deframe：36 FSYNC / 20218 ETM 字节）。
+
+## 更新：真 ETM 端到端跑通（BB=1，解出真实 func_test PC）
+
+### 先证 CPU 真在跑 func_test（排除"程序没起来"）
+
+DAPLink 多次 halt 采 PC：0x08000442→444→4d0→4ec→504，全部精确命中 func_test
+用户函数（level_b / dispatch_callback / callback_test / factorial）。**CPU 正常
+执行 func_test**，ETM trace 的是真实执行流。附带发现：func_test 代码极紧凑
+（0x08000414-0x08000578，160 字节），几乎全是短距离直接调用/分支。
+
+### 关键：BB（Branch Broadcast）决定能否解码
+
+- **BB=0**（低 TRACECLK 默认）：直接分支不发地址包，紧凑代码下地址锚点极稀疏，
+  OpenCSD 无法定位 → unique PC=0（之前一直卡这）。
+- **BB=1**（每分支发地址）：地址锚点大增，**端到端跑通**：
+  - deframed 27206 B, A-sync=9, INSTR_RANGE=3, **unique PC=6, 6/6 落 flash(100%)**
+  - **解出真实函数**：`factorial`（func_test 用户函数）、HAL_RCC_OscConfig
+  - Idx:7599 `exec range=0x8000512:[0x8000516] ISA=T32 iBR ret` = factorial 递归
+    返回的真实 Thumb 指令流 —— **内容真实且正确**。
+
+**这是整条链第一次端到端跑通**：源同步 IDDR 采集 → IDDR raw → TPIU deframe →
+OpenCSD → 真实落 flash 的 PC + 命中 func_test 函数。之前的 0 PC 不是链路坏，是
+BB=0 锚点太稀疏。
+
+### 仍存在的限制（诚实）
+
+- 解码率低（6 PC / 2 函数，远非全覆盖）：那个字节滑移（A-sync 后 0x80/0x01 时多
+  时少一字节，trace-info-after 仍 0）仍在拖累，且偶有误解码（如 ISA=A32，M7 上
+  不存在 → 假范围）。
+- 根因仍是 PC 端 `tpiu_deframe_walk` 在高 HSYNC 密度流（30%）上的帧对齐滑移，
+  或 IDDR raw 导出 CDC 的偶发字节滑移 —— 需进一步用 orbuculum 官方 tpiuDecoder
+  对照区分。
+
+**结论**：真 ETM 端到端**已跑通并解出真实 PC**（推翻"没跑通"），但解码率受字节滑移
+限制。这是 PC 端解码链的完善问题，不是采集/SI/频率问题。
