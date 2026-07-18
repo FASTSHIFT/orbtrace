@@ -477,3 +477,43 @@ FIFO 版抓真 ETM 出现两个症状，host 端变换都是碰运气（已放�
 
 **净结论**：解耦证明 CDC 修复是好的（连续流零丢失）；剩一个确定性的半 nibble 字节
 对齐要在 RTL 修，且真 ETM 复测应在与旧版同频（12M）下做公平对照。
+
+
+## 转向复用上游方案：traceIF 帧路径（用户建议：能复用上游的就用上游）
+
+### 上游 orbtrace trace pipeline 复用盘点
+
+| 环节（上游 Amaranth） | 作用 | 我们的状态 |
+|---|---|---|
+| TraceIF (`glue.py`) | 双沿采→组16B帧+锁sync+滤HSYNC | ✅ 复用 orbuculum `verilog/traceIF.v` |
+| IDDR 输入采样 | DDR 双沿采引脚 | ⚠️ 自造（ECP5→Artix 器件不同，必须重写）|
+| **AsyncFIFO 跨域（传帧）** | trace→sys CDC，格雷码原子传帧 | ❌ **自造且造错**（裸总线字节撕裂）→ 这是 2.5% 根源 |
+| TPIUSync (`tpiu.py`) | 锁 sync + 字节对齐 | ⚠️ 已导出 `syn/artix7/tpiu_sync.v` 但闲置（traceIF 已含此功能）|
+| TPIUDemux (`tpiu.py`) | 拆 stream-ID 提 ETM | ⚠️ 已导出 `syn/artix7/tpiu_demux.v` 但闲置；host 重实现 |
+| ChecksumAppender/COBS/SuperFramer | OrbFlow 封装 | ⚠️ 已导出 Verilog 但闲置 |
+| USB 传输 | | ❌ 换以太网（板无 USB PHY）|
+| OpenCSD/orbmortem 解码 | | ✅ 复用 |
+
+**关键教训**：`export_trace_modules.py` 早已把上游 TPIUSync/Demux/Checksum/COBS/
+SuperFramer 转成 Verilog 放在 `syn/artix7/*.v`，但板载 bringup 走了"CAP_RAW=1 抓裸
+字节 + host 手工对齐"，把上游在 FPGA 里已解决的 CDC 原子性 / 字节对齐 / sync 锁定
+**在 host 端全重踩了一遍**——包括那个 2.5% CDC 撕裂和半 nibble 偏移。
+
+### traceIF 帧路径实测（CAP_RAW=0，上游原生并口路径）
+
+编 `CAP_METHOD=IDDR CAP_RAW=0` bit：`trace_capture_a7(IDDR) → traceIF.v(组帧) →
+BRAM 存 128-bit 整帧`。烧后（BRAM 清空重填实时 ETM）抓真 ETM：
+- **202 个不同字节值、高熵 ETMv4 包，0xff 不再主导**——**traceIF 在 FPGA 侧就把
+  HSYNC/半sync 滤掉了**（CAP_RAW=1 满屏 0xff 的问题消失）。这正是上游方案的价值。
+- 帧作为 128-bit 原子单元存取 → **无字节撕裂、无半 nibble 偏移**（帧边界在 trace 域
+  traceIF 内锁定）。
+- host demux 出 stream 2 高熵 ETM 字节；A-sync 目前 0（swap16 字节序下 3 个）——
+  **只差 traceIF 帧字节序与 host `_decode_frame16` 的精确对齐**（traceIF 有
+  `{packet[7:0],packet[15:8]}` 交换 + 帧内 elemCount 布局，需与 demux 对齐）。
+
+### 净结论
+
+放弃自造的 CAP_RAW=1 字节级 CDC 路径，改用上游 traceIF 帧路径：CDC 撕裂、HSYNC
+淹没、半 nibble 偏移三个坑**一次性消除**（都在 traceIF 帧原子化里解决）。剩唯一收尾：
+对齐 traceIF 帧字节序 ↔ host demux（或直接接现成 `tpiu_demux.v` 到 FPGA 里，让 host
+只收纯 ETM）。这才是"用成熟方案"的正道。
