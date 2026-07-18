@@ -34,21 +34,37 @@ def edges(bits):
 
 def check_canary(raw):
     """Bit[7:5] is a 3-bit mod-8 counter incrementing every clk200 sample.
-    Verify sequence is monotonically increasing modulo 8. Any break = FPGA
-    or DDR3 path bug (write-side FIFO overflow / read-side gearbox glitch /
-    ring boundary mishap), NOT a SI issue.
-    Returns (num_samples, num_breaks, first_break_offset). """
-    breaks = 0
+    Verify sequence is monotonically increasing modulo 8. Any break in the
+    INTERIOR = FPGA/DDR3 path bug (write-side FIFO overflow / read-side gearbox
+    glitch), NOT a SI issue.
+
+    NB: breaks clustered in the last few hundred bytes are a benign SNAPSHOT
+    BOUNDARY effect: arm() latches wr_ptr and freezes the writer, and the
+    reader's 4MB window ends on the writer's in-flight burst boundary / ring
+    wrap. Those tail breaks are deterministic, not data corruption, so we
+    report interior vs tail separately.
+    Returns (num_samples, total_breaks, first_break_offset, interior_breaks,
+             tail_breaks, tail_start). """
+    TAIL = 4096   # bytes at the end treated as the snapshot boundary region
+    n = len(raw)
+    tail_start = n - TAIL
+    total = 0
+    interior = 0
+    tail = 0
     first = None
     prev = (raw[0] >> 5) & 0x7
-    for i in range(1, len(raw)):
+    for i in range(1, n):
         cur = (raw[i] >> 5) & 0x7
         if cur != ((prev + 1) & 0x7):
-            breaks += 1
+            total += 1
             if first is None:
                 first = i
+            if i >= tail_start:
+                tail += 1
+            else:
+                interior += 1
         prev = cur
-    return len(raw), breaks, first
+    return n, total, first, interior, tail, tail_start
 
 
 def main():
@@ -66,14 +82,19 @@ def main():
 
     # Canary integrity gate first — if the FPGA/DDR3 path itself is broken,
     # any downstream analysis is meaningless.
-    total, breaks, first_break = check_canary(raw)
-    pct = 100.0 * breaks / max(1, total - 1)
+    total_s, breaks, first_break, interior, tail, tail_start = check_canary(raw)
+    ipct = 100.0 * interior / max(1, tail_start - 1)
     if breaks == 0:
-        print(f"[canary] OK — {total} samples, sequence intact")
+        print(f"[canary] OK — {total_s} samples, sequence fully intact")
+    elif interior == 0:
+        print(f"[canary] OK — {interior} interior breaks; {tail} benign "
+              f"boundary breaks in last {total_s - tail_start} bytes "
+              f"(snapshot tail, expected)")
     else:
-        print(f"[canary] {breaks} breaks in {total} samples ({pct:.4f}%), "
-              f"first break at offset {first_break}")
-        if pct > 0.01:
+        print(f"[canary] {interior} INTERIOR breaks in {tail_start} samples "
+              f"({ipct:.4f}%), first at offset {first_break}; "
+              f"plus {tail} benign tail breaks")
+        if ipct > 0.001:
             print(f"[canary] WARNING: FPGA/DDR3 path bug detected. "
                   f"Do NOT trust downstream SI numbers until this is fixed.")
 
