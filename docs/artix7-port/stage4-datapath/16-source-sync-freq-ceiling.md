@@ -438,11 +438,42 @@ fall/rise 对称**。
 （CDC 在 IDELAY 下游）、随机每次不同（异步交接相位随机）、0x5/0xa OR 叠加（撕裂签名）、
 跨场景顽固（只要用这 CDC 就有）。
 
-### 遗留：FIFO 版真 ETM 出现 nibble-顺序偏移（标定中）
+### 遗留：FIFO 版真 ETM 有字节对齐 + 数据完整性问题（未解，需系统排查）
 
-FIFO 版抓真 ETM，raw 的 HSYNC 从 `ff 7f` 变成 `f7 ff`——**字节 nibble 顺序相对旧版
-变了**（FIFO 的 valid/data 对齐与旧 toggle-CDC 的多级延迟不同）。walking 对称看不出，
-但真 ETM 的 TPIU 结构暴露了。host 端 nibble-swap 是错解（凑出假 FSYNC）。正解：用
-**不对称已知图案（CURTPM F0/00 → 字节 0x0F 或 0xF0）标定正确 nibble 顺序**，在 RTL 里
-把 `{iddr_b,iddr_a}` 打包顺序改对，重编译。walking 完美已证 FIFO 本身零错，只差这个
-确定性的字节对齐。
+FIFO 版抓真 ETM 出现两个症状，host 端变换都是碰运气（已放弃）：
+- HSYNC 从旧版的 `ff 7f`(60个) 变成 `f7 ff`(17409个)——既有**半 nibble 边界偏移**，
+  又有**数量暴增 290×**。
+- F0/00 标定：FIFO 版字节 = 纯 `0x0F`（干净单值，说明采样本身没坏）。
+- 直接解 / nibble-swap / nibble-offset 重组 都解不出真 ETM（要么 0 FSYNC，要么凑出
+  假 FSYNC 但帧内是垃圾）。
+
+**关键矛盾**：同一 firmware 同样 ETM 流，HSYNC 密度不该比旧版差 290×。这指向 FIFO 版
+可能**丢了大量真实 ETM 突发数据、只剩 HSYNC 填充**——walking（连续恒定速率）完美，
+但 ETM（突发 + STALL）可能触发了 FIFO write 端的问题（`tclk_push` 从首拍即 =1 推入复位
+首字节造成偏移；或突发时序）。
+
+**诚实状态**：CDC 换 async FIFO 让 walking 从 2.5% 随机降到 0.0000%（根因坐实、修复
+确凿）；但 FIFO 版对真实 ETM 突发流的字节对齐 + 完整性尚未跑通，需要系统排查 write
+端 push 时序，不能靠 host 变换硬凑。这是明确的下一步 RTL 工作，不是又一个猜测。
+
+### 用已知字节流解耦（用户建议：先和 ETM 解耦，缩短链条）
+
+同时改 CDC + 跳真 ETM 是两个变量纠缠。用 CURTPM 已知连续图案把链条缩到
+`CURTPM → FIFO CDC → raw`，逐一排查：
+
+1. **FIFO CDC 不丢连续数据**（决定性）：48M walking（与真 ETM 同频）walk_score =
+   rotation break 2/122880 = 0.002%（边界瞬态）。100M walking = 0.0000%。**连续
+   已知流下 FIFO 一个字节都不丢** → 290× HSYNC 暴增 **不是** CDC 丢数据造成的。
+
+2. **290× HSYNC 暴增 = 频率导致的填充，不是 bug**：旧版 12M ETM data-ish 87.1%
+   (0xff=179)；FIFO 版 48M data-ish 27.9%(0xff=26855)。M7 产生的 ETM 数据率不变，
+   TRACECLK 从 12M 提到 48M（快 4×），单位捕获里 TPIU 的 HSYNC 填充自然多几倍。
+   两次是不同频率的会话，非同类比较 → HSYNC 差异**大部分是频率的正常结果**。
+
+3. **仍存在的真问题 = 半 nibble 字节偏移**：FIFO 版 HSYNC 是 `f7 ff`，旧版是
+   `ff 7f`——差半个 nibble，导致 `has_tpiu_sync=False`。这是 FIFO 与旧 toggle-CDC 的
+   确定性字节相位差，walking 对称看不出，真 ETM 的 TPIU 帧暴露。**这个必须 RTL 修**
+   （调 `{iddr_b,iddr_a}` 配对/顺序），host 端变换是碰运气（已放弃）。
+
+**净结论**：解耦证明 CDC 修复是好的（连续流零丢失）；剩一个确定性的半 nibble 字节
+对齐要在 RTL 修，且真 ETM 复测应在与旧版同频（12M）下做公平对照。
