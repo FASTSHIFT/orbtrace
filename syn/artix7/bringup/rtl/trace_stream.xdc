@@ -17,8 +17,11 @@ set_property PACKAGE_PIN D14 [get_ports {trace_data_in[2]}]
 set_property PACKAGE_PIN E16 [get_ports {trace_data_in[3]}]
 set_property IOSTANDARD LVCMOS33 [get_ports trace_clk_in]
 set_property IOSTANDARD LVCMOS33 [get_ports {trace_data_in[*]}]
-# STM32 TPIU /16 prescale -> trace_clk is low; 10ns period is a safe upper bound
-create_clock -period 10.000 -name trace_clk_in [get_ports trace_clk_in]
+# TRACECLK from H743 CURTPM/ETM. Measured ~66.67 MHz (15 ns) with the current
+# PLL1 DIVR1 setting; 12 ns (83 MHz) here keeps a margin so STA covers a bit
+# faster without being so tight it flags the slow real clock. For the IDDR
+# source-synchronous path this period also drives the data-vs-clock window.
+create_clock -period 12.000 -name trace_clk_in [get_ports trace_clk_in]
 # trace_clk_in (D17) feeds a BUFIO/BUFR (BUFR_IO mode in trace_capture_a7).
 # D17 is not in the BUFR's clock region for all placements; allow the
 # dedicated-route demotion (trace_clk is slow /16, so the sub-optimal route

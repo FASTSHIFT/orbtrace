@@ -69,11 +69,15 @@ set selftest 0
 if {[info exists ::env(SELFTEST)]} { set selftest $::env(SELFTEST) }
 set twidth 4
 if {[info exists ::env(TRACE_WIDTH)]} { set twidth $::env(TRACE_WIDTH) }
-puts "============ TAP = $tap  CAP_RAW = $capraw  EYE = $eye  SELFTEST = $selftest  TRACE_WIDTH = $twidth ============"
-synth_design -top trace_stream_top -part $part -generic TAP=$tap -generic CAP_RAW=$capraw -generic EYE=$eye -generic SELFTEST=$selftest -generic TRACE_WIDTH=$twidth
+set capmethod "OVERSAMPLE"
+if {[info exists ::env(CAP_METHOD)]} { set capmethod $::env(CAP_METHOD) }
+puts "============ TAP = $tap  CAP_RAW = $capraw  EYE = $eye  SELFTEST = $selftest  TRACE_WIDTH = $twidth  CAP_METHOD = $capmethod ============"
+synth_design -top trace_stream_top -part $part -generic TAP=$tap -generic CAP_RAW=$capraw -generic EYE=$eye -generic SELFTEST=$selftest -generic TRACE_WIDTH=$twidth -generic CAP_METHOD=$capmethod
 opt_design
 place_design
 route_design
 report_timing_summary -no_detailed_paths -no_header
-write_bitstream -force trace_stream.bit
-puts "============ TRACE STREAM BUILD DONE (tap=$tap) ============"
+set outbit "trace_stream.bit"
+if {[info exists ::env(OUTBIT)]} { set outbit $::env(OUTBIT) }
+write_bitstream -force $outbit
+puts "============ TRACE STREAM BUILD DONE (tap=$tap method=$capmethod) -> $outbit ============"

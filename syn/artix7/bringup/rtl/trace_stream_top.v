@@ -18,7 +18,11 @@
 `default_nettype none
 
 module trace_stream_top #(
-    parameter [4:0] TAP   = 5'd28,    // V2 eye centre
+    parameter       CAP_METHOD = "OVERSAMPLE", // "OVERSAMPLE" (low-freq, edge+
+                                      // eye) or "IDDR" (high-freq source-sync,
+                                      // TRACECLK drives IDDR; per-lane IDELAY
+                                      // deskew tap swept at runtime via CSR).
+    parameter [4:0] TAP   = 5'd28,    // V2 eye centre / IDDR default deskew tap
     parameter       DEPTH = 61440,    // captured bytes (60 KB = 3840 frames);
                                       // keep < 65536 so 16-bit ext_addr also
                                       // reaches the status bytes at DEPTH..+2
@@ -155,11 +159,13 @@ module trace_stream_top #(
         end
     end
 
-    trace_capture_a7 #(.CLK_BUF("BUFR_IO"), .EYE_DELAY(EYE)) u_capture (
+    trace_capture_a7 #(.CLK_BUF("BUFR_IO"), .CAP_METHOD(CAP_METHOD),
+                       .EYE_DELAY(EYE)) u_capture (
         .rst(sys_rst), .ref_200m(clk200),
         .trace_clk_p(trace_clk_in), .trace_data_p(trace_data_in),
-        .tap_data0(TAP), .tap_data1(TAP), .tap_data2(TAP), .tap_data3(TAP),
-        .tap_load(tap_load),
+        .tap_data0(tap_200), .tap_data1(tap_200),
+        .tap_data2(tap_200), .tap_data3(tap_200),
+        .tap_load(tap_load | tap_load_200),
         .test_en(SELFTEST[0]), .test_clk(st_clk), .test_data(st_data),
         .eye_delay_rt(eye_rt),
         .cap_clear(cap_rearm),
@@ -204,15 +210,38 @@ module trace_stream_top #(
     wire       csr_we_w;
     reg  [7:0] eye_csr = 8'd0;          // 0 => use EYE parameter default
     reg        rearm_125 = 1'b0;        // 1-cycle pulse in clk125 domain
+    // Runtime per-lane IDELAY tap (IDDR high-freq deskew). Default = TAP param;
+    // CSR 0x05 sets it, and any write pulses tap_load_125 so the new tap loads
+    // without a reflash -> the host can sweep taps to find the data eye centre
+    // against the known CURTPM pattern.
+    reg  [4:0] tap_csr = TAP;
+    reg        tap_load_125 = 1'b0;
     always @(posedge clk125) begin
         rearm_125 <= 1'b0;
+        tap_load_125 <= 1'b0;
         if (sys_rst) begin
             eye_csr <= 8'd0;
+            tap_csr <= TAP;
         end else if (csr_we_w) begin
             if (csr_addr_w == 8'h01) eye_csr <= csr_data_w;
             if (csr_addr_w == 8'h02) rearm_125 <= 1'b1;
+            if (csr_addr_w == 8'h05) begin
+                tap_csr      <= csr_data_w[4:0];
+                tap_load_125 <= 1'b1;
+            end
         end
     end
+    // CDC the tap value + load pulse into clk200 (IDELAY C domain).
+    reg [4:0] tap_s0 = TAP, tap_200 = TAP;
+    reg       tapld_tgl125 = 1'b0;
+    always @(posedge clk125) if (tap_load_125) tapld_tgl125 <= ~tapld_tgl125;
+    reg [2:0] tapld_sync200 = 3'b0;
+    always @(posedge clk200) begin
+        tap_s0  <= tap_csr;
+        tap_200 <= tap_s0;
+        tapld_sync200 <= {tapld_sync200[1:0], tapld_tgl125};
+    end
+    wire tap_load_200 = tapld_sync200[2] ^ tapld_sync200[1];
 
     // eye_csr is quasi-static (set between captures) — sample it into the
     // clk200 domain with a 2-FF sync for clean use by trace_capture_a7.

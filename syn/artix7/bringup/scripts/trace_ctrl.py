@@ -21,6 +21,7 @@ REG_EYE = 0x01
 REG_REARM = 0x02
 REG_BITLEN_LO = 0x03
 REG_BITLEN_HI = 0x04
+REG_TAP = 0x05     # IDDR per-lane IDELAY deskew tap (0..31); write also loads it
 
 
 def write_csr(ip, addr, value, timeout=1.0):
@@ -45,6 +46,9 @@ def main():
     pb = sub.add_parser("set-bitlen",
                         help="SWO NRZ bit length in ref_200m cycles (=200e6/baud)")
     pb.add_argument("value", type=int)
+    pt = sub.add_parser("set-tap",
+                        help="IDDR IDELAY deskew tap 0..31 (loads immediately)")
+    pt.add_argument("value", type=int)
     sub.add_parser("rearm")
     a = ap.parse_args()
 
@@ -55,6 +59,9 @@ def main():
         write_csr(a.ip, REG_BITLEN_LO, a.value & 0xFF)
         write_csr(a.ip, REG_BITLEN_HI, (a.value >> 8) & 0xFF)
         print(f"set SWO bitlen = {a.value} ref cycles (~{200e6/a.value/1e6:.3f} Mbaud)")
+    elif a.cmd == "set-tap":
+        write_csr(a.ip, REG_TAP, a.value & 0x1F)
+        print(f"set IDELAY tap = {a.value & 0x1F}")
     elif a.cmd == "rearm":
         write_csr(a.ip, REG_REARM, 1)
         print("soft re-arm pulsed")

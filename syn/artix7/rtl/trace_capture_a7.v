@@ -442,6 +442,7 @@ module trace_capture_a7 #(
         // this samples on the data transition (doc 14 §21 regression). Kept
         // for reference and for centre-aligned parts.
         // ----------------------------------------------------------------
+        wire [3:0] iddr_a, iddr_b;
         genvar j;
         for (j = 0; j < 4; j = j + 1) begin : g_iddr_lane
             IDDR #(
@@ -450,8 +451,8 @@ module trace_capture_a7 #(
                 .INIT_Q2      (1'b0),
                 .SRTYPE       ("ASYNC")
             ) u_iddr (
-                .Q1 (trace_a[j]),  // rising-edge sample
-                .Q2 (trace_b[j]),  // falling-edge sample
+                .Q1 (iddr_a[j]),  // rising-edge sample
+                .Q2 (iddr_b[j]),  // falling-edge sample
                 .C  (trace_clk_io), // BUFIO (BUFR_IO) or BUFG net
                 .CE (1'b1),
                 .D  (data_dly[j]),
@@ -459,9 +460,37 @@ module trace_capture_a7 #(
                 .S  (1'b0)
             );
         end
-        // IDDR mode has no glitch-free ref-domain capture path.
-        assign cap_byte  = 8'b0;
-        assign cap_valid = 1'b0;
+        assign trace_a = iddr_a;
+        assign trace_b = iddr_b;
+
+        // ---- gap-tolerant raw-byte export for CAP_RAW (high-freq path) ----
+        // Register the IDDR outputs into the fabric trace_clk (BUFR) domain and
+        // form one byte {falling, rising} per TRACECLK period. Because the
+        // WRITE side is clocked by trace_clk itself, a STOPPED TRACECLK simply
+        // produces no new bytes (and no garbage) -- exactly what we want for an
+        // ETM whose clock gates on/off (e.g. with trace filtering). No PLL/MMCM
+        // to lose lock; a BUFIO/BUFR has zero re-lock time, so capture resumes
+        // on the very first edge after a gap.
+        reg [7:0] tclk_byte = 8'b0;
+        reg       tclk_tgl  = 1'b0;   // toggles once per captured byte
+        always @(posedge trace_clk) begin
+            tclk_byte <= {iddr_b, iddr_a};   // big-endian: falling nibble MS
+            tclk_tgl  <= ~tclk_tgl;
+        end
+        // CDC the toggle into ref_200m and edge-detect -> one clk200 pulse per
+        // TRACECLK byte. Safe as long as TRACECLK < ref_200m (66M < 200M): at
+        // most one new byte per ~3 ref cycles, so no toggle is missed. The byte
+        // itself is captured a couple ref cycles after its toggle, long settled.
+        reg [2:0] tgl_sync = 3'b0;
+        reg [7:0] byte_s0 = 8'b0, byte_s1 = 8'b0;
+        always @(posedge ref_200m) begin
+            tgl_sync <= {tgl_sync[1:0], tclk_tgl};
+            byte_s0  <= tclk_byte;
+            byte_s1  <= byte_s0;
+        end
+        assign cap_valid = tgl_sync[2] ^ tgl_sync[1];
+        assign cap_byte  = byte_s1;
+
         // IDDR mode does not measure duty; hold the stats at 0.
         always @(posedge ref_200m) begin
             duty_hi_min <= 0; duty_hi_max <= 0; duty_lo_min <= 0;
