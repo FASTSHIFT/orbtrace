@@ -965,3 +965,48 @@ H743 TRACECLK 到并口间还有约 /2 分频，我对 pll1_r_ck→TRACECLK 关�
   ETM 密集流下逐指令干净，与 walking 到 200M 的字节干净结论一致、互相印证。
 - 运维教训：FPGA 采集前端偶发状态坏（抓全 0），重烧 `trace_iddr_fifocdc.bit` 即恢复；
   DAPLink 崩溃后调试口 stalled 需 `connect_assert_srst`（RST 已接）或断电恢复。
+
+
+## ✅ -O0 + 逐指令顺序核对：14/14 func_test，解码执行流逐条匹配源码调用图
+
+用户要求"确保指令流顺序和代码对得上，再提频"。改 `-O0`（时钟修对后 -O0 不再崩）并写
+`decode/verify_order.py` 做**逐条顺序核对**（非集合覆盖虚荣指标，红方 r25 要求）。
+
+### 为何 -O0：找回被优化消除的调用
+
+`-Og`（即使 `-fno-inline`）仍做 DCE + 常量折叠，把 `conditional(1/2)`、`repeat_test`、
+`pingpong`（常量参数 + 返回值只喂 volatile）整个消除——objdump 证实 main_loop 里根本
+没有对它们的 BL。所以之前"13/14 缺 conditional"不是采集/解码缺陷，是**编译器没生成这些
+调用**。`-O0` 不做 DCE/折叠，14 个函数全部保留为真实 BL/BLX。
+
+### 结果（-O0，真 ETM，FPGA timebase 实测 46.9MHz）
+
+| 指标 | 值 |
+|------|-----|
+| deframed ETM | 32758 B（fsync=35）|
+| A-sync / trace-info-after | 32 / 22 |
+| unique PC | 349，**100% 落 flash** |
+| **func_test 覆盖** | **14/14**（conditional 回来了，24 次）|
+| INSTR_RANGE | 10095 |
+| **RESERVED+BAD_SEQ（采集字节错）** | **0（0.000%）** |
+| NOT_SYNC（重锁开销）| 39 |
+
+### 逐指令顺序核对：PASS
+
+`verify_order.py` 从解码的 INSTR_RANGE 序列提取函数 visit 序，对一整轮 main_loop 的 33 个
+预期调用做**有序子序列匹配**：**全部 33 个调用按代码调用图顺序出现**（visits[0..96]）。
+实测序列逐条对上源码：
+- `level_a→level_b→level_c→leaf_mul→level_c→level_b→leaf_add→...→level_a`：直接调用链
+  A→B→C 及返回展开逐条对
+- `indirect_caller→op_add / op_sub / op_mul`：3 次间接调用目标顺序精确
+- `callback_test→dispatch_callback→cb_handler_a → cb_handler_b → cb_handler_a`：回调 a/b/a 精确
+- `deep1→2→3→4→5→6→5→4→3→2→1`：6 层嵌套进入+返回**对称展开完整**
+- `repeat_test→pingpong→leaf_add`（×5）：重复调用逐次对
+- `factorial` 递归、`mixed_test` 内调用树均对
+
+### 结论：顺序正确，可以提频
+
+解码出的执行流**逐条匹配源码静态调用图的顺序**（含递归返回、深层嵌套对称进出、间接调用
+具体目标），不是集合覆盖。采集层字节错 0.000%。**基础频率下顺序完全正确**，满足"提频前先
+确保顺序无误"的前置条件。下一步：抬高 PLL 让 timebase 实测频率上到 66M+/100M+，复测逐指令
+顺序 + 采集字节错是否保持。
