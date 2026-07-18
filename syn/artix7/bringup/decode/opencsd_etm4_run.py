@@ -249,6 +249,12 @@ def main():
     ap.add_argument("elf")
     ap.add_argument("--period-ns", type=float, default=20.0,
                     help="TRACECLK period (50MHz=20)")
+    ap.add_argument("--deframer", choices=("official", "walk"),
+                    default="official",
+                    help="TPIU deframer: official (orbuculum port, default) or "
+                         "walk (legacy home-grown)")
+    ap.add_argument("--stream", type=int, default=2,
+                    help="TPIU stream/tag to extract (ETM=2)")
     ap.add_argument("--keep", type=str, default=None,
                     help="keep the OpenCSD snapshot dir (and etm.bin) here")
     ap.add_argument("--dump-lister", type=str, default=None,
@@ -267,9 +273,23 @@ def main():
     #       when has_tpiu_sync returns false on the raw bytes but true on the
     #       parity=1 assembled bytes.
     if L.has_tpiu_sync(raw):
-        print("[2] TPIU-framed byte stream (from FPGA-side traceIF)")
-        etm = L.tpiu_deframe_walk(raw)
-        print(f"[3] deframed ETM: {len(etm)} bytes")
+        if a.deframer == "official":
+            # Faithful port of orbuculum Src/tpiuDecoder.c: 16-bit-aligned
+            # HSYNC filtering + padding/stream handling. Our home-grown
+            # tpiu_deframe_walk scans HSYNC byte-by-byte and mis-aligns when
+            # HSYNC lands on an odd offset -- fatal at this stream's ~30% HSYNC
+            # density (A-sync trace-info-after: walk=0 vs official=57; decoded
+            # PCs: walk=6 vs official=781). Default to official.
+            import tpiu_official as T
+            print("[2] TPIU-framed; official (orbuculum) deframer, stream=%d"
+                  % a.stream)
+            etm, st = T.deframe(raw, want_stream=a.stream)
+            print(f"[3] deframed ETM: {len(etm)} bytes "
+                  f"(frames={st['packets']} fsync={st['syncs']})")
+        else:
+            print("[2] TPIU-framed byte stream; legacy tpiu_deframe_walk")
+            etm = L.tpiu_deframe_walk(raw)
+            print(f"[3] deframed ETM: {len(etm)} bytes")
     else:
         # Try the legacy 2-byte-per-period nibble path.
         score, parity, order, data, fl, v4a = recover_assemble(raw)

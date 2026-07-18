@@ -185,3 +185,42 @@ BB=0 锚点太稀疏。
 
 **结论**：真 ETM 端到端**已跑通并解出真实 PC**（推翻"没跑通"），但解码率受字节滑移
 限制。这是 PC 端解码链的完善问题，不是采集/SI/频率问题。
+
+## 真 ETM 彻底跑通：官方 TPIU deframer 修好 → 781 PC / 13-14 func_test 函数
+
+低解码率的根因找到了：**我们自写的 Python `tpiu_deframe_walk` 逐字节扫 HSYNC
+(0xFF 0x7F)，在本流 ~30% HSYNC 密度下、当 HSYNC 落在奇字节偏移时会丢 16-bit 帧
+相位**。对比 orbuculum 官方 `Src/tpiuDecoder.c`：它按 **16-bit 对（got_lowbits）**
+收集字节、只在对边界过滤 HSYNC，永不丢帧相位；并正确处理 padding(stream 0 丢弃)
+和 delayed-stream-change。
+
+把官方逻辑忠实移植为 `decode/tpiu_official.py`，同一份 BB=1 抓样：
+
+| 指标 | 自写 walk | **官方移植** |
+|------|----------:|-------------:|
+| A-sync | 9 | **72** |
+| trace-info-after(0x01) | 0 | **57** |
+| unique PC | 6 | **781** |
+| PC 落 flash | 6/6 | **781/781 (100%)** |
+| 覆盖函数 | 2 | **46** |
+| func_test 用户函数 | 1/14 | **13/14**（仅缺 conditional）|
+
+**真 ETM 端到端彻底跑通**：STM32 源同步采集 → IDDR raw → 官方 TPIU deframe →
+OpenCSD → 重建真实 func_test 执行流（main_loop/callback_test/indirect_caller/
+mixed_test/factorial... 13/14）。缺的 conditional 很可能只是该 trace 窗口未执行到。
+
+已把官方 deframer 接入 `opencsd_etm4_run.py`（`--deframer official` 默认），从 raw
+一步出 781 PC。
+
+### 最终定位（全链诚实结论）
+
+真 ETM 解码失败的根因**从来不是 FPGA 采集 / SI / 频率**，逐层证明：
+1. CPU 确在跑 func_test（DAPLink PC 采样命中用户函数）
+2. 采集/SI/频率排除（12M=48M；raw 有 FSYNC；字节边界对；walking 证 SI 结构误差
+   与频率无关）
+3. BB=0 锚点饥饿（紧凑代码直接分支不发地址）→ BB=1 解决
+4. **PC 端 Python deframe 的 HSYNC 相位 bug** → 官方 16-bit 对齐移植解决
+
+采集侧结论不变：源同步 IDDR 物理带宽 ≥198MHz（AA/55），多-lane 有 ~2.5% 结构
+误差；而**真实 ETM 在 12MHz + BB=1 下已能重建 13/14 func_test 函数**。下一步可
+在更高 TRACECLK 下复测真 ETM 解码正确率，得到"有意义的采集上限"。
