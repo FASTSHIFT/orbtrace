@@ -101,3 +101,52 @@
 要测更高频率需重配 PLL1 输入分频 M / RGE 让 VCO 能上更高（>198MHz），或换更快
 的 PLL 源。但这属于"造更快的信号源"，不是"测采集上限"——采集侧已证明 198MHz
 仍游刃有余。真正要压 FPGA 采集极限，需要一个能发 >200MHz 干净 DDR 的信号源。
+
+## 终极判据：真 ETM + OpenCSD 解码（进行中）
+
+按红方建议上真 ETM 做无法自欺的验证。用 `build_h743.sh` 自编译 firmware（ELF
+与 flash 严格匹配，避免地址错配），`etm_enable_h743.cfg` 启 ETMv4 + 清 CURTPM，
+IDDR raw 抓 → `opencsd_etm4_run.py`（OpenCSD trc_pkt_lister）解码。
+
+### 现状（诚实）
+
+- **真 ETM 数据确实抓到**：201-224 个不同字节值，大量 TPIU HSYNC(0xFF/0x7F) +
+  高熵 ETMv4 包；assemble 后有 FSYNC(0xFFFFFF7F)（48M ~10 个，12M ~36 个）。
+- **解码器能起步**：锁到 A-sync，解出 I_ATOM_F1/F2/F3、I_ADDR_S_IS1、I_EXCEPT
+  等合法 ETMv4 包，48M 有 318 个 I_ADDR 包、12M 有 2724 个。
+- **但 unique PC = 0**：解出的地址被污染（如 0xF71D0472，高位是流里的高熵字节），
+  没有一个落在 flash（0x080xxxxx）。
+
+### 根因定位：字节/nibble 对齐滑移（不是 SI，不是频率）
+
+- **降频到 12MHz（SI 余量极大）表现和 48M 一样烂** → 排除高速 SI / bit 错为主因。
+- deframe 流里真 A-sync（11零+0x80）后**本该紧跟 Trace-Info(0x01)，实测中间隔着
+  一个 stray byte**（0xf7/0xf6/0xdb），且滑移不一致（有的缺 0x80、有的多字节）。
+  这正是 `opencsd_etm4_run.fix_async_alignment` 注释描述的"1 字节相位滑移"，但该
+  函数是死代码（主流程未调用）且模式匹配太窄，只能修 1 个。
+- **IDDR raw 字节边界其实是对的**（一度误判）：TPIU HSYNC 在 raw 里表现为
+  `ff 7f ff 7f...` 交替（这是 TPIU 半同步字的正常字节形态，不是连续 0xFF），
+  且 raw 直接 `has_tpiu_sync=True`、含 36 个 FSYNC(0xFFFFFF7F)。所以 **不该再做
+  nibble assemble**——`recover_assemble` 把已对的字节又拆 nibble 重组反而搞乱。
+  直接把 raw 当 TPIU 字节流 deframe 才对。
+- 但**直接 deframe 后 A-sync 仍不跟 0x01**（trace-info-after=0）。字节边界对了，
+  问题下沉到 **TPIU formatter 帧解析**（`tpiu_deframe_walk`）：16 字节帧的
+  stream-ID / aux-bit 交织提取有偏移，导致 deframe 后的 ETM 字节流错位。那 2 个
+  A-sync 很可能是数据里的巧合零串，非真同步点。
+
+### 结论与下一步
+
+真 ETM 端到端**尚未跑通**，但逐层排除后定位清楚：
+- 采集/SI/频率：**排除**（12M 与 48M 同样表现；raw 有 FSYNC；字节边界正确）
+- firmware/ELF 匹配：**已解决**（自编译，flash 与 ELF 严格一致）
+- **TPIU formatter deframe 错位**：`tpiu_deframe_walk` 对这个 16-字节帧流的
+  stream-ID/aux 提取有偏移，是当前唯一未通的环节。
+
+下一步（独立的解码链工程）：
+1. 核对 TPIU formatter 帧格式（IHI0029 §D4：16 字节 = 交织的数据字节 + 每偶字节
+   LSB 的 ID/data 标志 + 末字节 aux）与 `tpiu_deframe_walk` 实现，修正帧内提取偏移。
+2. deframe 正确后 A-sync 应自然紧跟 0x01，解码器落出 flash PC。
+3. 再谈"真 ETM 在多高 TRACECLK 下解码正确率达标"——那才是有意义的采集上限。
+
+**可复现资产**：`perf/firmware/{etmtest,tclk12}/`（自编译，ELF 匹配 flash），
+`/tmp/etm12.bin`（12M 真 ETM raw，raw 直接 deframe：36 FSYNC / 20218 ETM 字节）。
