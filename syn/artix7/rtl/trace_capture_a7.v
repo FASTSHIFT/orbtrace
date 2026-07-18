@@ -464,32 +464,54 @@ module trace_capture_a7 #(
         assign trace_b = iddr_b;
 
         // ---- gap-tolerant raw-byte export for CAP_RAW (high-freq path) ----
-        // Register the IDDR outputs into the fabric trace_clk (BUFR) domain and
-        // form one byte {falling, rising} per TRACECLK period. Because the
-        // WRITE side is clocked by trace_clk itself, a STOPPED TRACECLK simply
-        // produces no new bytes (and no garbage) -- exactly what we want for an
-        // ETM whose clock gates on/off (e.g. with trace filtering). No PLL/MMCM
-        // to lose lock; a BUFIO/BUFR has zero re-lock time, so capture resumes
-        // on the very first edge after a gap.
+        // v2 (r26 R4 fix): the byte crosses trace_clk -> ref_200m through a
+        // PROPER async FIFO (gray-code pointers) instead of the old bare-bus
+        // toggle CDC. The old design exposed the combinationally-updated 8-bit
+        // `tclk_byte` bus directly to a ref_200m sampler; with real per-bit
+        // routing skew, a ref sample landing in the launch window latched a MIX
+        // of period k and k+1 -> the 0x5=0x1|0x4 / 0xa=0x2|0x8 OR-tears. The
+        // FIFO's gray-coded pointer crossing makes the byte transfer ATOMIC:
+        // the reader only ever sees a fully-written entry, never a torn one.
+        //
+        // Gap tolerance preserved: the WRITE port is clocked by trace_clk, so a
+        // stopped TRACECLK simply stops pushing (no garbage). No PLL/MMCM lock
+        // to lose. Depth 32 is ample: write rate <= TRACECLK (<=200M), read rate
+        // = ref_200m (200M), so it never backs up in steady state.
         reg [7:0] tclk_byte = 8'b0;
-        reg       tclk_tgl  = 1'b0;   // toggles once per captured byte
+        reg       tclk_push = 1'b0;
         always @(posedge trace_clk) begin
             tclk_byte <= {iddr_b, iddr_a};   // big-endian: falling nibble MS
-            tclk_tgl  <= ~tclk_tgl;
+            tclk_push <= 1'b1;               // push one byte per TRACECLK period
         end
-        // CDC the toggle into ref_200m and edge-detect -> one clk200 pulse per
-        // TRACECLK byte. Safe as long as TRACECLK < ref_200m (66M < 200M): at
-        // most one new byte per ~3 ref cycles, so no toggle is missed. The byte
-        // itself is captured a couple ref cycles after its toggle, long settled.
-        reg [2:0] tgl_sync = 3'b0;
-        reg [7:0] byte_s0 = 8'b0, byte_s1 = 8'b0;
-        always @(posedge ref_200m) begin
-            tgl_sync <= {tgl_sync[1:0], tclk_tgl};
-            byte_s0  <= tclk_byte;
-            byte_s1  <= byte_s0;
-        end
-        assign cap_valid = tgl_sync[2] ^ tgl_sync[1];
-        assign cap_byte  = byte_s1;
+
+        wire        fifo_s_ready;
+        wire [7:0]  fifo_m_data;
+        wire        fifo_m_valid;
+        // read side: pop whenever data is available (ref_200m is >= TRACECLK, so
+        // we drain at least as fast as it fills).
+        wire        fifo_m_ready = fifo_m_valid;
+
+        axis_async_fifo #(
+            .DEPTH(32), .DATA_WIDTH(8),
+            .KEEP_ENABLE(0), .LAST_ENABLE(0), .USER_ENABLE(0), .FRAME_FIFO(0)
+        ) u_cdc_fifo (
+            .s_clk(trace_clk), .s_rst(rst),
+            .s_axis_tdata(tclk_byte), .s_axis_tkeep(1'b0),
+            .s_axis_tvalid(tclk_push), .s_axis_tready(fifo_s_ready),
+            .s_axis_tlast(1'b0), .s_axis_tid(8'h0), .s_axis_tdest(8'h0),
+            .s_axis_tuser(1'b0),
+            .m_clk(ref_200m), .m_rst(rst),
+            .m_axis_tdata(fifo_m_data), .m_axis_tkeep(),
+            .m_axis_tvalid(fifo_m_valid), .m_axis_tready(fifo_m_ready),
+            .m_axis_tlast(), .m_axis_tid(), .m_axis_tdest(), .m_axis_tuser(),
+            .s_pause_req(1'b0), .s_pause_ack(), .m_pause_req(1'b0), .m_pause_ack(),
+            .s_status_depth(), .s_status_depth_commit(), .s_status_overflow(),
+            .s_status_bad_frame(), .s_status_good_frame(),
+            .m_status_depth(), .m_status_depth_commit(), .m_status_overflow(),
+            .m_status_bad_frame(), .m_status_good_frame()
+        );
+        assign cap_valid = fifo_m_valid & fifo_m_ready;
+        assign cap_byte  = fifo_m_data;
 
         // IDDR mode does not measure duty; hold the stats at 0.
         always @(posedge ref_200m) begin

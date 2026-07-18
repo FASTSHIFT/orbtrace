@@ -383,3 +383,66 @@ fall/rise 对称**。
 要把"随机 2% 抖动"定位到 FPGA 内部(CDC) vs 物理层，用 `SELFTEST=1`（trace_capture_a7
 内部生成已知图案，绕开物理引脚/IDELAY/SI）。若 SELFTEST 下仍有此随机抖动 →
 纯 FPGA 内部(CDC)，与 TRACECLK/飞线/SI 全无关，彻底定位到 R4 的 CDC 交接。
+
+
+## CDC 仿真定位：纯逻辑零 skew 不复现，但当前 CDC 设计本就不严谨
+
+现有 SELFTEST 注入点**只在 OVERSAMPLE 分支**（`os_clk_src/os_data_src`），IDDR 分支
+没接，且生成器仅 ~1MHz——无法直接测 IDDR CDC。改走 iverilog 离线定位。
+
+**tb_iddr_cdc_async.v（零人为 skew + 真异步 + 真实双沿 IDDR + edge-aligned data）**：
+- 100MHz(=ref/2, toggle CDC 最坏情况)扫遍初始相位：**bad≈0，0x5=0 0xa=0**。
+- 93MHz(非 ref/2 真异步)扫相位：同样不复现。
+- → **纯 CDC 逻辑在零 skew 下不产生 0x5/0xa**，即使最坏 ref/2。
+
+**tb_iddr_cdc_sweep.v（红方版，注入 per-bit skew）**：撕裂**高度依赖精确频率比/相位**
+——红方报告的 48MHz 撕裂在 100MHz 整除 ref/2 时反而消失（相位锁定）。skew 0-300ps @
+100MHz 全 0%。说明"CDC+skew 撕裂"存在但对工况极敏感，不是普遍解释。
+
+### 诚实的把握度与判断
+
+- 占空比根因：**基本排除**（100M fall/rise 对称）。
+- 纯 CDC 逻辑撕裂：**零 skew 仿真不复现**；靠真实布线 bit-skew 可能在特定工况撕裂。
+- 把握度：CDC 字节交接不严谨是**最可能方向(~55%)**，但**尚无稳定复现硬件 2% 的仿真**。
+
+**关键工程判断（不必等 100% 坐实机制）**：当前 IDDR 导出 CDC = `tclk_byte` 组合更新
+的 8-bit 裸总线，被 ref_200m 域用"数据链 2 级 / 选通链 3 级"直接采——**没有任何原子性
+保证**（红方 R4）。无论撕裂机制细节如何，这都是不严谨设计。正确做法是用**已验证的
+异步 FIFO（格雷码指针，la_ddr_writer 里 CI 测过的 axis_async_fifo）做原子字节交接**。
+
+### 下一步：修 CDC 再上板（"修了再看"胜过继续猜）
+
+把 IDDR 分支的裸总线 toggle-CDC 换成 axis_async_fifo 原子交接，重编上板测 100M walking：
+- 若 2% 随机错**消失** → 机制坐实为 CDC 字节交接，问题解决。
+- 若**仍在** → 排除 CDC，指向物理层（真实 SI / IDDR Q2 建立时间），再上 MMCM 相移/ISERDES。
+这比继续在仿真参数空间穷举更有产出。
+
+
+## ✅ 根因坐实 + 修复：2.5% = 我的裸总线 CDC 撕裂，换 async FIFO 后 walking 归零
+
+把 IDDR 分支的裸总线 toggle-CDC 换成经 CI 验证的 **axis_async_fifo（格雷码指针原子
+交接）**，100MHz walking，关键 tap 各重复 8 次：
+
+| tap | 旧裸总线 CDC（8次） | **新 async FIFO（8次）** |
+|----:|--------------------|--------------------------|
+| 8  | 0.69–2.80% 随机 | **0.00 ×8** |
+| 10 | 1.08–3.31% 随机 | **0.00 ×8** |
+| 18 | 1.04–3.17% 随机 | **0.00 ×8** |
+
+严格 walk_score（rotation 判据）：**0.0000%**，零 multibit、零 rotation break。
+
+**根因一锤定音**：那顽固的 2.5% **是我自己写的 CDC bug**——`tclk_byte` 8-bit 裸总线
+跨 trace_clk→ref_200m 非原子交接，ref 采样撞在发射窗口就把相邻周期的 bit 混进一个
+字节（`0x5=0x1|0x4` OR 撕裂）。**不是占空比、不是 SI、不是飞线、不是 IDDR 采样相位**
+——全是我之前的错误猜测。红方 r26 R4 方向完全正确。所有诡异现象都被解释：tap 无关
+（CDC 在 IDELAY 下游）、随机每次不同（异步交接相位随机）、0x5/0xa OR 叠加（撕裂签名）、
+跨场景顽固（只要用这 CDC 就有）。
+
+### 遗留：FIFO 版真 ETM 出现 nibble-顺序偏移（标定中）
+
+FIFO 版抓真 ETM，raw 的 HSYNC 从 `ff 7f` 变成 `f7 ff`——**字节 nibble 顺序相对旧版
+变了**（FIFO 的 valid/data 对齐与旧 toggle-CDC 的多级延迟不同）。walking 对称看不出，
+但真 ETM 的 TPIU 结构暴露了。host 端 nibble-swap 是错解（凑出假 FSYNC）。正解：用
+**不对称已知图案（CURTPM F0/00 → 字节 0x0F 或 0xF0）标定正确 nibble 顺序**，在 RTL 里
+把 `{iddr_b,iddr_a}` 打包顺序改对，重编译。walking 完美已证 FIFO 本身零错，只差这个
+确定性的字节对齐。
