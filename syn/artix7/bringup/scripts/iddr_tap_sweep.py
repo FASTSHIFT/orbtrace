@@ -50,6 +50,25 @@ def score(path, good_set):
     return bad / len(d), len(d)
 
 
+def _measure_traceclk(ip, outdir):
+    """One timebase capture -> measured TRACECLK in Hz (alias-free), or None."""
+    import json
+    cap = os.path.join(outdir, "_guardprobe.bin")
+    run([sys.executable, f"{HERE}/trace_ctrl.py", "--ip", ip, "rearm"])
+    run([sys.executable, f"{HERE}/trace_dump.py", "--ip", ip,
+         "--depth", "61440", "-o", cap, "--timebase"])
+    ts = cap + ".ts.json"
+    if not os.path.exists(ts):
+        return None
+    tb = json.load(open(ts))
+    tk = tb.get("ticks", [])
+    if len(tk) < 2:
+        return None
+    nbytes = (len(tk) - 1) * tb["stride"]
+    dt_ns = (tk[-1] - tk[0]) * tb["tick_ns"]
+    return nbytes / dt_ns * 1e9 if dt_ns > 0 else None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ip", default="192.168.10.42")
@@ -60,6 +79,8 @@ def main():
     ap.add_argument("--settle", type=float, default=0.3,
                     help="seconds to wait after re-arm before dump")
     ap.add_argument("--outdir", default="/tmp/iddr_tap_sweep")
+    ap.add_argument("--force", action="store_true",
+                    help="override the sampling-guard frequency check")
     a = ap.parse_args()
 
     good = PATTERNS[a.pattern]
@@ -69,6 +90,20 @@ def main():
         taps = list(range(int(lo), int(hi) + 1))
     else:
         taps = [int(x) for x in a.taps.split(",")]
+
+    # GUARD: an IDELAY tap sweep only means something when IDELAY has authority
+    # over the eye. Measure TRACECLK first and refuse if we're in the low-freq
+    # dead zone (the 12MHz-IDDR-tap-sweep trap). --force to override.
+    import sampling_guard as G
+    fhz = _measure_traceclk(a.ip, a.outdir)
+    if fhz:
+        ok, level, msg = G.check(fhz, "IDDR", sweeping_tap=True)
+        print(f"[guard] measured TRACECLK = {fhz/1e6:.1f} MHz")
+        print(msg)
+        if level == "error" and not a.force:
+            print("[guard] ABORTING tap sweep (use --force to override). "
+                  "This sweep would be meaningless at this frequency.")
+            return 3
 
     print(f"=== IDDR IDELAY tap sweep (pattern={a.pattern}, good={{{','.join(f'0x{v:02x}' for v in good)}}}) ===")
     rows = []
