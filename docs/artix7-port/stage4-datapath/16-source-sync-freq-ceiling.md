@@ -1059,3 +1059,81 @@ FPGA timebase 实测频率，每档做严格字节错 + 逐指令顺序核对。
 
 1. 加重 func_test 负载（循环内更多真实分支/数据）喂饱 93.8M+ 端口，复测真 ETM 逐指令；
 2. 或接受"采集层到 200M 干净、真 ETM 逐指令到 62.5M 干净"作为本阶段结论，转入其它工作。
+
+
+## 加重负载 + 93.8M 深挖：真 ETM 高熵在 93.8M 出现 lane-skew 污染，需 per-lane IDELAY
+
+按用户选项 1，加重 func_test 负载（REPS 8→200、每次调用带数据依赖累加防 DCE、移除热循环里的
+HAL_GetTick/LED 轮询、factorial 深度随 r 变、conditional 双臂）喂端口，并 `TRACE_STALL=0`
+让 CPU 全速产 trace。
+
+### 对照结果（同一重负载固件，只变频率）
+
+| 实测 TRACECLK | TPIU full-sync | deframed ETM | 解码 |
+|---:|---:|---:|:--|
+| 62.5M | 2853 | 25858 B | **14/14, 338 PC** ✅ |
+| 93.8M | ~10300 | 591 B | **0 PC** ❌ |
+
+加重负载让 62.5M 更漂亮（338 PC、14/14、burst 更长）。但 93.8M 仍崩，且加重负载后 full-sync
+不降反升（6450→10300）。
+
+### 深挖 93.8M：不是 deframe，是高熵真 ETM 的采集污染
+
+剥掉 full-sync 后看 93.8M 真 ETM 数据本身（18986 B）：**A-sync 仅 4 个**（62.5M 同量数据
+有 25 个），字节直方图被 **`0x9f`(4440次) 主导** + 周期性 `f2 9f`/`f6 9f` 模式。这不是健康
+高熵 ETM（62.5M 是），是**结构化污染**。
+
+**关键对照**：93.8M 下 **walking 图案采集干净（0.0016%）但真 ETM 被污染**。差异在于：
+- walking = 4 lane 规整错序翻转，lane 间时序固定，且 2 字节周期图案能掩盖单点错；
+- 真 ETM = 4 lane 独立任意翻转的高熵流，暴露 **lane 间 skew**——某 lane 采样窗口在 93.8M
+  眼窄时被邻 lane 干扰，产生 `0x9f` 类系统性 bit 污染。
+
+这正是文档早先预测的"高频眼窄 + lane skew 需 per-lane IDELAY 校准"（proposal 33）的场景。
+
+### 阻塞点：当前 bit 的 IDELAY tap 控制对采集无可观测效果
+
+实测 `trace_ctrl set-tap 0/8/16/24` 后 walking 误码**纹丝不动全是 0.0016%**。RTL
+（`trace_capture_a7.v`）确有完整 per-lane IDELAYE2 VAR_LOAD + CSR 0x05→tap_csr→CDC→tap_load
+通路，`trace_stream_top.v` 也接了。tap 无效有两种可能：
+1. walking 规整图案的眼太宽，±2.4ns（IDELAY 全程）仍在眼内，**walking 根本测不出 tap 效果**
+   （只有真 ETM 的窄眼才显现）——那 per-lane IDELAY 仍可能对真 ETM 有效，但**只能用真 ETM
+   解码质量（A-sync 数/RESERVED 率）当判据来扫**，不能用 walking。
+2. 或 tap_load 脉冲/CDC 在此 bit 未真正生效（需 RTL 复核）。
+
+### ✅ 突破：IDELAY tap 对真 ETM 完全可观测，调对 tap 后 93.8M 跑通
+
+之前判断"tap 无效"是错的——那是因为**只用 walking 测**（规整图案眼太宽，±2.4ns 全在眼内）。
+改用**真 ETM 的 deframe 后 A-sync 数**当判据扫全局 tap，tap 效果一目了然：
+
+| tap | A-sync | deframed |
+|----:|-------:|---------:|
+| 0-6 | 16-17 | ~16500 |
+| 16 | 12 | 14833 |
+| 24 | 1 | 7678 |
+| 28（旧默认）| ~0 | 崩 |
+| 31 | 0 | 461 |
+
+**根因坐实**：93.8M 之前崩，是**综合默认 tap=28 在眼外**（高频眼窄，28 落到眼边缘/外）。
+之前满屏 10000+ full-sync 是**采样错产生的假 sync**，非真填充。
+
+**tap=2 完整解码 93.8M 真 ETM**：
+
+| 指标 | 默认 tap28 | **tap=2** |
+|------|:---:|:---:|
+| TPIU full-sync | ~10300（假）| **18** |
+| deframed ETM | 591 B | **16354 B** |
+| unique PC | 0 | **384，100% 落 flash** |
+| func_test | 0 | **14/14** |
+| 字节错(RESERVED+BAD_SEQ) | 61.6% | **0.110%**（RESERVED=5）|
+| 顺序核对 | — | **PASS 33/33** |
+
+### 结论：93.8M 真 ETM 逐指令跑通，IDELAY 是高频关键
+
+- **真 ETM 逐指令干净上限从 62.5M 提到 93.8M**（14/14 + 顺序 PASS + 字节错 0.110%），
+  关键就是把 IDELAY tap 从眼外的默认 28 调到眼内的 ~2。
+- **完全印证文档核心预测**：IDELAY 只在高频眼窄时有用且必需；判据必须用真 ETM 解码质量
+  （A-sync/RESERVED），walking 眼太宽测不出、集合覆盖是虚荣指标。
+- 残余 0.110%（5 个 RESERVED）= 全局单 tap 补不掉的 **lane 间 skew**，是 proposal 33
+  per-lane 独立 IDELAY 校准的正当场景（各 lane 单独扫 A-sync 眼心），预期可压到 0。
+- 运维教训：**高频抓真 ETM 前必须先扫 tap 找眼心**（用 A-sync 判据），默认 tap 只在低频
+  眼宽时凑效。应把这一步做成 `iddr_tap_sweep` 的真-ETM 判据模式。
