@@ -126,3 +126,18 @@ jobs:
           vvp /tmp/sim | tee /tmp/out
           # Real capture should at least feed bytes and detect TPIU sync words.
           grep -q 'Got sync' /tmp/out
+
+      - name: la_ddr_writer on-chip-LA stress test (Artix-7 pin-LA writer)
+        run: |
+          # Method-X width-matched black-box writer: proves the cap->128b
+          # AsyncFIFO->pack->DDR3-burst path stays byte-contiguous at full
+          # 200 MB/s sampling (no dropped/duplicated bytes), and that genuine
+          # DDR3 overload is flagged honestly (sticky overflow, monotonic
+          # canary) rather than silently sprinkling losses. Guards against the
+          # v1 regression (100 MB/s pack throughput -> 86% step=2 byte drop).
+          iverilog -g2012 -o /tmp/sim_la \
+            syn/artix7/bringup/sim/tb_la_ddr_writer.v \
+            syn/artix7/bringup/rtl/la_ddr_writer.v \
+            syn/external/verilog-ethernet/lib/axis/rtl/axis_async_fifo.v
+          vvp /tmp/sim_la | tee /tmp/out_la
+          grep -q 'RESULT=ALL_PASS' /tmp/out_la

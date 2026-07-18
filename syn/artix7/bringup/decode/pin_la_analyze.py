@@ -32,6 +32,25 @@ def edges(bits):
     return out
 
 
+def check_canary(raw):
+    """Bit[7:5] is a 3-bit mod-8 counter incrementing every clk200 sample.
+    Verify sequence is monotonically increasing modulo 8. Any break = FPGA
+    or DDR3 path bug (write-side FIFO overflow / read-side gearbox glitch /
+    ring boundary mishap), NOT a SI issue.
+    Returns (num_samples, num_breaks, first_break_offset). """
+    breaks = 0
+    first = None
+    prev = (raw[0] >> 5) & 0x7
+    for i in range(1, len(raw)):
+        cur = (raw[i] >> 5) & 0x7
+        if cur != ((prev + 1) & 0x7):
+            breaks += 1
+            if first is None:
+                first = i
+        prev = cur
+    return len(raw), breaks, first
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("cap")
@@ -44,6 +63,19 @@ def main():
         raw = raw[:a.limit]
     n = len(raw)
     print(f"samples: {n}  ({n * SR_NS / 1e6:.2f} ms of trace)")
+
+    # Canary integrity gate first — if the FPGA/DDR3 path itself is broken,
+    # any downstream analysis is meaningless.
+    total, breaks, first_break = check_canary(raw)
+    pct = 100.0 * breaks / max(1, total - 1)
+    if breaks == 0:
+        print(f"[canary] OK — {total} samples, sequence intact")
+    else:
+        print(f"[canary] {breaks} breaks in {total} samples ({pct:.4f}%), "
+              f"first break at offset {first_break}")
+        if pct > 0.01:
+            print(f"[canary] WARNING: FPGA/DDR3 path bug detected. "
+                  f"Do NOT trust downstream SI numbers until this is fixed.")
 
     # Extract each bit vector.
     clk = bytes((b >> CLK_BIT) & 1 for b in raw)

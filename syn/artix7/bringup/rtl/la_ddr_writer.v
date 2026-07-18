@@ -55,79 +55,112 @@ module la_ddr_writer #(
     output reg  [31:0] words_written,   // total 128-bit words committed
     output reg  [31:0] wr_lost_bytes    // bytes dropped (AsyncFIFO full)
 );
-    // ---------------- AsyncFIFO: cap_clk 8-bit -> ui_clk 8-bit ----------------
-    // Independent CDC FIFO (method X): the black box taps cap_byte at the
-    // source, never sharing the real-time path's FIFO. Depth 4096 absorbs DDR3
-    // arbitration latency. Loss = a cap_valid byte arriving while the FIFO is
-    // not ready (should not happen: 12.8MB/s in vs 800MB/s DDR3 out).
-    // freeze (clk125 level) synced into cap_clk; gate capture bytes off while a
-    // readback is in flight so the ring is a static snapshot.
+    // ------------- AsyncFIFO: cap_clk 128-bit -> ui_clk 128-bit -------------
+    // METHOD X v2 (litescope/OLS-style, WIDTH-MATCHED): the fatal flaw of v1
+    // was a THROUGHPUT mismatch, not a flow-control bug. v1 fed the async FIFO
+    // 8 bits/cap_clk (200 MB/s) but the ui_clk pack path could only pop 1
+    // byte/ui_clk = 100 MB/s (MIG UI = 400MHz DDR3 / 4:1 PHY). A 2:1 permanent
+    // overrun => ~half the bytes dropped => the "86% step=2" the canary saw.
+    // Simulation (tb_la_ddr_writer) proved this: at matched 100 MB/s v1 still
+    // scattered gaps because the pack path ALSO froze during each DDR3 burst.
+    //
+    // v2 packs 16 bytes into a 128-bit word IN THE cap_clk DOMAIN, then pushes
+    // whole words through a 128-bit-wide async FIFO. Now:
+    //   * FIFO write rate = 200M/16 = 12.5 Mword/s
+    //   * FIFO read rate  = up to 100 Mword/s (one word/ui_clk)
+    // an 8:1 drain margin, so steady state NEVER overflows. Loss can only
+    // happen on a genuine DDR3 stall, and then it is flagged (sticky) and the
+    // byte stream stays contiguous up to the stall point (canary monotonic).
+    // Bonus: no per-byte stall gating on the FIFO write port, so the DRC
+    // REQP-1839 async-control-on-BRAM warning goes away.
     reg frz0=0, frz1=0;
     always @(posedge cap_clk) begin frz0<=freeze; frz1<=frz0; end
-    wire cap_valid = cap_valid_in & ~frz1;
 
-    wire       fifo_s_ready;
-    wire [7:0] fifo_out_data;
-    wire       fifo_out_valid, fifo_out_ready;
+    // cap-domain 16-byte packer (big-endian: first byte -> MS byte).
+    reg [127:0] cap_word = 0;
+    reg [3:0]   cap_bidx = 0;
+    reg         cap_word_valid = 0;   // 1-cycle strobe when a word completes
+    always @(posedge cap_clk) begin
+        cap_word_valid <= 1'b0;
+        if (cap_rst) begin
+            cap_bidx <= 0; cap_word <= 0;
+        end else if (cap_valid_in & ~frz1) begin
+            cap_word <= {cap_word[119:0], cap_byte};
+            if (cap_bidx == 4'd15) begin
+                cap_bidx <= 0;
+                cap_word_valid <= 1'b1;   // this cycle's {cap_word[119:0],cap_byte} is complete
+            end else begin
+                cap_bidx <= cap_bidx + 1'b1;
+            end
+        end
+    end
+    // the completed word value (combinational, valid when cap_word_valid=1)
+    wire [127:0] cap_word_full = {cap_word[119:0], cap_byte};
+
+    wire        fifo_s_ready;
+    wire [127:0]fifo_out_data;
+    wire        fifo_out_valid, fifo_out_ready;
+    wire [8:0]  s_depth;   // word occupancy (DEPTH=256 words -> 9b)
+
+    // Overflow = the async FIFO could not accept a completed word (s_ready low)
+    // OR neared full. Sticky-latch it in cap domain so the host sees it after.
+    reg  overflow_sticky = 0;
+    wire near_full = (s_depth > 9'd240);   // ~15/16 of 256 words
+    always @(posedge cap_clk or posedge cap_rst) begin
+        if (cap_rst) begin
+            overflow_sticky <= 0;
+        end else if (cap_word_valid & (~fifo_s_ready | near_full)) begin
+            overflow_sticky <= 1'b1;   // a word was (or nearly) lost
+        end
+    end
+
     axis_async_fifo #(
-        .DEPTH(4096), .DATA_WIDTH(8),
+        .DEPTH(256), .DATA_WIDTH(128),
         .KEEP_ENABLE(0), .LAST_ENABLE(0), .USER_ENABLE(0), .FRAME_FIFO(0)
     ) u_afifo (
         .s_clk(cap_clk), .s_rst(cap_rst),
-        .s_axis_tdata(cap_byte), .s_axis_tkeep(1'b0),
-        .s_axis_tvalid(cap_valid), .s_axis_tready(fifo_s_ready),
+        .s_axis_tdata(cap_word_full), .s_axis_tkeep(1'b0),
+        .s_axis_tvalid(cap_word_valid), .s_axis_tready(fifo_s_ready),
         .s_axis_tlast(1'b0), .s_axis_tid(8'h0), .s_axis_tdest(8'h0), .s_axis_tuser(1'b0),
         .m_clk(ui_clk), .m_rst(ui_rst),
         .m_axis_tdata(fifo_out_data), .m_axis_tkeep(),
         .m_axis_tvalid(fifo_out_valid), .m_axis_tready(fifo_out_ready),
         .m_axis_tlast(), .m_axis_tid(), .m_axis_tdest(), .m_axis_tuser(),
         .s_pause_req(1'b0), .s_pause_ack(), .m_pause_req(1'b0), .m_pause_ack(),
-        .s_status_depth(), .s_status_depth_commit(), .s_status_overflow(),
+        .s_status_depth(s_depth), .s_status_depth_commit(), .s_status_overflow(),
         .s_status_bad_frame(), .s_status_good_frame(),
         .m_status_depth(), .m_status_depth_commit(), .m_status_overflow(),
         .m_status_bad_frame(), .m_status_good_frame()
     );
 
-    // capture-domain loss counter (cap_valid while FIFO can't accept), CDC'd up
-    reg [31:0] lost_cap = 0;
-    always @(posedge cap_clk or posedge cap_rst) begin
-        if (cap_rst) lost_cap <= 0;
-        else if (cap_valid & ~fifo_s_ready) lost_cap <= lost_cap + 1'b1;
-    end
-    reg [31:0] lost_s0=0, lost_s1=0;
+    // Overflow flag CDC to ui_clk; expose in wr_lost_bytes (nonzero => the
+    // capture stalled at least once, i.e. record has a hard end, not gaps).
+    reg ovf_s0=0, ovf_s1=0;
     always @(posedge ui_clk) begin
-        lost_s0 <= lost_cap; lost_s1 <= lost_s0; wr_lost_bytes <= lost_s1;
+        ovf_s0 <= overflow_sticky; ovf_s1 <= ovf_s0;
+        wr_lost_bytes <= {31'd0, ovf_s1};
     end
 
-    // ---------------- ui_clk: pack 16 bytes -> 128-bit word ----------------
-    reg [127:0] word_sr = 0;     // shift register building the 128-bit word
-    reg [3:0]   byte_idx = 0;    // 0..15 within the current word
-    reg [127:0] wbuf [0:LENGTH-1]; // one burst of 64 words staged for DDR3
+    // ---------------- ui_clk: stage 128-bit words into burst buffer ---------
+    reg [127:0] wbuf [0:LENGTH-1]; // one burst of LENGTH words staged for DDR3
     reg [9:0]   word_idx = 0;    // 0..LENGTH-1 words staged
     reg         burst_ready = 0; // a full LENGTH-word batch is staged
     reg         burst_done = 0;  // pulse when a DDR3 burst completes (FSM below)
 
-    // pop the FIFO whenever we're not mid-burst-commit and a byte is available
+    // pop a word whenever we're not mid-burst-commit and a word is available
     assign fifo_out_ready = fifo_out_valid & ~burst_ready & ~ui_rst;
 
     always @(posedge ui_clk) begin
         if (ui_rst) begin
-            byte_idx <= 0; word_idx <= 0; burst_ready <= 0; word_sr <= 0;
+            word_idx <= 0; burst_ready <= 0;
         end else begin
             if (fifo_out_valid & fifo_out_ready) begin
-                // big-endian byte pack: first byte -> MS byte
-                word_sr <= {word_sr[119:0], fifo_out_data};
-                if (byte_idx == 4'd15) begin
-                    byte_idx <= 0;
-                    wbuf[word_idx] <= {word_sr[119:0], fifo_out_data};
-                    if (word_idx == LENGTH-1) begin
-                        word_idx <= 0;
-                        burst_ready <= 1'b1;   // batch staged; trigger DDR3 write
-                    end else begin
-                        word_idx <= word_idx + 1'b1;
-                    end
+                wbuf[word_idx] <= fifo_out_data;
+                if (word_idx == LENGTH-1) begin
+                    word_idx <= 0;
+                    burst_ready <= 1'b1;   // batch staged; trigger DDR3 write
                 end else begin
-                    byte_idx <= byte_idx + 1'b1;
+                    word_idx <= word_idx + 1'b1;
                 end
             end
             if (burst_done) burst_ready <= 1'b0;   // clear once written

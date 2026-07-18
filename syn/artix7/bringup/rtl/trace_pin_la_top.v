@@ -108,7 +108,14 @@ module trace_pin_la_top #(
         pin_s0 <= {tclk_ibuf, tdata_ibuf};
         pin_s1 <= pin_s0;
     end
-    wire [7:0] la_byte  = {3'b000, pin_s1};
+
+    // Canary counter (red-team R8): bit[7:5] is a 3-bit modulo-8 counter
+    // incrementing every clk200 sample. On the host we check the sequence is
+    // monotonically increasing modulo 8. Any break => FPGA/DDR3 path bug, NOT
+    // a hardware SI issue.
+    reg [2:0] canary = 0;
+    always @(posedge sys_clk_200) canary <= canary + 3'd1;
+    wire [7:0] la_byte = {canary, pin_s1};
     // Continuously valid. Freeze gate is driven from the reader (busy).
 
     // ---- DDR3 controller ----
@@ -146,10 +153,15 @@ module trace_pin_la_top #(
     // DDR3 sustains far more, so drop should be zero.
     wire [28:0] wr_ptr_words;
     wire [31:0] words_written, wr_lost_bytes;
+    // Freeze the writer as soon as the pointer is latched, NOT only when
+    // the reader becomes busy. This eliminates the ~microsecond window
+    // between arm and reader-busy where the writer would otherwise advance
+    // wr_ptr further, corrupting the snapshot boundary.
+    wire writer_freeze = wrptr_valid | rb_busy;
     la_ddr_writer #(.LENGTH(LENGTH), .RING_BASE(29'd0),
                     .RING_WORDS(29'h0800000)) u_bb (
         .cap_clk(sys_clk_200), .cap_rst(sys_rst),
-        .cap_byte(la_byte), .cap_valid_in(1'b1), .freeze(rb_busy),
+        .cap_byte(la_byte), .cap_valid_in(1'b1), .freeze(writer_freeze),
         .ui_clk(ui_clk), .ui_rst(ui_rst | ~calib_done), .ddr3_busy(ddr3_busy),
         .ddr3_wr_start(wr_start), .ddr3_wr_data_req(wr_data_req),
         .ddr3_wr_data(wr_data), .ddr3_wr_addr_req(wr_addr_req),
@@ -161,7 +173,6 @@ module trace_pin_la_top #(
     // ---- reader (P2b-2 readback via :5555 self-TX) ----
     localparam [7:0] REG_ARM = 8'h20;
     localparam [31:0] READ_WORDS = 32'd262144;   // 256K words = 4 MB snapshot
-    // read the most-recently-written region
     wire [15:0] ext_addr;
     wire [7:0]  ext_data;
     wire [7:0]  csr_addr_w, csr_data_w;
@@ -169,13 +180,36 @@ module trace_pin_la_top #(
     reg  arm_125 = 0;
     always @(posedge clk125) arm_125 <= csr_we_w && (csr_addr_w == REG_ARM);
 
+    // CDC the writer's live pointer into clk125 (safe: it's monotonic).
     localparam [28:0] RING_APP = 29'h0800000;
     wire [28:0] READ_SPAN = READ_WORDS[25:0] << 3;
     reg [28:0] wrptr_c0=0, wrptr_c1=0;
     always @(posedge clk125) begin wrptr_c0<=wr_ptr_words; wrptr_c1<=wrptr_c0; end
+
+    // On arm pulse LATCH the pointer. All subsequent reads use this frozen
+    // value, so the readback window is deterministic and doesn't depend on
+    // how long between arm and la_ddr_reader actually starting the burst
+    // (red-team R9 -- arm/CDC jitter previously caused per-run scatter).
+    // wrptr_valid stays high from arm until reader busy drops back to 0,
+    // marking one complete snapshot cycle. Rearm-ready afterwards.
+    reg [28:0] wrptr_latched = 0;
+    reg        wrptr_valid   = 0;
+    reg        rb_busy_q     = 0;
+    always @(posedge clk125) rb_busy_q <= rb_busy;
+    wire rb_busy_fell = rb_busy_q & ~rb_busy;
+    always @(posedge clk125) begin
+        if (sys_rst) begin
+            wrptr_valid <= 1'b0;
+        end else if (arm_125) begin
+            wrptr_latched <= wrptr_c1;
+            wrptr_valid   <= 1'b1;
+        end else if (rb_busy_fell) begin
+            wrptr_valid <= 1'b0;
+        end
+    end
     wire [28:0] rd_start_addr =
-        (wrptr_c1 >= READ_SPAN) ? (wrptr_c1 - READ_SPAN)
-                                : (RING_APP + wrptr_c1 - READ_SPAN);
+        (wrptr_latched >= READ_SPAN) ? (wrptr_latched - READ_SPAN)
+                                     : (RING_APP + wrptr_latched - READ_SPAN);
 
     wire [7:0] rb_tdata;
     wire       rb_tvalid, rb_tready, rb_busy;
