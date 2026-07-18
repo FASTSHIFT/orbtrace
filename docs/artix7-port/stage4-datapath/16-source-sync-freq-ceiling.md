@@ -1289,3 +1289,78 @@ HAL_GetTick/LED 轮询、factorial 深度随 r 变、conditional 双臂）喂端
 2. 突破 ~100M 真 ETM 上限需 MMCM 相移采样时钟（粗延迟覆盖整 UI），IDELAY 只够微调。
 3. 采集能力评估**只认真 ETM 逐指令/ A-sync 判据**，walking 仅用于"链路通不通"的粗筛，
    不再作为频率上限依据。
+
+
+## ✅ orbetto → Perfetto 端到端可视化跑通 + 调用频次逐函数交叉校验 + SysTick 修复
+
+用户建议用 `embedded-debug-tools/ext/orbetto` 把真 ETM 抓样转 Perfetto,作为最有说服力的
+端到端证明。跑通并做了定量交叉校验。
+
+### 端到端链路
+
+```
+STM32H743 源同步 ETM (66.7M, BB=1)
+  → A7-Lite FPGA IDDR 采集 (trace_iddr_fifocdc.bit) + FPGA 200M timebase 硬件时间戳
+  → UDP :5001 raw dump
+  → orbetto (官方 TPIU deframe → ETMv4 解码, ARM/Linaro Mortrall)
+  → Perfetto trace (func_test_66m.perf)
+```
+
+命令:
+```sh
+# 1) 生成 per-ETM-byte 时间基准 (decode/etm_with_time.py -> .time.bin, u64 LE ns)
+python3 decode/etm_with_time.py raw.bin raw.bin.ts.json timed.bin
+# 2) orbetto 转 Perfetto (ELF 名须含 "stm32h743" 才被 Device 识别)
+build/orbetto -C 200000 -t 1 -f raw.bin -e stm32h743_*.elf -F timed.bin.time.bin
+```
+
+### 定量交叉校验:perf 调用频次 = 源码静态调用图 × 迭代数
+
+用 protobuf 解 perf,数每个函数的 slice 次数,对照 main.c 一轮 main_loop 的静态调用图
+(以 deep1..6 = 58 次定基准迭代数):
+
+| 函数 | perf 次数 | 源码预测(×58) | ratio |
+|------|----------:|-------------:|------:|
+| dispatch_callback | 174 | 3×58=174 | 1.00 |
+| pingpong | 289 | 5×58=290 | 1.00 |
+| indirect_caller | 231 | 4×58=232 | 1.00 |
+| op_add+op_sub+op_mul | 231 | =indirect_caller | 1.00 |
+| deep1..6 | 各 58 | 各 1×58 | 1.00 |
+| conditional | 114 | 2×58 | 0.98 |
+| factorial | 115 | 2×58 | 0.99 |
+| leaf_add | 574 | 10×58=580 | 0.99 |
+| leaf_mul | 171 | 3×58=174 | 0.98 |
+| level_a/b/c, frame_func, mixed_test, callback_test, repeat_test | ≈58/116 | | 0.98–1.00 |
+
+**全部 18 个函数 ratio 0.98–1.00**——重建的执行流调用频次与源码调用图**逐函数量化吻合**
+(含 callback 调 3 次、repeat 循环 5 次、indirect 每次调 1 operator、6 层嵌套、conditional
+双臂各 leaf_add/leaf_mul)。这是比集合覆盖更硬的证明。偏差 0.98 只是抓取窗口边界最后一轮
+未跑完。
+
+### FPGA 硬件时间戳修复了假时间轴
+
+初版没喂 `-F`,orbetto 靠 ETM cycle-count 推时间 → 时间轴塌成假的 "1m3s"(单函数 duration
+被拉成分钟)。喂 FPGA `-F` timebase (每 ETM 字节一个 200M-tick ns 值) 后,时间轴变成真实的
+0–919µs,58 轮迭代逐个展开。**这验证了 doc 15 §25 的 FPGA 硬件时间戳方案端到端可用**。
+
+### 顺带修复 orbetto 的 ETMv4-CMSIS 异常退出 bug
+
+用户发现 Perfetto 里 SysTick "乱"。诊断:
+- SysTick(#15) 进入和返回**都在数据里、都解对了**(进 SysTick_Handler→HAL_IncTick→返回
+  0x44e)。
+- 但 orbetto 的 ETMv4 异常退出检测**只认 NuttX 的 `arm_exception*` 函数名**(在间接 JUMP
+  路径)。标准 CMSIS handler(`SysTick_Handler`)的 EXC_RETURN 经 ETMv4 **地址包**回到
+  returnAddress,没被识别成退出 → slice 拖到 500-事件超时才强制关 → Perfetto 里横跨一片。
+
+修复(`embedded-debug-tools` mortrall.hpp):在 EV_CH_ADDRESS 处理里加**通用异常退出检测**
+——异常活跃时地址包回到记录的 returnAddress(thumb 半字节容差)即为中断返回,不依赖 handler
+命名。修复后 SysTick entry/exit 完美配平(1/1,0 超时强制),slice 是真实窄条。这让 orbetto
+从"只支持 NuttX/PX4"扩展到**支持标准 CMSIS firmware**。
+
+### 净成果
+
+- **完整端到端可视化跑通**:源同步 IDDR 采集 → orbetto ETMv4 → Perfetto,时间轴用 FPGA
+  硬件时间戳,调用频次逐函数交叉校验吻合。产物 `func_test_66m.perf`(可拖入 ui.perfetto.dev)。
+- orbetto ETMv4-CMSIS 异常退出修复(通用,非 NuttX 专用)。
+- 校准脚本:`decode/etm_with_time.py`(FPGA timebase → orbetto -F)。
+- 注:ELF 文件名须含 `stm32h743` 才被 orbetto Device 识别(否则 device.valid() 断言失败)。
