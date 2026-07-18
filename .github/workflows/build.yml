@@ -127,6 +127,22 @@ jobs:
           # Real capture should at least feed bytes and detect TPIU sync words.
           grep -q 'Got sync' /tmp/out
 
+      - name: IDDR source-sync capture gap tolerance (gapping ETM clock)
+        run: |
+          # Proves the source-synchronous IDDR capture path in trace_capture_a7
+          # tolerates a STOPPING TRACECLK (an ETM whose clock gates on/off, e.g.
+          # with trace filtering): during a frozen clock it emits ZERO bytes
+          # (no phantoms), and after the clock resumes the byte stream is clean
+          # with no DDR-pairing misalignment across the gap. This is the key
+          # advantage of source-sync over any PLL/MMCM scheme (which would lose
+          # lock across a gap).
+          iverilog -g2012 -o /tmp/sim_gap \
+            syn/artix7/bringup/sim/tb_iddr_gap.v \
+            syn/artix7/rtl/trace_capture_a7.v \
+            syn/artix7/rtl/sim/xil_stubs.v
+          vvp /tmp/sim_gap | tee /tmp/out_gap
+          grep -q 'RESULT=ALL_PASS' /tmp/out_gap
+
       - name: la_ddr_writer on-chip-LA stress test (Artix-7 pin-LA writer)
         run: |
           # Method-X width-matched black-box writer: proves the cap->128b
