@@ -898,3 +898,70 @@ decoder 锚不住。降 TRCSYNCPR 强制更密 A-sync 反而让数据更稀（�
    trace 配置问题，不是采集能力问题。
 3. IDELAY 在高频（≥~66M）有真实眼图分辨力（112.5M 眼左沿 tap≈10 清晰可见），
    proposal 33 per-lane IDELAY 若要复活应在此频段、用漏边沿/字节错判据。
+
+
+## ✅✅✅ 密集 workload 解决锚点饥饿：真 ETM @~47M 解出 189 PC / 13-14 func_test / 采集层零字节错
+
+承接上一节"105M 真 ETM 0 PC = 锚点饥饿而非采集错"。用户诊断方向正确——问题在 workload
+被编译器内联稀释，不在采集。两步修复后端到端跑通。
+
+### 根因1（坐实）：`-Og` 内联把 func_test 稀释成锚点饥饿的 trace
+
+原 firmware `-Og` 把 leaf/level 小函数全内联，func_test 塌成几条直线代码，BB=1 也只有
+极少分支 → trace 突发短、A-sync 稀疏 → 高 TRACECLK 下 80% 是 HSYNC 填充、解码器锚不住。
+**改 `-Og -fno-inline -fno-inline-small-functions` + 每个 func_test 函数 `__attribute__((noinline))`**，
+每个调用都成真 BL/BLX，分支密度大增。
+
+### 根因2（坐实，且是之前"崩溃/HardFault"的真凶）：HSE 是 25MHz 不是 8MHz → 超频
+
+`build_h743.sh` 和手写 PLL 参数一直按 **8MHz HSE** 换算，实际板载 **HSE=25MHz**
+（`stm32h7xx_hal_conf.h: HSE_VALUE=25000000`）。于是"M=2 N=50"以为 VCO=200M，实际
+VCO=625M、sysclk 严重超压 → 取指损坏 → **UsageFault INVSTATE + SP 损坏**（CFSR=0x20000）。
+之前误判为"main.c 的 func_test 有 bug"、"栈溢出"全是错的——**纯粹是我用错 HSE 基准超频**。
+
+修复：
+- CubeMX 按 25M HSE 重生成 `SystemClock_Config`（M=2 N=32 P=2 R=4：ref=12.5M, VCO=400M,
+  sysclk=200M, HCLK=100M, pll1_r_ck=100M）。
+- PLL 分频参数改成 `#ifndef PLL_*_OVR` 宏，放进 `USER CODE BEGIN PD` 保护区（CubeMX
+  再生成不会删），`build_h743.sh` 可覆盖。
+- 修 `build_h743.sh`：HSE 基准 8→25MHz，加 ref/VCO/sysclk 越界告警（sysclk>200M 直接
+  警告"会崩"），杜绝再超频。
+- 修 Makefile：移除不存在的 `sysmem.c`/`syscalls.c`（fresh build 会因缺规则失败）。
+
+**验证稳定性**：烧录后 CFSR=0、多次采 PC 命中 func_test（level_a/main_loop），不再 fault。
+时钟修对后 main.c 的 func_test **本就没问题**。
+
+### 端到端结果（密集 workload + 正确时钟）
+
+| 指标 | 稀疏内联版（前节105M）| **密集 noinline 版（本次）** |
+|------|:---:|:---:|
+| deframed ETM 字节 | 216 | **45298** |
+| non-HSYNC 数据占比 | 20.9% | **80.0%**（突发 276B）|
+| A-sync | 3 | **44** |
+| INSTR_RANGE | 0 | **14753** |
+| unique PC | 0 | **189，100% 落 flash** |
+| func_test 覆盖 | 0 | **13/14**（缺 conditional）|
+| **RESERVED+BAD_SEQ（采集字节错）** | — | **0（0.00%）** |
+| NOT_SYNC（重锁开销）| — | 80 |
+
+**采集层零字节错**（14753 个指令区间全合法，RESERVED=BAD_SEQ=0），NOT_SYNC 是正常
+sync 重锁开销。**同一套采集链，只改 workload 密度 + 修时钟，就从 0 PC 翻转到 13-14
+func_test 逐指令干净**——彻底坐实"105M 0 PC 是锚点饥饿，非采集/SI/频率问题"。
+
+### 频率标签修正（诚实）
+
+本次 FPGA timebase 实测 TRACECLK = **46.9MHz**，而固件 pll1_r_ck 算的是 100M。说明
+H743 TRACECLK 到并口间还有约 /2 分频，我对 pll1_r_ck→TRACECLK 关系的理解不精确。**固件
+频率标签一直不可信**（tclk72 实测 105.5M、tclk100 实测 46.9M），**只有 FPGA timebase
+字节率实测数作准**。这不影响采集能力结论（walking 已独立证到 200M 干净）。
+
+### 净结论
+
+- **崩溃根因 = 用错 HSE 基准（8 vs 25MHz）超频**，非 firmware 逻辑、非 -O0。已用宏化 PLL
+  参数 + 25M 基准的 build 脚本 + 越界告警根治。
+- **高频真 ETM 解码率低 = 内联导致的锚点饥饿**，非采集/SI/频率。`-fno-inline` + noinline
+  workload 直接解决：45298B 数据、189 PC、13-14 func_test、采集层零字节错。
+- 采集链（源同步 IDDR + axis_async_fifo 原子 CDC + raw + host deframe + OpenCSD）在真
+  ETM 密集流下逐指令干净，与 walking 到 200M 的字节干净结论一致、互相印证。
+- 运维教训：FPGA 采集前端偶发状态坏（抓全 0），重烧 `trace_iddr_fifocdc.bit` 即恢复；
+  DAPLink 崩溃后调试口 stalled 需 `connect_assert_srst`（RST 已接）或断电恢复。
