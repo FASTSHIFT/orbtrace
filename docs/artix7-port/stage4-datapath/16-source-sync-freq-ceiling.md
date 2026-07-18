@@ -1364,3 +1364,35 @@ build/orbetto -C 200000 -t 1 -f raw.bin -e stm32h743_*.elf -F timed.bin.time.bin
 - orbetto ETMv4-CMSIS 异常退出修复(通用,非 NuttX 专用)。
 - 校准脚本:`decode/etm_with_time.py`(FPGA timebase → orbetto -F)。
 - 注:ELF 文件名须含 `stm32h743` 才被 orbetto Device 识别(否则 device.valid() 断言失败)。
+
+
+## ✅ 100M(实测校正后)端到端:真 ETM → Perfetto,533 PC / 14-14 / 顺序 PASS
+
+按用户要求把端到端推到 100M 主频。tclk100b(pll1_r_ck=200M),FPGA timebase 实测
+93.8M ×1.066 校正 = **99.9MHz(≈100M)真实 TRACECLK**。
+
+### 采集 + 解码(tap=2 眼内)
+
+| 指标 | 值 |
+|------|-----|
+| 实测 TRACECLK | 93.8M(timebase) → **99.9M 真实**(×1.066)|
+| unique PC | **533,100% 落 flash** |
+| func_test 覆盖 | **14/14** |
+| INSTR_RANGE | 4223 |
+| RESERVED+BAD_SEQ | 3 → byte-err **0.071%** |
+| 顺序核对 | **PASS 33/33** |
+
+眼在 tap 0-10(A-sync 16-17),默认综合 tap 之外需 CSR 调进眼——印证"高频必须先扫 tap"。
+
+### Perfetto 端到端
+
+`etm_with_time` → orbetto `-F` → `func_test_100m.perf`(445 PC bitmap,FPGA 时间基准
+span 614µs)。调用频次交叉校验(此窗口 N≈38 轮,以 deep=228=6×38 定基准):
+dispatch_callback 114=3×38、pingpong 190=5×38、indirect_caller 152=4×38(=op_add+sub+mul)、
+conditional 76=2×38——**比例逐函数吻合**,与 66M 一致。
+
+### 结论
+
+**~100M 真实 TRACECLK 端到端跑通**:源同步 IDDR 采集 → orbetto ETMv4 → Perfetto,
+14/14 func_test、533 PC、顺序 PASS、采集字节错 0.071%。这是 IDELAY-only 路径的真 ETM
+逐指令上限(再高到 105.5M+ 眼心超 IDELAY 范围,需 MMCM 相移)。产物 `func_test_100m.perf`。
