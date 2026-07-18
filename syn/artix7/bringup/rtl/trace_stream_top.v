@@ -163,8 +163,8 @@ module trace_stream_top #(
                        .EYE_DELAY(EYE)) u_capture (
         .rst(sys_rst), .ref_200m(clk200),
         .trace_clk_p(trace_clk_in), .trace_data_p(trace_data_in),
-        .tap_data0(tap_200), .tap_data1(tap_200),
-        .tap_data2(tap_200), .tap_data3(tap_200),
+        .tap_data0(tap0_200), .tap_data1(tap1_200),
+        .tap_data2(tap2_200), .tap_data3(tap3_200),
         .tap_load(tap_load | tap_load_200),
         .test_en(SELFTEST[0]), .test_clk(st_clk), .test_data(st_data),
         .eye_delay_rt(eye_rt),
@@ -210,35 +210,53 @@ module trace_stream_top #(
     wire       csr_we_w;
     reg  [7:0] eye_csr = 8'd0;          // 0 => use EYE parameter default
     reg        rearm_125 = 1'b0;        // 1-cycle pulse in clk125 domain
-    // Runtime per-lane IDELAY tap (IDDR high-freq deskew). Default = TAP param;
-    // CSR 0x05 sets it, and any write pulses tap_load_125 so the new tap loads
-    // without a reflash -> the host can sweep taps to find the data eye centre
-    // against the known CURTPM pattern.
-    reg  [4:0] tap_csr = TAP;
+    // Per-lane IDELAY taps. CSR 0x05 sets ALL four lanes to the same value
+    // (global sweep / backward compat). CSR 0x06 sets ONE lane independently:
+    // data[6:5] = lane index (0..3), data[4:0] = tap (0..31) -> lets the host
+    // deskew each data lane separately (proposal 33 per-lane calibration) to
+    // remove inter-lane skew that a single global tap can't fix at high freq.
+    reg  [4:0] tap_csr0 = TAP, tap_csr1 = TAP, tap_csr2 = TAP, tap_csr3 = TAP;
     reg        tap_load_125 = 1'b0;
     always @(posedge clk125) begin
         rearm_125 <= 1'b0;
         tap_load_125 <= 1'b0;
         if (sys_rst) begin
             eye_csr <= 8'd0;
-            tap_csr <= TAP;
+            tap_csr0 <= TAP; tap_csr1 <= TAP; tap_csr2 <= TAP; tap_csr3 <= TAP;
         end else if (csr_we_w) begin
             if (csr_addr_w == 8'h01) eye_csr <= csr_data_w;
             if (csr_addr_w == 8'h02) rearm_125 <= 1'b1;
-            if (csr_addr_w == 8'h05) begin
-                tap_csr      <= csr_data_w[4:0];
+            if (csr_addr_w == 8'h05) begin           // set all lanes
+                tap_csr0 <= csr_data_w[4:0];
+                tap_csr1 <= csr_data_w[4:0];
+                tap_csr2 <= csr_data_w[4:0];
+                tap_csr3 <= csr_data_w[4:0];
+                tap_load_125 <= 1'b1;
+            end
+            if (csr_addr_w == 8'h06) begin            // set one lane
+                case (csr_data_w[6:5])
+                    2'd0: tap_csr0 <= csr_data_w[4:0];
+                    2'd1: tap_csr1 <= csr_data_w[4:0];
+                    2'd2: tap_csr2 <= csr_data_w[4:0];
+                    2'd3: tap_csr3 <= csr_data_w[4:0];
+                endcase
                 tap_load_125 <= 1'b1;
             end
         end
     end
-    // CDC the tap value + load pulse into clk200 (IDELAY C domain).
-    reg [4:0] tap_s0 = TAP, tap_200 = TAP;
+    // CDC the tap values + load pulse into clk200 (IDELAY C domain).
+    reg [4:0] tap0_s0 = TAP, tap0_200 = TAP;
+    reg [4:0] tap1_s0 = TAP, tap1_200 = TAP;
+    reg [4:0] tap2_s0 = TAP, tap2_200 = TAP;
+    reg [4:0] tap3_s0 = TAP, tap3_200 = TAP;
     reg       tapld_tgl125 = 1'b0;
     always @(posedge clk125) if (tap_load_125) tapld_tgl125 <= ~tapld_tgl125;
     reg [2:0] tapld_sync200 = 3'b0;
     always @(posedge clk200) begin
-        tap_s0  <= tap_csr;
-        tap_200 <= tap_s0;
+        tap0_s0 <= tap_csr0; tap0_200 <= tap0_s0;
+        tap1_s0 <= tap_csr1; tap1_200 <= tap1_s0;
+        tap2_s0 <= tap_csr2; tap2_200 <= tap2_s0;
+        tap3_s0 <= tap_csr3; tap3_200 <= tap3_s0;
         tapld_sync200 <= {tapld_sync200[1:0], tapld_tgl125};
     end
     wire tap_load_200 = tapld_sync200[2] ^ tapld_sync200[1];

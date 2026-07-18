@@ -1137,3 +1137,58 @@ HAL_GetTick/LED 轮询、factorial 深度随 r 变、conditional 双臂）喂端
   per-lane 独立 IDELAY 校准的正当场景（各 lane 单独扫 A-sync 眼心），预期可压到 0。
 - 运维教训：**高频抓真 ETM 前必须先扫 tap 找眼心**（用 A-sync 判据），默认 tap 只在低频
   眼宽时凑效。应把这一步做成 `iddr_tap_sweep` 的真-ETM 判据模式。
+
+
+## proposal 33 复活：per-lane IDELAY 实装 + 真-ETM A-sync 判据校准 → 93.8M 残余降到 ~0.03%
+
+复活 proposal 33，把 per-lane 独立 IDELAY 做进 RTL 并用真 ETM 解码质量校准。
+
+### RTL + 工具实装
+
+- `trace_stream_top.v`：新增 CSR **0x06** per-lane tap（data[6:5]=lane, data[4:0]=tap），
+  4 个独立 `tap_csr0..3` + 各自 CDC 到 clk200，分别接 `tap_data0..3`。CSR 0x05 保留为
+  "设所有 lane"（全局扫）。
+- `trace_ctrl.py`：新增 `set-tap-lane <lane> <tap>`。
+- `perlane_idelay_cal.py`：贪心逐-lane 爬山，判据 = **真 ETM deframe 后 A-sync 数**
+  （不是 walking——眼太宽测不出；不是集合覆盖——虚荣指标）。
+- 新 bit `trace_iddr_perlane.bit`（TAP 默认 2，CAP_RAW=1，IDDR）。
+
+### 校准结果（93.8M 真 ETM，重负载）
+
+各 lane 单独扫 tap，A-sync 判据：
+
+| tap | 各 lane A-sync |
+|----:|:--------------|
+| 0-12 | 16-17（平台）|
+| 16 | 14-16 |
+| 20 | 5-15 |
+| 24 | 1-2 |
+| 28（旧默认）| ~0（眼外）|
+
+**4 条 lane 收敛到同一个 tap=2**（[2,2,2,2]），A-sync 在 tap 0-12 都是平台 16-17。
+
+### 关键发现：这套飞线 4 lane 之间几乎无 skew
+
+- **per-lane 校准没找到 lane 间偏移**——4 条 lane 都要 tap≈2，眼在 0-12 都平。说明**飞线
+  lane 间 skew < 1 个 IDELAY tap（78ps）**，本就匹配得好。
+- 所以**全局单 tap 已接近最优**，per-lane 在这块板子上没有额外增益（没有 skew 可补）。
+- [2,2,2,2] 多次严格解码：byte-err **0.02–0.047%**（RESERVED 仅 1-2 个/抓），比之前单次
+  0.110% 更稳更低；顺序核对仍 PASS 33/33。残余 1-2 个 RESERVED = 解码器段边界重锁的固有
+  开销，**不是系统性 lane skew**。
+
+### 诚实结论
+
+- **93.8M 真 ETM 逐指令干净**（14/14、顺序 PASS、byte-err ~0.03%），关键是 IDELAY 全局
+  tap 从眼外的 28 移到眼内的 2。
+- **per-lane IDELAY 已实装可用**（RTL+工具+校准脚本），但**这块板子 4 lane 无显著 skew**
+  （都要 tap=2），所以 per-lane 相比全局 tap 无额外增益——这是诚实的负结果：proposal 33 的
+  机制到位了，但当前硬件不需要它（飞线恰好匹配）。若换 skew 更大的连线/更高频眼更窄时，
+  per-lane 才会显现价值，届时校准脚本和 CSR 通路已就绪。
+- 残余 ~0.03% 是解码器重锁开销（RESERVED 落在段边界），非采集字节错——采集层在 93.8M
+  对真 ETM 已实质零字节错。
+
+### 净成果
+
+- 真 ETM 逐指令干净：**93.8M**（IDELAY tap 调进眼）。
+- per-lane IDELAY 基础设施就绪（CSR 0x06 + set-tap-lane + perlane_idelay_cal.py），
+  当前板子无 skew 用不上，但为更高频/更差连线备好。
