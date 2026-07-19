@@ -240,6 +240,17 @@ TRACECLK 零字节错、14/14、顺序 PASS。本方案不动采集前端，只�
   无限循环让 ETM 流持续（单次 -O0 跑完即 idle 无 trace）；UART 在 clock override 后 re-init;
   跨会话 IDDR 半-nibble 相位偏移需断电复位。
 
+**阶段 1 完成（2026-07-19）✅** —— 只改 -O0→-O3，频率/过滤/cache 不动：
+- CoreMark CRC 仍全对（计算正确）。**反常：-O3 更慢**（228 Iter/s vs -O0 486，Total 8.7s
+  vs 4.1s）。DWT 硬测 CPU=150.1M 确认时钟正常。根因=**无 cache + flash 等待**：HCLK=75M、
+  I/D cache 未开、CoreMark 指针追逐密集（list/matrix/state），-O3 的激进内联/循环展开假设
+  有 cache，无 cache 时更多 flash stall 反被拖慢。**预演了阶段 3（开 cache）的必要性**
+  （doc 29 早证 M7 靠 cache 全速）。非 bug。
+- **ETM trace：999 PC / 100% flash / 采集字节错 0.000%**（RESERVED=0，9765 指令区间全合法）。
+- **trace 更密**：fsync 3418(-O0)→18(-O3)，deframed 7660→16313 —— -O3 分支/数据更密集，
+  HSYNC 填充锐减，trace 字节率上升但仍在端口承载内、零字节错、能解出调用图（core_bench_list/
+  state、core_state_transition、crc16/crcu16/crcu32）。
+
 ### 阶段依赖图（单变量链）
 
 ```
