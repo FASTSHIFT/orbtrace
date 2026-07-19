@@ -123,3 +123,40 @@ mem_base = 0x08000000   # ← 硬编码
 **下一步**：用修复后的解码器，重跑 proposal 36 的阶段2/3 关键抓样（BB-OFF 无cache、BB-OFF+cache
 各频点），重新评估"函数级 trace 追平"的真实可达性——之前的悲观结论建立在错误解码上，需要
 在正确基座上重做。
+
+---
+
+## 7. 端到端重跑验证（bugfix 后，2026-07-20）
+
+用修复后的解码器重抓 BB-OFF+cache+150M，导出 Perfetto perf，做**三重独立交叉验证**：
+
+### 验证 1：opencsd 调用边逐条对照 ELF（`verify_calls.py`）
+提取解码流所有 `b+link`（函数调用）边，检查末尾指令确为 bl/blx 且目标 == ELF 静态目标：
+```
+b+link call edges: 373
+  end insn really is bl/blx: 373
+  target matches ELF static (or indirect blx): 373
+  MISMATCH/suspect: 0
+```
+**373/373 调用边全部对上 ELF 真实调用关系，零不匹配。**
+
+### 验证 2：orbetto 独立解码路径（自读 ELF、自 deframe）
+`orbetto -C 150000 -t 1 -e stm32h743_*.elf -F timed.time.bin`：
+- **PC bitmap cardinality = 962**（bug 修复前是 0——"cardinality=0"也是基址 bug 的连锁后果）。
+- Overflows: 0。导出 `coremark_bb0_cache_150m_memfix.perf`（工程根目录）。
+
+### 验证 3：perf 调用栈函数名（Perfetto slice）
+perf 里的调用栈 slice 全是 CoreMark 真实函数，**零 HAL/ee_printf 假调用**：
+```
+core_state_transition 142, crc16 114, cmp_complex 95, crcu32 16, crcu16 5,
+core_bench_state 3, core_bench_list 2, cm_benchmark_main 1
+```
+嵌套关系合 ELF：cmp_complex 真实调用 core_bench_matrix/crcu16/core_bench_state（objdump 证实），
+与 perf 共现一致。
+
+**三重独立路径（opencsd 逐指令 + orbetto 独立解码 + Perfetto 栈）全部干净、互相印证。**
+BB-OFF + cache + 150M 的函数级 trace 在修复解码器后**逐条对上真实调用链**——彻底坐实
+proposal 38 的根因结论，也彻底推翻 r28/r29"cache 下 BB-OFF 必然漂移"的悲观判断。
+
+**产物**：`~/workpath/orbcode/coremark_bb0_cache_150m_memfix.perf`；验证脚本
+`syn/artix7/bringup/decode/verify_calls.py`。
