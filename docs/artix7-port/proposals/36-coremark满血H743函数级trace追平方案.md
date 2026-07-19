@@ -269,6 +269,53 @@ TRACECLK 零字节错、14/14、顺序 PASS。本方案不动采集前端，只�
 - 调用图仍完整正确（BB OFF 下靠 ELF 静态推断直接分支，间接分支/返回重建函数进出），采集
   字节错 0.000%。产物 `coremark_o3_bboff_112m.perf`。
 
+**阶段 3 完成（2026-07-19）✅** —— 只加开 I/D cache（`-DBOARD_ENABLE_CACHE`，运行时
+SCB_EnableICache/DCache），-O3/BB-OFF/150M 不动：
+- **CoreMark 分数跃升**：228 Iter/s（阶段1 -O3 无cache）→ **612 Iter/s**（-O3+cache），
+  提升 **2.67×**，修复了阶段1的"-O3 反慢"，坐实 doc 29"M7 靠 cache 全速"。CRC 仍全对。
+- **cache 全速 + BB-OFF 过滤，trace 字节率仍可控**：non-HSYNC 5.1%(无cache BB-OFF)→
+  **6.7%**(cache+BB-OFF)，仅微升，**远低于端口承载**。1008 PC / 100% flash /
+  **采集字节错 0.000%**（opencsd_etm4_run，1109 指令区间 RESERVED=0）。
+- **对照 doc 29 的决定性意义**：当年 cache+全BB 溢出 1356 次；现在 cache+BB-OFF 过滤
+  **0 溢出、0 字节错**——**过滤是 cache 全速下不溢出的关键**，验证了方案主线。
+- 注：orbetto 的 TPIUPump 对这个极稀疏(6.7%数据/高fsync)BB-OFF 流导出 Perfetto 时
+  cardinality=0（opencsd 官方 deframer 正常出 1008 PC）——是 orbetto deframe 对稀疏流的
+  适配问题，非采集问题，后续单独修（阶段验收用 opencsd 逐指令判据）。
+
+**阶段 3 补充：cache 揭出两个硬约束（2026-07-19）⚠️**
+
+阶段 3 开 cache 后，对 Perfetto 调用栈做了逐函数 vs ELF objdump 的对齐核对（不是集合覆盖），
+发现两个之前乐观结论没暴露的硬约束：
+
+**约束 1：BB-OFF + cache → 调用图走偏（解码推断误差，非采集错）**
+- 逐 transition 对照 ELF 真实 BL 目标：cache+BB-OFF 出现大量**假调用**——
+  `core_list_init→HAL_UART_Init ×22`（core_list_init 在 ELF 里根本不调用任何函数）、
+  `matrix_test→core_init_matrix ×3`（matrix_test 只调 crc16）。
+- **决定性对照**（三配置同 workload）：
+  | 配置 | 假调用 | 采集字节错 |
+  |------|:---:|:---:|
+  | BB-OFF 无 cache（阶段2）| **无**（604 visit，17 transition 全合法）| 0.000% |
+  | **BB-OFF + cache（阶段3）** | **多**（HAL_UART_Init×22 等）| 0.000% |
+  | BB=1 + cache | 无（仅真实 SysTick→HAL_IncTick）| 0.019% |
+- **机制**：BB-OFF 用"带宽换推断"——不发直接分支地址，解码器靠 ELF 反汇编**盲推**两个间接
+  分支锚点之间的直接分支流。cache 命中让 M7 双发射零等待全速跑，间接分支**锚点物理间距拉大**
+  （visit 190 vs 无cache 604），盲推路程超出可靠范围，一个数据相关条件分支猜错方向就顺着
+  ELF **走进物理相邻的错误函数**（core_list_init@0x7f54 紧邻 HAL_UART_Init@0x791c），无锚点纠回。
+- **本质**：字节错仍 0（采集没问题），是 **BB-OFF 推断模型在 cache 稀疏锚点下的解码局限**。
+  BB=1（每分支发地址、不盲推）在 cache 下调用图干净 → 坐实是"BB-OFF 盲推 × cache 稀疏锚点"
+  的组合，非 cache 本身或采集。
+
+**约束 2：BB=1 + cache 在当前 150M 就已爆带宽**
+- 实测 BB=1+cache @150M CPU / 112.5M TRACECLK：**ETF 溢出 37-64 次**——ETM 生成率已 >112.5MB/s
+  端口 drain 上限。抓样有效数据占比 ~50%（端口限制后的值，真实生成率更高）。
+- 即 **cache 全速 + 全 BB，150M 主频就溢出**（与 doc 29 一致：cache+全BB 在 12.8M 就溢出）。
+  480M 满血更是远超。**BB=1 不是满血 480M 的可行选项**。
+
+**两难**：BB=1 准但爆带宽（150M 即溢出）；BB-OFF 省带宽但 cache 稀疏锚点下调用图走偏。
+需要红方评审下一步方向（见评审请求）。候选：(a) BB-OFF + 提高 TRCSYNCPR 加密周期性 A-sync
+锚点补偿盲推；(b) BB-OFF + address-range filter 只 trace 关心区间（缩短盲推跨度）；
+(c) 降 CPU 主频找 BB=1 不溢出的临界点（但离"满血"远）；(d) TRCSTALL 停核无损（侵入式）。
+
 ### 阶段依赖图（单变量链）
 
 ```
