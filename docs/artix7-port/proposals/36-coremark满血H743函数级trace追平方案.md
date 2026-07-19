@@ -350,6 +350,16 @@ SCB_EnableICache/DCache），-O3/BB-OFF/150M 不动：
 3. 下一步：落地 **BB-OFF + TRCVIICTLR/TRCACVR address-range filter**（红方候选 b），
    只 trace 热点函数区间，缩短盲推跨度验证 cache 全速下调用图不再走偏。
 
+**候选 (a)(b) 硬件可行性实测（2026-07-19）→ 均不可用**（`r28-response-候选ab硬件不可用.md`）：
+- **候选 (b) range-filter 不可用**：`TRCIDR4.NUMACPAIRS=0`（0 对地址比较器），写 `TRCACVR0`
+  读回 0 —— 此 M7 ETM 精简实现，**无地址比较器**，硬件 range-filter 基础不存在。
+- **候选 (a) 加密 A-sync 不可用**：`TRCIDR3.SYNCPR[25]=1`（同步周期固定），写 `TRCSYNCPR`
+  0x08/0x0d 均读回 0x0A —— A-sync 周期**硬件固定 1024B，不可编程**。
+- **两个片上"缩盲推跨度"手段硬件都不可用。** 唯一剩余路线 = **纯软件解码侧盲推约束**
+  （ELF 函数边界处无锚点不跨界，抑制假调用，零上板）或退一步接受 **BB-OFF 采样式统计**
+  （多次抓样统计热点函数出现频次，而非精确逐 transition 调用图）——与 R2 裁决"采样式剖析"
+  定位一致。这是下一步落地方向。
+
 ### 阶段依赖图（单变量链）
 
 ```
