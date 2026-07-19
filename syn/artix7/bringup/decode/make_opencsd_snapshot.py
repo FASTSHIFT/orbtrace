@@ -32,11 +32,38 @@ Then:
 """
 import argparse
 import os
+import re
 import subprocess
 import sys
 
 READELF = os.environ.get("READELF", "arm-none-eabi-readelf")
 OBJCOPY = os.environ.get("OBJCOPY", "arm-none-eabi-objcopy")
+
+
+def _lowest_load_lma(elf):
+    """Return the lowest LMA among the sections objcopy -O binary emits, so the
+    decoder's memory base matches mem.bin's true first byte. objcopy starts the
+    flat binary at the lowest included section's LMA; hardcoding 0x08000000 when
+    .isr_vector is absent skews every fetch. Parse `objdump -h` LMA column and
+    take the min over allocatable, non-zero-LMA code/data sections."""
+    try:
+        out = subprocess.check_output(
+            [OBJCOPY.replace("objcopy", "objdump"), "-h", elf]).decode()
+    except Exception:
+        return 0x08000000
+    lmas = []
+    for line in out.splitlines():
+        # columns: Idx Name Size VMA LMA FileOff Algn
+        m = re.match(r"\s*\d+\s+(\S+)\s+([0-9a-f]{8})\s+([0-9a-f]{8})\s+"
+                     r"([0-9a-f]{8})", line)
+        if m:
+            name, size, vma, lma = m.group(1), int(m.group(2), 16), \
+                int(m.group(3), 16), int(m.group(4), 16)
+            if name in (".isr_vector", ".text", ".rodata", ".ARM.exidx",
+                        ".init_array", ".fini_array", "ER_IROM1") \
+                    and size > 0 and lma != 0:
+                lmas.append(lma)
+    return min(lmas) if lmas else 0x08000000
 
 # ---- ETMv3.5 (Cortex-M4) live register defaults -----------------------------
 # Live values for the STM32F429 Cortex-M4 ETM (override via env).
@@ -122,6 +149,7 @@ def main():
     #    the whole ELF (objcopy will strip non-loadable).
     mem_bin = os.path.join(a.out_dir, "mem.bin")
     subprocess.run([OBJCOPY, "-O", "binary",
+                    "--only-section=.isr_vector",
                     "--only-section=.text", "--only-section=.rodata",
                     "--only-section=.ARM.exidx", "--only-section=.init_array",
                     "--only-section=.fini_array",
@@ -131,7 +159,17 @@ def main():
         subprocess.run([OBJCOPY, "-O", "binary", a.elf, mem_bin],
                        capture_output=True)
     mem_size = os.path.getsize(mem_bin)
-    mem_base = 0x08000000
+
+    # CRITICAL (r30-followup bugfix): objcopy -O binary starts the output at the
+    # LOWEST included section's LMA and pads gaps, but does NOT pad before it.
+    # If .isr_vector (@0x08000000) is omitted, mem.bin starts at .text's LMA
+    # (0x080002a0) yet we used to hardcode base=0x08000000 -> a 0x2a0-byte skew:
+    # the decoder fetched wrong opcodes for EVERY address. BB=1 masked this
+    # (explicit address packets re-anchor every branch) but BB=0 relies on the
+    # image to infer direct branches, so the skew corrupted the whole call graph
+    # (the "false calls"/"blind-inference drift" seen in stage 3 / r29). Derive
+    # the base from the ELF's lowest loadable section LMA instead of hardcoding.
+    mem_base = _lowest_load_lma(a.elf)
 
     fmt = "coresight" if a.coresight else "source_data"
 
