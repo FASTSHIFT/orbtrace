@@ -251,6 +251,24 @@ TRACECLK 零字节错、14/14、顺序 PASS。本方案不动采集前端，只�
   HSYNC 填充锐减，trace 字节率上升但仍在端口承载内、零字节错、能解出调用图（core_bench_list/
   state、core_state_transition、crc16/crcu16/crcu32）。
 
+**阶段 2 完成（2026-07-19）✅** —— 只改 BB=1→BB OFF（TRCCONFIGR.BB=0），-O3/150M/cache 不动：
+这是方案核心"只 trace 函数进出"。BB OFF 后直接分支不发地址（解码器靠 ELF 推断），只有
+间接分支/返回/异常发地址 = 函数进出锚点。
+
+| 指标（同 -O3 CoreMark）| BB=1（阶段1）| **BB OFF（阶段2）** |
+|---|---|---|
+| deframed ETM 字节 | 16313 | **2760** |
+| non-HSYNC 数据占比 | ~26% | **5.1%** |
+| 实际 trace 字节率 | 高 | **降 ~5-6×** |
+| unique PC | 999 | 656（100% flash）|
+| 采集字节错 | 0.000% | **0.000%** |
+| 调用图 | 完整 | **完整**（core_bench_state⇄state_transition, crcu16→crcu32）|
+
+- **BB OFF 把 trace 字节率降一个数量级**（deframed 16313→2760，~6×），正是方案核心：全指令
+  trace 压成函数进出流。这对追平满血 480M 关键（全 BB 会灌爆端口）。
+- 调用图仍完整正确（BB OFF 下靠 ELF 静态推断直接分支，间接分支/返回重建函数进出），采集
+  字节错 0.000%。产物 `coremark_o3_bboff_112m.perf`。
+
 ### 阶段依赖图（单变量链）
 
 ```
