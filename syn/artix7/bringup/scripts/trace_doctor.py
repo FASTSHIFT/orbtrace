@@ -204,6 +204,60 @@ def cmd_probe_health(a):
     return rc
 
 
+def cmd_probe_stream_link(a):
+    """Isolate the UDP TX path from the trace pipeline.
+
+    Switches the FPGA STREAM source (CSR 0x09) from cap_byte to a free-running
+    byte counter, receives for N seconds, and checks that every byte in the
+    reassembled stream is (prev+1) mod 256 -- a strictly monotone ramp. This
+    verifies clk200 -> clk125 async FIFO, packetiser, self-TX FSM, UDP checksum
+    bypass, verilog-ethernet MAC, PHY, cable, host NIC, kernel socket buffers,
+    and Python receiver -- with ETM, TPIU, cache, cables to STM32, and clock
+    synthesis on both sides *taken out of the loop*. So when it is green and
+    real-trace mode still fails, the fault is not in the network path.
+
+    Restores real-trace mode on exit."""
+    import subprocess as sp
+    import time
+    HERE = Path(__file__).parent
+    out = getattr(a, "out", None) or "/tmp/stream_selftest.bin"
+    seconds = getattr(a, "seconds", 2.0)
+    ip = getattr(a, "ip", None) or "192.168.10.42"
+    try:
+        sp.run([sys.executable, str(HERE / "trace_ctrl.py"),
+                "--ip", ip, "stream-selftest", "1"], check=True)
+        time.sleep(0.3)
+        r = sp.run([sys.executable, str(HERE / "stream_recv.py"),
+                    "--out", out, "--seconds", str(seconds), "--ip", ip],
+                   capture_output=True, text=True)
+        print(r.stdout, end="")
+        if r.stderr.strip():
+            print(r.stderr, end="", file=sys.stderr)
+        # Content check: verify (prev+1) mod 256 across every received byte.
+        data = Path(out).read_bytes()
+        breaks = 0
+        first_break = None
+        for i in range(1, len(data)):
+            if data[i] != (data[i - 1] + 1) & 0xFF:
+                breaks += 1
+                if first_break is None:
+                    first_break = i
+        if breaks == 0:
+            print(f"[trace_doctor] ramp integrity OK over {len(data)} bytes "
+                  f"({len(data)/1e6:.2f} MB)")
+        else:
+            ctx = data[max(0, first_break-4):first_break+4].hex(' ')
+            print(f"[trace_doctor] ramp broken {breaks} times, first at byte "
+                  f"{first_break}: {ctx}", file=sys.stderr)
+            print("               -> UDP TX path is losing bytes; check "
+                  "stream_lost_cnt (DEPTH+34) and seq-gap counts above",
+                  file=sys.stderr)
+    finally:
+        sp.run([sys.executable, str(HERE / "trace_ctrl.py"),
+                "--ip", ip, "stream-selftest", "0"])
+    return 0 if breaks == 0 else 1
+
+
 def cmd_probe_wire(a):
     """Pin connectivity — trace pins wire-check."""
     script = "pin_wire_check_isolated.py" if a.isolated else "pin_wire_check.py"
@@ -361,7 +415,15 @@ def cmd_capture_status(a):
 
 
 def cmd_capture_stream(a):
-    return native("trace_stream_rx.py", *(a.extra or [])).returncode
+    """Continuous UDP trace capture (trace_iddr_clktap_stream.bit, STREAM=1).
+
+    Runs stream_recv.py which listens on STREAM_DEST_PORT (default 5555),
+    reassembles the [4-byte seq][payload] packets into a byte file, and reports
+    both wire-side losses (seq-gap) and capture-side losses (the clk200 async
+    FIFO drop counter at DEPTH+34..37). Use this instead of `capture snapshot`
+    when the workload is longer than the 60 KB one-shot buffer -- e.g. a whole
+    CoreMark iteration at 2-bit (50 MB/s port rate)."""
+    return native("stream_recv.py", *(a.extra or [])).returncode
 
 
 def cmd_capture_la_dump(a):
@@ -584,8 +646,13 @@ def cmd_etm_width(a):
     (upstream traceIF.v has `width` as a wire; we used to bake it into a
     localparam and resynthesise per width)."""
     size = {4: 0x08, 2: 0x02, 1: 0x01}[a.value]
+    # TPIU has a CoreSight software lock: with LSR.LOCKED set, writes to
+    # CURPSIZE/FFCR/etc are silently dropped and the register reads back its
+    # previous value (measured: writing 0x08 with the lock on left it at 0x01).
+    # Unlock by writing 0xC5ACCE55 to LAR (+0xFB0) first. See etm_enable cfg.
     cmd = ["openocd", "-f", "interface/cmsis-dap.cfg", "-f", "target/stm32h7x.cfg",
            "-c", "init", "-c", "halt",
+           "-c", "mww 0x5C015FB0 0xC5ACCE55",
            "-c", f"mww 0x5C015004 0x{size:08x}",
            "-c", "echo [format {CURPSIZE=0x%08x} [mrw 0x5C015004]]",
            "-c", "resume", "-c", "shutdown"]
@@ -953,6 +1020,13 @@ def build_parser():
     x = pp_sub.add_parser("wire", help="trace pin wire-check")
     x.add_argument("--isolated", action="store_true")
     _add_extra(x); x.set_defaults(func=cmd_probe_wire)
+    x = pp_sub.add_parser("stream-link",
+        help="isolate the UDP TX path: stream an FPGA byte ramp and verify "
+             "monotone-mod-256 receipt, bypassing ETM/TPIU/trace pins entirely")
+    x.add_argument("--out", default="/tmp/stream_selftest.bin")
+    x.add_argument("--seconds", type=float, default=2.0)
+    x.add_argument("--ip", default="192.168.10.42")
+    x.set_defaults(func=cmd_probe_stream_link)
     x = pp_sub.add_parser("pin-la", help="pin_la bit health")
     _add_extra(x); x.set_defaults(func=cmd_probe_pin_la)
     x = pp_sub.add_parser("tpiu-pattern",

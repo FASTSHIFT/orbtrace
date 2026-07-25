@@ -30,6 +30,7 @@ REG_TAP = 0x05     # IDDR IDELAY deskew tap (0..31) for ALL lanes; loads it
 REG_TAP_LANE = 0x06  # per-lane tap: value = {lane[6:5], tap[4:0]}
 REG_TAP_CLK = 0x07   # clock-lane IDELAY tap (0..31); >100MHz eye reach
 REG_WIDTH = 0x08     # TPIU parallel port width: 4, 2 or 1 (runtime, no reflash)
+REG_STREAM_SELFTEST = 0x09  # 1=stream FPGA-side byte ramp instead of real trace
 
 
 def write_csr(ip, addr, value, timeout=1.0):
@@ -67,6 +68,10 @@ def main():
     pw = sub.add_parser("set-width",
                         help="TPIU port width 4/2/1 bits (runtime, no reflash)")
     pw.add_argument("value", type=int, choices=(4, 2, 1))
+    ps = sub.add_parser("stream-selftest",
+                        help="stream an FPGA-side byte ramp instead of real "
+                             "trace (isolates the UDP path from ETM)")
+    ps.add_argument("value", type=int, choices=(0, 1))
     sub.add_parser("rearm")
     a = ap.parse_args()
 
@@ -95,6 +100,10 @@ def main():
         write_csr(a.ip, REG_WIDTH, a.value)
         write_csr(a.ip, REG_REARM, 1)
         print(f"set TPIU port width = {a.value} bit (traceIF re-synced, capture re-armed)")
+    elif a.cmd == "stream-selftest":
+        write_csr(a.ip, REG_STREAM_SELFTEST, a.value)
+        print(f"STREAM data source = "
+              f"{'FPGA byte ramp (selftest)' if a.value else 'real trace'}")
     elif a.cmd == "rearm":
         write_csr(a.ip, REG_REARM, 1)
         print("soft re-arm pulsed")

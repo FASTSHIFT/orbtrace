@@ -49,7 +49,7 @@ module trace_stream_top #(
                                       // captured stream must be an exact +7
                                       // mod-16 ramp; any deviation = the async
                                       // oversampling architecture itself errs.
-    parameter       TRACE_WIDTH = 4   // POWER-ON DEFAULT TPIU port width: 4, 2
+    parameter       TRACE_WIDTH = 4,  // POWER-ON DEFAULT TPIU port width: 4, 2
                                       // or 1 bits. Runtime-switchable via CSR
                                       // 0x08 (see below), so one bitstream
                                       // covers all three widths -- upstream
@@ -57,6 +57,38 @@ module trace_stream_top #(
                                       // making it a localparam here was what
                                       // forced a resynthesis per width.
                                       // 2-bit uses TRACED0/1, 1-bit TRACED0.
+    parameter       STREAM = 0,       // 0: one-shot capture into BRAM, PC pulls
+                                      // over UDP :5001 (default, keeps every
+                                      // debugging feature). 1: continuous UDP
+                                      // push of cap_byte to STREAM_DEST_IP:PORT
+                                      // via fpga_core_net's self-TX FSM, so a
+                                      // full CoreMark run fits at 2-bit. Only
+                                      // supported with CAP_RAW=1 (streaming a
+                                      // traceIF-framed byte stream would need a
+                                      // separate frame-rate FIFO).
+    parameter [31:0] STREAM_DEST_IP   = {8'd192, 8'd168, 8'd10, 8'd245},
+    parameter [15:0] STREAM_DEST_PORT = 16'd5555,
+    parameter [15:0] STREAM_PAYLOAD   = 16'd1024,   // UDP payload bytes/packet
+                                                    // (excluding the 4-byte seq
+                                                    // header we prepend).
+    parameter       STREAM_FIFO_DEPTH = 8192,       // clk200 -> clk125 async
+                                                    // FIFO for trace bytes.
+                                                    // Sized for ~80 us at the
+                                                    // 100 MHz TRACECLK peak;
+                                                    // grow if lost_cnt trips.
+    parameter       STREAM_SELFTEST = 0             // 1: bypass the trace
+                                                    // front-end and stream a
+                                                    // free-running clk125 byte
+                                                    // counter -- pure network
+                                                    // link + UDP TX path test,
+                                                    // no ETM required. The
+                                                    // host verifies the ramp
+                                                    // is monotone mod 256 and
+                                                    // gap-free by sequence
+                                                    // number, so any wire-side
+                                                    // loss is unambiguous.
+                                                    // Runtime CSR 0x09 also
+                                                    // toggles it (data[0]=1).
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -228,6 +260,7 @@ module trace_stream_top #(
     reg  [4:0] tap_csrc = 5'd0;               // clock-lane tap (0 = no clk delay)
     reg        tap_load_125 = 1'b0;
     reg  [1:0] width_csr = TIF_WIDTH_DEF;     // TPIU port width (CSR 0x08)
+    reg        selftest_csr = STREAM_SELFTEST[0]; // STREAM data source (CSR 0x09)
     always @(posedge clk125) begin
         rearm_125 <= 1'b0;
         tap_load_125 <= 1'b0;
@@ -269,6 +302,12 @@ module trace_stream_top #(
                     default: width_csr <= csr_data_w[1:0];
                 endcase
             end
+            // STREAM data source select (STREAM=1 builds only):
+            //   0 = real trace (cap_byte from trace_capture_a7, default)
+            //   1 = FPGA-side selftest ramp (bypasses trace front-end entirely)
+            // This gives us an unambiguous "is the UDP TX path healthy?" test
+            // that stands on its own -- no STM32, no ETM, no TRACECLK involved.
+            if (csr_addr_w == 8'h09) selftest_csr <= csr_data_w[0];
         end
     end
 
@@ -465,6 +504,15 @@ module trace_stream_top #(
                           (ext_addr == NB+32)    ? cclast_125[31:24] :
                           // active TPIU port width (4/2/1), CSR 0x08
                           (ext_addr == NB+33)    ? width_rb :
+                          // stream mode: bytes dropped by the clk200->clk125
+                          // async FIFO because the network path lagged the
+                          // capture. Any nonzero value is diagnostic.
+                          (ext_addr == NB+34)    ? stream_lost_cnt[7:0] :
+                          (ext_addr == NB+35)    ? stream_lost_cnt[15:8] :
+                          (ext_addr == NB+36)    ? stream_lost_cnt[23:16] :
+                          (ext_addr == NB+37)    ? stream_lost_cnt[31:24] :
+                          // STREAM selftest mode readback (CSR 0x09)
+                          (ext_addr == NB+38)    ? {7'b0, selftest_csr} :
                           // ts table window: NB+64 .. NB+64+4*TS_N (LE u32/entry)
                           ts_win                 ? ts_byte : 8'h00;
         assign led1 = ~rfull;
@@ -497,7 +545,159 @@ module trace_stream_top #(
     end
     endgenerate
 
-    fpga_core_net #(.TARGET("XILINX")) u_eth (
+    // ==================================================================
+    // Continuous UDP streaming path (STREAM=1)
+    // ==================================================================
+    // cap_byte / cap_valid come out of trace_capture_a7 in the clk200 domain
+    // (see the IDDR generate's small trace_clk->clk200 CDC FIFO). Cross into
+    // clk125 for the packetiser and fpga_core_net's self-TX FSM, prepend a
+    // 32-bit BE sequence per packet so the host can spot any lost UDP frame.
+    // Reuse of the fpga_core_net STREAM contract that trace_mmcm_stream_top
+    // already validated; only the source of cap_byte changes.
+    //
+    // Byte rates for context (TRACECLK=100 MHz, cap_byte is 1 B / TRACECLK
+    // regardless of port width; unused lanes are just static levels):
+    //   4-bit   100 MB/s   (would swamp a 125 MB/s GigE budget)
+    //   2-bit    50 MB/s   (product-target width; comfortably < 100 MB/s)
+    //   1-bit    25 MB/s
+    // At 2-bit half the bits are dead lanes, but streaming those alongside is
+    // free and lets the host distinguish "silent because of dead lane" from
+    // "silent because of no trace".
+    wire [7:0] stream_tdata;
+    wire       stream_tvalid;
+    wire       stream_tready;
+    wire [31:0] stream_lost_cnt;
+    wire        stream_active_led;
+    generate
+    if (STREAM && CAP_RAW) begin : g_stream
+        // ---- selftest ramp source (CSR 0x09) --------------------------------
+        // Free-running byte counter in clk200 (same domain as cap_byte, so the
+        // downstream async FIFO / packetiser doesn't care which one is live).
+        // Advances every clk200 cycle -> 200 MB/s, way above the 100 MB/s trace
+        // rate, so if the network path is healthy it also exercises it beyond
+        // real workload. Any received byte that isn't (prev+1) mod 256 is a
+        // capture-side drop -- but note the async FIFO already applies
+        // backpressure, so the correct expectation is "monotone mod 256 with
+        // possible steps > 1 where the FIFO stalled the counter's producer"
+        // ... we sidestep that by only advancing the counter when the FIFO
+        // accepts a byte, i.e. treat it as a normal AXIS source.
+        wire selftest_active;
+        reg [7:0] bw_cnt = 8'd0;
+        wire       bw_valid = selftest_active;   // always has data
+        wire       bw_ready;                     // driven by u_cdc.s_axis_tready
+        always @(posedge clk200) begin
+            if (sys_rst)             bw_cnt <= 8'd0;
+            else if (bw_valid && bw_ready) bw_cnt <= bw_cnt + 8'd1;
+        end
+
+        // Sync selftest_csr (clk125) into clk200 (source domain).
+        reg selftest_s0 = 0, selftest_200 = 0;
+        always @(posedge clk200) begin selftest_s0 <= selftest_csr; selftest_200 <= selftest_s0; end
+        assign selftest_active = selftest_200;
+
+        // Mux into the FIFO input.
+        wire [7:0] src_data  = selftest_active ? bw_cnt   : cap_byte;
+        wire       src_valid = selftest_active ? bw_valid : cap_valid;
+        assign     bw_ready  = fifo_in_ready & selftest_active;
+
+        // clk200 -> clk125 async FIFO
+        wire [7:0] fifo_out_data;
+        wire       fifo_out_valid;
+        wire       fifo_out_ready;
+        wire       fifo_in_ready;
+        wire [$clog2(STREAM_FIFO_DEPTH):0] m_depth;
+
+        axis_async_fifo #(
+            .DEPTH(STREAM_FIFO_DEPTH), .DATA_WIDTH(8),
+            .KEEP_ENABLE(0), .LAST_ENABLE(0), .USER_ENABLE(0), .FRAME_FIFO(0)
+        ) u_cdc (
+            .s_clk(clk200), .s_rst(sys_rst),
+            .s_axis_tdata(src_data), .s_axis_tkeep(1'b0),
+            .s_axis_tvalid(src_valid), .s_axis_tready(fifo_in_ready),
+            .s_axis_tlast(1'b0), .s_axis_tid(8'h0), .s_axis_tdest(8'h0),
+            .s_axis_tuser(1'b0),
+            .m_clk(clk125), .m_rst(sys_rst),
+            .m_axis_tdata(fifo_out_data), .m_axis_tkeep(),
+            .m_axis_tvalid(fifo_out_valid), .m_axis_tready(fifo_out_ready),
+            .m_axis_tlast(), .m_axis_tid(), .m_axis_tdest(), .m_axis_tuser(),
+            .s_pause_req(1'b0), .s_pause_ack(),
+            .m_pause_req(1'b0), .m_pause_ack(),
+            .s_status_depth(), .s_status_depth_commit(), .s_status_overflow(),
+            .s_status_bad_frame(), .s_status_good_frame(),
+            .m_status_depth(m_depth), .m_status_depth_commit(),
+            .m_status_overflow(),
+            .m_status_bad_frame(), .m_status_good_frame()
+        );
+
+        // Drop counter (clk200): every src_valid the FIFO cannot accept means
+        // the network/packetiser lags the source. Any nonzero value is a
+        // diagnostic. In selftest mode the counter self-throttles (bw_ready
+        // gates its advance), so this reports drops only in real-trace mode --
+        // which is exactly what we care about.
+        reg [31:0] lost200 = 32'd0;
+        wire       drop = cap_valid & ~fifo_in_ready & ~selftest_active;
+        always @(posedge clk200) begin
+            if (sys_rst)    lost200 <= 32'd0;
+            else if (drop)  lost200 <= lost200 + 1'b1;
+        end
+        // CDC to clk125 for CSR readback (quasi-static -> 2FF sync is fine)
+        reg [31:0] lost_s0 = 0, lost_125 = 0;
+        always @(posedge clk125) begin lost_s0 <= lost200; lost_125 <= lost_s0; end
+        assign stream_lost_cnt = lost_125;
+
+        // Packetiser: [4-byte BE seq][STREAM_PAYLOAD trace bytes] per UDP frame.
+        // Same shape as trace_mmcm_stream_top, minus the heartbeat/startup
+        // machinery (we assume the host is up before enabling trace here).
+        localparam integer PKT = STREAM_PAYLOAD + 4;
+        reg [31:0] seq = 0;
+        reg [15:0] pos = 0;
+        reg        pkt_active = 0;
+        wire       in_header = (pos < 16'd4);
+        // Only start a packet once the FIFO has at least a full payload buffered
+        // (or the FSM will underrun and pad with 0x00, wasting bandwidth).
+        wire       can_start = (m_depth >= STREAM_PAYLOAD[$clog2(STREAM_FIFO_DEPTH):0]);
+
+        wire [7:0] seq_byte = (pos == 16'd0) ? seq[31:24] :
+                              (pos == 16'd1) ? seq[23:16] :
+                              (pos == 16'd2) ? seq[15:8]  :
+                                               seq[7:0];
+        assign stream_tvalid  = pkt_active & (in_header | fifo_out_valid);
+        assign stream_tdata   = in_header ? seq_byte : fifo_out_data;
+        assign fifo_out_ready = pkt_active & ~in_header & stream_tready;
+
+        always @(posedge clk125) begin
+            if (sys_rst) begin
+                pos <= 0; seq <= 0; pkt_active <= 0;
+            end else if (!pkt_active) begin
+                if (can_start) pkt_active <= 1'b1;
+                pos <= 0;
+            end else if (stream_tvalid && stream_tready) begin
+                if (pos == PKT-1) begin
+                    pos <= 0;
+                    seq <= seq + 1'b1;
+                    pkt_active <= 1'b0;
+                end else begin
+                    pos <= pos + 1'b1;
+                end
+            end
+        end
+        assign stream_active_led = pkt_active;
+    end else begin : g_no_stream
+        assign stream_tdata      = 8'h00;
+        assign stream_tvalid     = 1'b0;
+        assign stream_lost_cnt   = 32'd0;
+        assign stream_active_led = 1'b0;
+    end
+    endgenerate
+
+    fpga_core_net #(
+        .TARGET("XILINX"),
+        .STREAM((STREAM && CAP_RAW) ? 1 : 0),
+        .UDP_CHECKSUM_GEN_ENABLE(0),  // stalls a continuous self-TX; per fpga_core_net
+        .STREAM_DEST_IP(STREAM_DEST_IP),
+        .STREAM_DEST_PORT(STREAM_DEST_PORT),
+        .STREAM_PKT_BYTES((STREAM && CAP_RAW) ? (STREAM_PAYLOAD + 16'd4) : 16'd1024)
+    ) u_eth (
         .clk(clk125), .clk90(clk125_90), .rst(sys_rst),
         .btnu(1'b0), .btnl(1'b0), .btnd(1'b0), .btnr(1'b0), .btnc(1'b0),
         .sw(8'h0), .led(),
@@ -508,7 +708,9 @@ module trace_stream_top #(
         .uart_rxd(1'b1), .uart_txd(),
         .dbg_rx_good_frame(), .dbg_rx_bad_fcs(), .dbg_tx_axis_tvalid(),
         .ext_addr(ext_addr), .ext_data(ext_data),
-        .csr_addr(csr_addr_w), .csr_data(csr_data_w), .csr_we(csr_we_w)
+        .csr_addr(csr_addr_w), .csr_data(csr_data_w), .csr_we(csr_we_w),
+        .stream_tdata(stream_tdata), .stream_tvalid(stream_tvalid),
+        .stream_tready(stream_tready)
     );
 
     assign phy_mdio = 1'bz;
