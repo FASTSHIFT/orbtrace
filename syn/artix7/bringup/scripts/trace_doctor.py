@@ -403,15 +403,29 @@ def cmd_burn_fpga(a):
 
 
 def cmd_burn_fw(a):
-    """Burn STM32 firmware via openocd."""
+    """Burn STM32 firmware via openocd (CMSIS-DAP + stm32h7x cfg).
+
+    NOTE: `program.sh` in scripts/ is a *FPGA* JTAG loader (via Vivado), not
+    an STM32 firmware programmer -- naming is misleading. We use openocd
+    directly here, matching AGENT.md §4.2."""
     hexp = a.hex
     if not Path(hexp).exists():
         sys.exit(f"[trace_doctor] hex not found: {hexp}")
-    rc = native("program.sh", hexp, *(a.extra or [])).returncode
+    cmd = ["openocd", "-f", "interface/cmsis-dap.cfg", "-f", "target/stm32h7x.cfg",
+           "-c", "init", "-c", "reset halt",
+           "-c", f"program {hexp} verify",
+           "-c", "reset run", "-c", "shutdown"]
+    rc = run(cmd, cwd=BRINGUP.parents[2]).returncode
     if rc == 0:
         state_update("stm32", hex_file=hexp, hex_md5=md5_of(Path(hexp)),
                      burned_at=datetime.datetime.now().isoformat(timespec="seconds"))
     return rc
+
+
+def cmd_burn_fpga_persistent(a):
+    """PERSISTENT QSPI flash of FPGA (via program.sh) — for final designs.
+    Contrast with `burn fpga` which is volatile SRAM load via openFPGALoader."""
+    return native("program.sh", a.target, "flash", *(a.extra or [])).returncode
 
 
 def cmd_etm_enable(a):
@@ -435,6 +449,16 @@ def cmd_etm_enable(a):
 
 def cmd_etm_recover(a):
     return native("etm_recover.sh", *(a.extra or [])).returncode
+
+
+def cmd_etm_clear_curtpm(a):
+    """Clear TPIU CURTPM register (test-pattern generator) so real ETM data
+    can flow to the pins. This is a mandatory step after `etm enable` when
+    the ETM cfg leaves CURTPM in test-mode (proposal 36 AGENT.md §4.4)."""
+    cmd = ["openocd", "-f", "interface/cmsis-dap.cfg", "-f", "target/stm32h7x.cfg",
+           "-c", "init", "-c", "halt", "-c", "mww 0x5C015204 0",
+           "-c", "resume", "-c", "shutdown"]
+    return run(cmd, cwd=BRINGUP.parents[2]).returncode
 
 
 def cmd_etm_show(a):
@@ -505,13 +529,106 @@ def _check_l2_fpga_bit(state, verbose=True):
     return issues
 
 
+def _check_l1_probe(state, verbose=True):
+    """L1 physical: DAPLink SWD DPIDR + STM32 IDCODE via a quick openocd."""
+    issues = []
+    r = subprocess.run(
+        ["openocd", "-f", "interface/cmsis-dap.cfg", "-f", "target/stm32h7x.cfg",
+         "-c", "init", "-c",
+         "echo [format {IDCODE=0x%08x} [mrw 0x5C001000]]",
+         "-c", "shutdown"],
+        cwd=str(BRINGUP.parents[2]), capture_output=True, text=True, timeout=10)
+    out = r.stdout + r.stderr
+    if "DPIDR 0x6ba02477" not in out:
+        issues.append("L1 DAPLink SWD DPIDR mismatch or SWD not up")
+    import re
+    m = re.search(r"IDCODE=0x([0-9a-fA-F]+)", out)
+    if m:
+        idcode = int(m.group(1), 16)
+        if (idcode & 0xFFF) != 0x450:
+            issues.append(f"L1 STM32 IDCODE=0x{idcode:08x} (expected H74x/75x family 0x450)")
+        elif verbose:
+            print(f"  L1 STM32 IDCODE=0x{idcode:08x} (H74x/75x)")
+    else:
+        issues.append("L1 STM32 IDCODE readout failed")
+    return issues
+
+
+def _check_l3_net(state, verbose=True):
+    """L3 net: FPGA UDP status 3 consecutive successes."""
+    issues = []
+    fails = 0
+    for i in range(3):
+        r = subprocess.run(
+            ["python3", str(HERE / "trace_dump.py"), "--status-only"],
+            cwd=str(BRINGUP), capture_output=True, text=True, timeout=3)
+        if r.returncode != 0 or "device DEPTH=" not in r.stdout:
+            fails += 1
+    if fails > 0:
+        issues.append(f"L3 FPGA UDP status flaky ({fails}/3 failed)")
+    elif verbose:
+        print(f"  L3 FPGA UDP 3/3 responded")
+    return issues
+
+
+def _check_l7_etm(state, verbose=True):
+    """L7 STM32 ETM state: read CoreSight regs and check for common failure
+    modes (ETM not enabled / IDLE / test-pattern still on / auth locked)."""
+    issues = []
+    r = subprocess.run(
+        ["openocd", "-f", "interface/cmsis-dap.cfg", "-f", "target/stm32h7x.cfg",
+         "-c", "init", "-c", "halt",
+         "-c", "echo [format {PRGCTLR=0x%08x STATR=0x%08x CONFIGR=0x%08x "
+               "CURPSIZE=0x%08x CSTF=0x%08x ETF=0x%08x DBGMCU=0x%08x "
+               "CURTPM=0x%08x AUTH=0x%08x} "
+               "[mrw 0xE0041004] [mrw 0xE004100C] [mrw 0xE0041010] "
+               "[mrw 0x5C015004] [mrw 0x5C013000] [mrw 0x5C014020] "
+               "[mrw 0x5C001004] [mrw 0x5C015204] [mrw 0xE0041FB8]]",
+         "-c", "resume", "-c", "shutdown"],
+        cwd=str(BRINGUP.parents[2]), capture_output=True, text=True, timeout=10)
+    out = r.stdout + r.stderr
+    import re
+    def get(name):
+        m = re.search(name + r"=0x([0-9a-fA-F]+)", out)
+        return int(m.group(1), 16) if m else None
+    prg = get("PRGCTLR"); stat = get("STATR"); tpiu = get("CURPSIZE")
+    cstf = get("CSTF"); etf = get("ETF"); dbg = get("DBGMCU")
+    curtpm = get("CURTPM"); auth = get("AUTH")
+    if prg is None:
+        return ["L7 CoreSight readback failed (openocd/SWD?)"]
+    if prg != 1:
+        issues.append(f"L7 TRCPRGCTLR=0x{prg:x} (ETM not enabled; run `td etm enable`)")
+    if stat is not None and stat != 0:
+        issues.append(f"L7 TRCSTATR=0x{stat:x} (ETM in IDLE/error, not tracing)")
+    if tpiu not in (0x01, 0x02, 0x08):
+        issues.append(f"L7 TPIU_CURPSIZE=0x{tpiu:x} (expected 1/2/8-bit)")
+    if cstf is None or (cstf & 0x1) != 1:
+        issues.append(f"L7 CSTF ENS0 not set (ETM ATB blocked; funnel disabled)")
+    if etf is None or (etf & 0x1) != 1:
+        issues.append(f"L7 ETF_CTL disabled (no trace capture)")
+    if dbg is None or (dbg & 0x00700000) != 0x00700000:
+        issues.append(f"L7 DBGMCU_CR trace clocks not fully enabled (0x{dbg:x})")
+    if curtpm and curtpm != 0:
+        issues.append(f"L7 TPIU CURTPM=0x{curtpm:x} (test-pattern on! run `td etm clear-curtpm`)")
+    if auth is not None and (auth & 0x0C) == 0:
+        issues.append(f"L7 TRCAUTHSTATUS=0x{auth:x} — Non-invasive debug bits[3:2]=00 "
+                      f"(ETM output may be gated off; check DAPLink attach)")
+    if verbose and not issues:
+        print(f"  L7 ETM prg=1 stat=0 tpiu=0x{tpiu:x} cstf=0x{cstf:x} etf=0x{etf:x} "
+              f"auth=0x{auth:x}")
+    return issues
+
+
 def cmd_diag(a):
     """Layered diagnostic (proposal 41 §3). Early-stop on first FAIL unless --deep."""
     print("=== trace_doctor diag ===")
     all_issues = []
     for name, checker in [
         ("L0 host env", _check_l0),
+        ("L1 SWD/STM32", _check_l1_probe),
         ("L2 FPGA bit", _check_l2_fpga_bit),
+        ("L3 FPGA net", _check_l3_net),
+        ("L7 STM32 ETM", _check_l7_etm),
     ]:
         print(f"\n[{name}]")
         issues = checker(state_load())
@@ -664,6 +781,9 @@ def build_parser():
     x.set_defaults(func=cmd_etm_enable)
     x = pe_sub.add_parser("recover"); _add_extra(x); x.set_defaults(func=cmd_etm_recover)
     x = pe_sub.add_parser("show"); x.set_defaults(func=cmd_etm_show)
+    x = pe_sub.add_parser("clear-curtpm",
+        help="clear TPIU test-pattern register (mandatory after etm enable)")
+    x.set_defaults(func=cmd_etm_clear_curtpm)
 
     return p
 
