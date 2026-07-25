@@ -484,10 +484,20 @@ def _check_l2_fpga_bit(state, verbose=True):
         m = re.search(r"DEPTH=(\d+).*?full=(\d+).*?gen=(\d+)", rc.stdout)
         if m:
             depth = int(m.group(1))
-            if depth == 65535:
-                issues.append(f"L2 FPGA DEPTH=0xFFFF (stale/uninitialized — bit may not be loaded)")
+            # Known-good DEPTH signatures per bit (proposal 41 §3.3 whitelist):
+            #   trace_iddr_clktap.bit    -> DEPTH ~63472-63479, gen 0..255
+            #   pin_la (trace_pin_la)    -> DEPTH ~32639
+            #   trace_ddr_selftest       -> higher
+            # A DEPTH >= 0xFF00 (65280) is diagnostic of "CSR reads returning
+            # 0xFF" i.e. the bit isn't answering with real state -- either not
+            # loaded or wrong bit. Note gen=0xFF is NORMAL for freshly-loaded
+            # clktap after some captures; do NOT gate on gen alone.
+            if depth >= 0xFF00:
+                issues.append(
+                    f"L2 FPGA DEPTH={depth} full={m.group(2)} gen={m.group(3)} "
+                    f"— stale/uninitialized (CSR reads 0xFF, bit not loaded?)")
             elif depth == 0:
-                if verbose: print(f"  L2 FPGA DEPTH=0 (fresh, needs rearm)")
+                if verbose: print(f"  L2 FPGA DEPTH=0 (fresh, needs rearm to fill)")
             else:
                 if verbose: print(f"  L2 FPGA DEPTH={depth} full={m.group(2)} gen={m.group(3)}")
         else:
