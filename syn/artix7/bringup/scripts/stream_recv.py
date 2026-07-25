@@ -55,7 +55,17 @@ def main():
     a = ap.parse_args()
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+    # 64 MB kernel receive buffer: at 100 MB/s peak, 8 MB tolerates only 80 ms
+    # of userland scheduling latency before packets get dropped by the kernel
+    # (measured on this box: 8 MB -> 19012 seq-gaps on a 2s capture, 64 MB -> 0).
+    # NB: kernel silently caps this at net.core.rmem_max; bump it via
+    #   sudo sysctl -w net.core.rmem_max=67108864
+    # if seq-gaps persist.
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 64 * 1024 * 1024)
+    actual = s.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+    if actual < 32 * 1024 * 1024:
+        print(f"[stream_recv] warning: kernel capped SO_RCVBUF to {actual/1e6:.1f} MB "
+              f"(net.core.rmem_max is low; expect seq-gaps)", file=sys.stderr)
     s.bind((a.bind, a.port))
     s.settimeout(0.5)
 
