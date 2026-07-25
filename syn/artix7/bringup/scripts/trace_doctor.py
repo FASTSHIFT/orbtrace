@@ -736,14 +736,23 @@ def _check_l7_etm(state, verbose=True):
 
 
 def _check_l4_phase(state, verbose=True):
-    """L4 sampling phase: TPIU fixed-pattern cross-check. Requires pin_la bit.
-    Uses FF00 (all lanes toggle together, wide tolerance -> tests the WIRE) and
-    AA55 (lanes interleaved, needs precise phase -> tests the SAMPLING POINT).
+    """L4 physical link: TPIU fixed-pattern cross-check on the pin_la bit.
 
-    Interpretation matrix:
-      FF00 good + AA55 good  -> wire OK, phase OK
-      FF00 good + AA55 bad   -> wire OK, PHASE OFF EYE CENTRE (run tap sweep)
-      FF00 bad               -> physical link problem (wire/solder/IBUF)
+    IMPORTANT SCOPE (learned the hard way): pin_la samples at a fixed 200 MSPS
+    with NO IDELAY alignment, so a high AA55 error here does NOT mean the real
+    capture path is broken -- the clktap bit (IDDR + IDELAY) can have a wide
+    open eye at the same moment. Use this layer only to answer
+    "is the WIRE physically intact" via FF00 (all lanes toggle together, wide
+    tolerance). Treat AA55 as informational on pin_la.
+
+    Sampling-phase verdicts belong on the clktap bit via `td tap sweep`
+    (CURTPM AA/55 + IDELAY sweep), which is a separate step.
+
+    Also note: tap only aligns BIT sampling. Byte/nibble boundary alignment is
+    an independent degree of freedom -- a perfectly tapped capture can still
+    read `f7ff f7ff` instead of `ff7f ff7f`. The decoder's parity/order search
+    (recover_assemble) normally fixes that, but its A-sync-count criterion is
+    weak on sparse BB-OFF streams.
     """
     issues = []
     # Only meaningful on pin_la. Detect via its 'LA' magic (more reliable than
@@ -774,16 +783,17 @@ def _check_l4_phase(state, verbose=True):
         errs = [float(x) for x in aa_errs[0]]
         worst = max(errs)
         spread = max(errs) - min(errs)
-        if worst > 1.0 and spread < 2.0:
-            issues.append(f"L4 AA55 err={worst:.2f}% on all lanes uniformly "
-                          f"(spread {spread:.2f}%) — SAMPLING PHASE off eye "
-                          f"centre. Fix: enable CURTPM then `td tap sweep`, "
-                          f"set the recommended tap.")
-        elif worst > 1.0:
-            issues.append(f"L4 AA55 err up to {worst:.2f}% with lane spread "
-                          f"{spread:.2f}% — per-lane skew; try `td tap set-lane`")
+        # INFORMATIONAL only on pin_la (no IDELAY -> high err is expected and
+        # does NOT imply the clktap capture path is broken). Only a large
+        # lane-to-lane SPREAD indicates a real per-lane skew/solder problem.
+        if spread > 5.0:
+            issues.append(f"L4 AA55 lane spread {spread:.2f}% (>5%) — per-lane "
+                          f"skew or a bad solder joint on one lane; "
+                          f"check `td probe wire`")
         elif verbose:
-            print(f"  L4 AA55 err max={worst:.2f}% (phase OK)")
+            print(f"  L4 AA55 err max={worst:.2f}% spread={spread:.2f}% "
+                  f"(informational on pin_la; phase verdict = `td tap sweep` "
+                  f"on the clktap bit)")
     if not ff_div and not aa_errs:
         issues.append(f"L4 tpiu-pattern produced no parseable result (rc={p.returncode})")
     return issues
