@@ -377,12 +377,34 @@ def cmd_decode_verify(a):
 
 
 def cmd_decode_perf(a):
-    """Export Perfetto perf via etm_with_time.py + orbetto. Wrapper for the
-    two-step pipeline from AGENT.md §4.6."""
-    ts_bin = a.raw + ".time.bin"
-    ts_json = a.raw + ".ts.json"
+    """Export Perfetto perf via etm_with_time.py + orbetto (AGENT.md §4.6).
+
+    NOTE: orbetto's own TPIU deframer cannot recover a half-nibble
+    misalignment, so we first run the same parity/order search the opencsd path
+    uses and feed orbetto the REALIGNED stream. Without this, orbetto reports
+    'PC bitmap cardinality = 0' on any capture whose nibble phase is off."""
+    raw_path = a.raw
+    # Pre-align: reuse opencsd_etm4_run's recover_assemble ranking
+    try:
+        sys.path.insert(0, str(DECODE_DIR))
+        import opencsd_etm4_run as OC  # noqa
+        import etm35lib as L           # noqa
+        raw_bytes = Path(a.raw).read_bytes()
+        if not L.has_tpiu_sync(raw_bytes):
+            best = OC.recover_assemble(raw_bytes)
+            aligned = best[3]
+            if L.has_tpiu_sync(aligned):
+                raw_path = a.raw + ".aligned.bin"
+                Path(raw_path).write_bytes(aligned)
+                print(f"[trace_doctor] pre-aligned nibble phase "
+                      f"(parity={best[1]} order={best[2]} fsync={best[6]}) "
+                      f"-> {raw_path}")
+    except Exception as e:
+        print(f"[trace_doctor] pre-align skipped ({e}); feeding raw to orbetto")
+    ts_bin = raw_path + ".time.bin"
+    ts_json = a.raw + ".ts.json"   # timebase sidecar belongs to the ORIGINAL raw
     # step 1: attach timebase
-    r1 = native("etm_with_time.py", a.raw, ts_json, ts_bin)
+    r1 = native("etm_with_time.py", raw_path, ts_json, ts_bin)
     if r1.returncode != 0:
         return r1.returncode
     # step 2: orbetto
@@ -390,7 +412,7 @@ def cmd_decode_perf(a):
     if not orbetto.exists():
         print(f"[trace_doctor] orbetto binary not found at {orbetto}")
         return 2
-    cmd = [str(orbetto), "-C", str(a.freq_khz), "-t", "1", "-f", a.raw,
+    cmd = [str(orbetto), "-C", str(a.freq_khz), "-t", "1", "-f", raw_path,
            "-e", a.elf, "-F", ts_bin + ".time.bin"]
     env = os.environ.copy()
     env.setdefault("ORBETTO_ETM_PROT", "ETM4")
