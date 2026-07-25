@@ -349,3 +349,113 @@ trace_doctor.py --ci               # 无颜色/无 interactive，退出码非0�
 ## 8. 一句话给未来的自己（和 agent）
 
 **跑之前先跑 `trace_doctor`**。今天卡壳的每一分钟，都可以用它省下来。
+
+---
+
+## 补充（2026-07-25）：已存在的 FPGA 内置错误码机制（proposal 30 P1）
+
+**关键发现**：proposal 30 已经把 FPGA 内置错误码/诊断寄存器**完整实现**了，
+`rtl/dbg_regfile.v` + `scripts/fpga_health.py` 已在项目里可用。trace_doctor 应
+**直接复用**，不重造。
+
+### 9.1 已实现的错误码（`rtl/dbg_regfile.v` + `led_status.v` 定义，`fpga_health.py` 消费）
+
+| 错误码 | 含义 | 触发源 | 定责 |
+|:---:|------|------|------|
+| `0x0000` | 无错误 | — | — |
+| **`0x0101`** | **no TRACECLK edges** (GPIO 上无边沿) | 引脚级探针 | STM32 ETM 未启 / DBGMCU_CR TRACECLKEN 未开 / TRACE 引脚未 AF0 / 接线断 |
+| **`0x0102`** | **trace MMCM lost lock**（有 TRACECLK 但采样 MMCM 失锁） | MMCM 时钟监视 | TRACECLK 频率与 bitstream 期望不符 / 频率抖动 / clktap 相位问题 |
+| **`0x0301`** | **capture FIFO overflow** (ETM 生成率 > drain) | FIFO 溢出 | STM32 ETM 生成率过高（BB=1 高频） |
+| **`0x0401`** | **self-TX HDR stuck (ARP deadlock)** | self-TX FSM 超时 | 主机未回 ARP，网络自发 TX 死锁（HANDOFF §7.1） |
+| **`0x0501`** | RX bad frame（超阈） | MAC 侧 | 主机侧发的包 CRC 错 / PHY 信号完整性 |
+| **`0x0502`** | TX FIFO overflow | MAC 侧 | 出方向反压异常 |
+| **`0x0503`** | RX FIFO overflow | MAC 侧 | 主机灌包过快 |
+
+**Sticky 语义**：只锁**第一次**发生的错误（`FIRST_ERR_CODE` 0xFF16），并记时间戳 `FIRST_ERR_TIME`（0xFF18）+ 现场 `FIRST_ERR_CTX`（0xFF1C）。清除方式=软复位（写 REG_SOFTRST 0x10）或断电重启。这一条特别关键——**如果只有零星错误，sticky 会把最早那次抓住，避免"跑了一晚上不知道哪一时刻坏的"**。
+
+### 9.2 已实现的可观测寄存器（`fpga_health.py` 消费）
+
+| 地址 | 名称 | 内容 | 用于 |
+|:---:|------|------|------|
+| `0xFF10` | `DBG_MAGIC` | 固定 `0xDB` | trace_doctor L2 认证：读回 0xDB 证明 dbg_regfile 在线（当前 bit 支持诊断） |
+| `0xFF11` | `LIVE_STATUS` | `{mmcm_lock, tck_active, fsm bits, ...}` | live 状态 |
+| `0xFF12-15` | `CYCLE` | free-run cycle counter (LE, 4B) | 时间戳基准 |
+| `0xFF16-17` | `FIRST_ERR_CODE` | 首错 sticky 码 | **核心：一句话定责** |
+| `0xFF18-1B` | `FIRST_ERR_TIME` | 首错发生的 cycle | 时序取证 |
+| `0xFF1C` | `FIRST_ERR_CTX` | 首错现场快照 | 深度取证 |
+| `0xFF20-26` | `ERR_COUNT[7]` | 各错误饱和计数 (8b each) | 频率分析：0x0301 累计 vs 一次 |
+| `0xFF30` | `GPIO_LEVEL` | `{0,0,0,clk,d3,d2,d1,d0}` 原始电平快照 | **绕开 MMCM 直读引脚** |
+| `0xFF31-3A` | `GPIO_EDGES` | TRACECK+TRACED0-3 各 16b 边沿计数 | **引脚翻转证明**（区分"引脚死"vs"MMCM 没锁"） |
+| `0xFF3B-3D` | `TRACECLK_FREQ` | 16.777ms 窗口内 TRACECK 边沿数 | 实测 TRACECLK 频率 |
+| `0xFF3E-41` | `GAP_COUNT / GAP_MAX` | TRACECLK 停顿 >8clk 的次数 + 最长 gap | 区分"频率错" vs "断续导致 MMCM flap" |
+| `0xFF70-73` | `BUILD_ID` | 综合时打入的 Unix 时间戳 | **bit 身份识别**（AGENT.md 坑点：md5 白名单的强化） |
+
+### 9.3 已实现的自愈机制
+
+- **软复位**（写 `REG_SOFTRST` 0x10 到 :5002 CSR）：拉伸 256 clk125 复位采集前端 + 清 sticky 计数。`fpga_health.py <ip> reset` 一键。
+- **看门狗**：TRACECLK 有活动但 MMCM 持续 ~134ms 未锁 → 自动脉冲软复位重锁。
+
+### 9.4 关键 GAP：主力 clktap bit **没有** dbg_regfile
+
+**扫遍 rtl/*.v 例化 dbg_regfile 的顶层**：
+- ✅ `trace_mmcm_stream_top.v`（流式，proposal 25/26）
+- ✅ `trace_ddr_blackbox_top.v`（DDR3 黑匣子，proposal 32）
+- ✅ `trace_ddr_selftest_top.v`（DDR3 自检）
+- ❌ **`trace_stream_top.v`（对应主力 `trace_iddr_clktap.bit`）——未例化 dbg_regfile**
+
+这解释了今天下午跑 `fpga_health.py` 时看到：
+```
+[WARN] debug regfile magic = 0x00 (expected 0xDB). Old bitstream without proposal-30 observability? Falling back.
+```
+
+**这是 trace_doctor 设计的第一个必须补的 gap**。两条路：
+
+**方案 A（推荐）**：把 `dbg_regfile` 接进 `trace_stream_top.v`。工作量小（几百 LUT+两条 wire），
+主力 clktap bit 从此支持 sticky 首错 + 引脚级 GPIO 探针，这是**最有价值的一次投资**——
+今天下午卡的每一个失效点，如果有 dbg_regfile 都能秒级定位：
+- 相位漂移（`f7ff` 模式）→ `TRACECLK_FREQ` 显示频率对 + `GAP_COUNT>0` 直接给结论
+- FPGA bit 加载失败 → `BUILD_ID` 一读就知
+- 没 fsync（"trace 太稀"）→ `GPIO_EDGES` 显示引脚在翻转但计数不涨 → MMCM 侧问题
+
+**方案 B（兜底）**：trace_doctor 检测 `DBG_MAGIC != 0xDB` → 走 fallback 逻辑（只依赖
+`trace_dump --status-only` 的 DEPTH 特征 + `hw_selftest quick` 的 TPIU voltmeter）。
+诊断力比 A 弱，但**当前主力 bit 立即可用**。
+
+**建议实施顺序**：先做 P0（方案 B 兜底），能立刻用；同时并行做 A（把 dbg_regfile 加进 clktap 顶层重综合一个 clktap+dbg bit），一旦有新 bit 就升级到 A 的强诊断。
+
+### 9.5 更新 §2.2 分层探测清单
+
+在 **L2/L3** 层加：
+- **L2.a**：读 `0xFF10 DBG_MAGIC`。若 = 0xDB → 后续走 dbg_regfile 强诊断路径；若 = 0x00 → fallback（现主力 bit）+ 报"当前 bit 未含 dbg_regfile，建议烧含诊断的顶层"。
+- **L2.b**：读 `0xFF70 BUILD_ID`（若 magic 有），vs 白名单里最新期望值，报 build 是否为最新。
+
+在 **L4** 层用 dbg_regfile 强化：
+- **L4.a**：读 `0xFF31-3A GPIO_EDGES` 三次采样，判**引脚是否翻转**（区分接线断 vs 只是 MMCM 没锁）。
+- **L4.b**：读 `0xFF3B-3D TRACECLK_FREQ`，与固件预期 TRACECLK（PLL 计算得到）对比 ±5%。
+- **L4.c**：读 `0xFF3E-41 GAP_COUNT/MAX`，若 GAP_COUNT>0 且 MAX >>1 → **区分频率错 vs 断续**。
+- **L4.d**：读 `0xFF16 FIRST_ERR_CODE`，若非 0 → 直接查错误码表报根因。
+
+在 **L7** 层：
+- **L7.a**：读 `0xFF22 ERR_COUNT[cap_overflow]` 累计溢出计数，作为 STM32 生成率超 drain 的**片上证据**（比 opencsd 的 I_OVERFLOW 更准，因为后者依赖流未破坏）。
+
+### 9.6 判据表补丁（追加到 §7）
+
+| 层 | 名字 | 期望 | 失败含义 |
+|:---:|------|------|------|
+| L2.a | DBG_MAGIC | 0xDB | 当前 bit 无诊断（走 fallback） |
+| L2.b | BUILD_ID | ≥ 白名单最新 | bit 过期或未知 |
+| L4.a | GPIO_EDGES 增长 | clk+d0-3 全部 >0 且随时间递增 | 某 lane 静止→接线断 / STM32 ETM 未启 |
+| L4.b | TRACECLK_FREQ | 固件 PLL 计算值 ±5% | TRACECLK 频率异常 |
+| L4.c | GAP_MAX | <8 clk 或 gap_count=0 | 断续 (STM32 TPIU 停发) |
+| L4.d | FIRST_ERR_CODE | 0x0000 | 首错锁存，查表 |
+| L7.a | ERR_COUNT[cap_overflow] | 0 或稳态 | 溢出频发→需 BB-OFF 削峰 |
+
+---
+
+## 修订总结
+
+- **原设计（§1-8）** 是"外部探测"路线：主机 grep / openocd 读 CoreSight / opencsd 解码。
+- **补充 §9** 引入"**片上诊断**"：dbg_regfile 已实现的 sticky 首错 + 引脚级 GPIO 探针 + 频率计 + gap 检测。
+- **两者互补**：外部探测独立于 bit，任何 bit 都能测（L0/L1/L4-TPIU/L5-L8）；片上诊断**主力 bit 加了 dbg_regfile 之后**能秒级给出根因码，避免几小时的 tap 扫描/断电重启。
+- **trace_doctor 实现优先级**：先跑外部探测（P0，工作量小），检测到 dbg_regfile 在线时自动切到片上诊断（强化 L2-L7）。
+- **主力 clktap bit 的诊断能力升级**：作为独立 P0.5 任务——把 `dbg_regfile` 例化进 `trace_stream_top.v`，重综合一份 `trace_iddr_clktap_dbg.bit`，与现有 `trace_iddr_clktap.bit` 并存供选。
