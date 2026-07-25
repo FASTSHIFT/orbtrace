@@ -397,8 +397,23 @@ def cmd_decode_perf(a):
     return run(cmd, env=env).returncode
 
 
-def cmd_decode_tpiu_diff(a):
-    return native("tpiu_testpattern_diff.py", *(a.extra or [])).returncode
+def cmd_probe_tpiu_pattern(a):
+    """TPIU built-in test-pattern cross-check (CURTPM). Drives a KNOWN fixed
+    byte pattern out of the TPIU, bypassing the ENTIRE upstream chain
+    (M7 core -> ETM -> CSTF -> ETF -> formatter), so any error is 100%
+    attributable to: TPIU driver -> PCB/wire -> A7 IBUF -> sampler -> DDR3.
+
+    Patterns: AA55 (every lane toggles per edge), FF00 (all-1 then all-0),
+              W1 (walking ones), W0 (walking zeros).
+    REQUIRES pin_la bit (`td burn fpga build/trace_pin_la.bit`).
+
+    This is the ground-truth 'is the wire+sampling correct' test -- run this
+    BEFORE trusting any ETM decode result."""
+    args = []
+    if a.patterns:
+        args += ["--patterns", a.patterns]
+    args += a.extra or []
+    return native("tpiu_testpattern_diff.py", *args).returncode
 
 
 def cmd_decode_walk_score(a):
@@ -720,6 +735,60 @@ def _check_l7_etm(state, verbose=True):
     return issues
 
 
+def _check_l4_phase(state, verbose=True):
+    """L4 sampling phase: TPIU fixed-pattern cross-check. Requires pin_la bit.
+    Uses FF00 (all lanes toggle together, wide tolerance -> tests the WIRE) and
+    AA55 (lanes interleaved, needs precise phase -> tests the SAMPLING POINT).
+
+    Interpretation matrix:
+      FF00 good + AA55 good  -> wire OK, phase OK
+      FF00 good + AA55 bad   -> wire OK, PHASE OFF EYE CENTRE (run tap sweep)
+      FF00 bad               -> physical link problem (wire/solder/IBUF)
+    """
+    issues = []
+    # Only meaningful on pin_la. Detect via its 'LA' magic (more reliable than
+    # DEPTH, which reads 0 right after a fresh burn before any rearm).
+    import re
+    r = subprocess.run(
+        ["python3", str(HERE / "check_pinla.py")],
+        cwd=str(BRINGUP), capture_output=True, text=True, timeout=8)
+    if "b'LA'" not in r.stdout:
+        if verbose:
+            print("  L4 SKIP (needs pin_la bit; `td burn fpga build/trace_pin_la.bit`)")
+        return []
+    p = subprocess.run(
+        ["python3", str(HERE / "tpiu_testpattern_diff.py"), "--patterns", "FF00,AA55"],
+        cwd=str(BRINGUP), capture_output=True, text=True, timeout=120)
+    out = p.stdout + p.stderr
+    ff_div = re.search(r"FF00 speed=\d+: divergence=([\d.]+)%", out)
+    aa_errs = re.findall(r"AA55 speed=\d+: D0=([\d.]+)%\s+D1=([\d.]+)%\s+"
+                         r"D2=([\d.]+)%\s+D3=([\d.]+)%", out)
+    if ff_div:
+        div = float(ff_div.group(1))
+        if div > 2.0:
+            issues.append(f"L4 FF00 divergence={div:.2f}% (>2%) — PHYSICAL LINK "
+                          f"problem (wire/solder/IBUF), not a phase issue")
+        elif verbose:
+            print(f"  L4 FF00 divergence={div:.2f}% (wire OK)")
+    if aa_errs:
+        errs = [float(x) for x in aa_errs[0]]
+        worst = max(errs)
+        spread = max(errs) - min(errs)
+        if worst > 1.0 and spread < 2.0:
+            issues.append(f"L4 AA55 err={worst:.2f}% on all lanes uniformly "
+                          f"(spread {spread:.2f}%) — SAMPLING PHASE off eye "
+                          f"centre. Fix: enable CURTPM then `td tap sweep`, "
+                          f"set the recommended tap.")
+        elif worst > 1.0:
+            issues.append(f"L4 AA55 err up to {worst:.2f}% with lane spread "
+                          f"{spread:.2f}% — per-lane skew; try `td tap set-lane`")
+        elif verbose:
+            print(f"  L4 AA55 err max={worst:.2f}% (phase OK)")
+    if not ff_div and not aa_errs:
+        issues.append(f"L4 tpiu-pattern produced no parseable result (rc={p.returncode})")
+    return issues
+
+
 def cmd_diag(a):
     """Layered diagnostic (proposal 41 §3). Early-stop on first FAIL unless --deep."""
     print("=== trace_doctor diag ===")
@@ -729,6 +798,7 @@ def cmd_diag(a):
         ("L1 SWD/STM32", _check_l1_probe),
         ("L2 FPGA bit", _check_l2_fpga_bit),
         ("L3 FPGA net", _check_l3_net),
+        ("L4 sampling phase", _check_l4_phase),
         ("L7 STM32 ETM", _check_l7_etm),
     ]:
         print(f"\n[{name}]")
@@ -792,6 +862,11 @@ def build_parser():
     _add_extra(x); x.set_defaults(func=cmd_probe_wire)
     x = pp_sub.add_parser("pin-la", help="pin_la bit health")
     _add_extra(x); x.set_defaults(func=cmd_probe_pin_la)
+    x = pp_sub.add_parser("tpiu-pattern",
+        help="TPIU fixed-pattern cross-check (AA55/FF00/W1/W0) -- ground truth "
+             "for wire+sampling, bypasses ETM entirely")
+    x.add_argument("--patterns", help="comma list: AA55,FF00,W1,W0 (default all)")
+    _add_extra(x); x.set_defaults(func=cmd_probe_tpiu_pattern)
 
     # -- tap group --
     pt = sub.add_parser("tap", help="IDDR sampling phase (IDELAY)")
@@ -853,8 +928,9 @@ def build_parser():
     x.add_argument("raw"); x.add_argument("elf")
     x.add_argument("--freq-khz", type=int, default=300000)
     x.set_defaults(func=cmd_decode_perf)
-    for name, fn in (("tpiu-diff", cmd_decode_tpiu_diff),
-                     ("walk-score", cmd_decode_walk_score),
+    # NB: tpiu-diff moved to `probe tpiu-pattern` -- it's a physical-link
+    # ground-truth test (bypasses ETM), not a decode step.
+    for name, fn in (("walk-score", cmd_decode_walk_score),
                      ("golden", cmd_decode_golden)):
         x = pdc_sub.add_parser(name); _add_extra(x); x.set_defaults(func=fn)
 
