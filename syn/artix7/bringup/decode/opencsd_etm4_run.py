@@ -46,12 +46,25 @@ EXPECTED = {
 }
 
 
+TPIU_FSYNC = bytes([0xFF, 0xFF, 0xFF, 0x7F])
+
+
 def recover_assemble(raw):
     """Streamed byte = {trace_a[k] hi, trace_b[k-1] lo}. Recover time-ordered
     half-bit nibbles and parity/order-search assemble to the period-indexed
-    byte stream. Ranks candidates by count of *real* Thumb I-syncs anchored in
-    flash — same criterion as mmcm_stream_orbetto but with the additional
-    ETMv4 A-sync fallback so it works before any I-sync is emitted."""
+    byte stream.
+
+    Ranking criteria, strongest first:
+      1. TPIU full-sync count (FF FF FF 7F). This is by far the most robust
+         signal because the TPIU emits it as HSYNC filler whenever the ETM has
+         no data -- so it is DENSE precisely on sparse BB-OFF streams where the
+         old criteria (A-sync / I-sync) are both zero and the search silently
+         fell through to parity=0 order=0 (which is often wrong -> the
+         'f7ff f7ff' half-nibble misalignment we chased for hours; see
+         AGENT.md pitfall 17).
+      2. ETMv4 A-sync count (>=11 zero bytes then 0x80) -- good on dense BB=1.
+      3. ETMv3.5-style I-sync anchored in flash -- final tie-breaker.
+    """
     nibs = bytearray()
     for k in range(len(raw) - 1):
         nibs.append((raw[k] >> 4) & 0xF)
@@ -60,6 +73,8 @@ def recover_assemble(raw):
     for parity in (0, 1):
         for order in (0, 1):
             data = D.assemble(nibs, parity, order)
+            # TPIU HSYNC filler -- dense on sparse streams (primary criterion)
+            fsync = data.count(TPIU_FSYNC)
             # ETMv3.5-style I-sync in flash
             fl = sum(1 for s in L.find_isyncs(data) if L.is_flash(s.addr))
             # ETMv4 A-sync: >=11 zero bytes then 0x80
@@ -73,11 +88,10 @@ def recover_assemble(raw):
                     zc = 0
                 else:
                     zc = 0
-            # A-sync count dominates for ETMv4 streams; I-sync count is a
-            # tie-breaker to avoid picking an all-zero misalignment.
-            score = v4a * 100 + fl
+            # Weight so that fsync dominates, then A-sync, then I-sync.
+            score = fsync * 10000 + v4a * 100 + fl
             if best is None or score > best[0]:
-                best = (score, parity, order, data, fl, v4a)
+                best = (score, parity, order, data, fl, v4a, fsync)
     return best
 
 
@@ -292,10 +306,11 @@ def main():
             print(f"[3] deframed ETM: {len(etm)} bytes")
     else:
         # Try the legacy 2-byte-per-period nibble path.
-        score, parity, order, data, fl, v4a = recover_assemble(raw)
+        score, parity, order, data, fl, v4a, fsync = recover_assemble(raw)
         if L.has_tpiu_sync(data):
             print(f"[2] legacy raw {{a,b}}: parity={parity} order={order} "
-                  f"assembled={len(data)}B  A-syncs(v4)={v4a} flash-Isync={fl}")
+                  f"assembled={len(data)}B  TPIU-fsync={fsync} "
+                  f"A-syncs(v4)={v4a} flash-Isync={fl}")
             etm = L.tpiu_deframe_walk(data)
             print(f"[3] deframed ETM: {len(etm)} bytes")
         else:
