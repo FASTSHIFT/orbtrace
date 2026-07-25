@@ -244,6 +244,20 @@ def cmd_tap_set_lane(a):
     return rc
 
 
+def cmd_tap_set_width(a):
+    """Set the TPIU parallel port width (4/2/1) at runtime via CSR 0x08.
+
+    One bitstream serves all three widths: upstream traceIF.v takes `width` as a
+    wire, and the CAP_RAW byte layout ({trace_b,trace_a} per TRACECLK) is
+    width-independent -- only the unused lanes differ. Remember the STM32 side
+    must match: TPIU_CURPSIZE (0x5C015004) = 0x08 for 4-bit, 0x02 for 2-bit,
+    0x01 for 1-bit (`td etm width N` does both)."""
+    rc = native("trace_ctrl.py", "set-width", str(a.value)).returncode
+    if rc == 0:
+        state_update("fpga", trace_width=a.value)
+    return rc
+
+
 def cmd_tap_sweep(a):
     """Sweep IDELAY tap, scored against a KNOWN TPIU AA/55 test pattern (via
     CURTPM=0x00020004). REQUIRES the STM32 to be running with CURTPM in
@@ -391,13 +405,21 @@ def cmd_decode_perf(a):
         import etm35lib as L           # noqa
         raw_bytes = Path(a.raw).read_bytes()
         if not L.has_tpiu_sync(raw_bytes):
-            best = OC.recover_assemble(raw_bytes)
+            # At 2/1 bit a TPIU byte spans 2/4 TRACECLK periods, so the raw
+            # capture needs width-aware regrouping before orbetto (which only
+            # ever sees already-byte-aligned TPIU data) can deframe it.
+            if a.width == 4:
+                best = OC.recover_assemble(raw_bytes)
+                what = f"parity={best[1]} order={best[2]}"
+            else:
+                best = OC.recover_assemble_width(raw_bytes, a.width)
+                what = (f"{a.width}-bit phase={best[1]} "
+                        f"order={'lsb' if not best[2] else 'msb'}")
             aligned = best[3]
             if L.has_tpiu_sync(aligned):
                 raw_path = a.raw + ".aligned.bin"
                 Path(raw_path).write_bytes(aligned)
-                print(f"[trace_doctor] pre-aligned nibble phase "
-                      f"(parity={best[1]} order={best[2]} fsync={best[6]}) "
+                print(f"[trace_doctor] pre-aligned {what} fsync={best[6]} "
                       f"-> {raw_path}")
     except Exception as e:
         print(f"[trace_doctor] pre-align skipped ({e}); feeding raw to orbetto")
@@ -409,7 +431,12 @@ def cmd_decode_perf(a):
     etm_out = raw_path + ".etm.bin"
     ts_bin = etm_out + ".time.bin"
     ts_json = a.raw + ".ts.json"   # timebase sidecar belongs to the ORIGINAL raw
-    r1 = native("etm_with_time.py", raw_path, ts_json, etm_out)
+    # The timebase is indexed by RAW capture byte (one per TRACECLK). At 2/1 bit
+    # the pre-aligned stream has 2x/4x fewer bytes, so scale the offsets back or
+    # the whole trace collapses into the first half/quarter of the timeline.
+    raw_per_byte = {4: 1, 2: 2, 1: 4}[a.width]
+    r1 = native("etm_with_time.py", raw_path, ts_json, etm_out,
+                "--raw-per-byte", str(raw_per_byte))
     if r1.returncode != 0:
         return r1.returncode
     # step 2: orbetto
@@ -547,6 +574,30 @@ def cmd_etm_clear_curtpm(a):
            "-c", "init", "-c", "halt", "-c", "mww 0x5C015204 0",
            "-c", "resume", "-c", "shutdown"]
     return run(cmd, cwd=BRINGUP.parents[2]).returncode
+
+
+def cmd_etm_width(a):
+    """Set the TPIU port width on BOTH ends in one shot: STM32 TPIU_CURPSIZE and
+    FPGA CSR 0x08. They must agree or frame assembly is nonsense.
+
+    No reflash needed on either side now -- the FPGA takes the width at runtime
+    (upstream traceIF.v has `width` as a wire; we used to bake it into a
+    localparam and resynthesise per width)."""
+    size = {4: 0x08, 2: 0x02, 1: 0x01}[a.value]
+    cmd = ["openocd", "-f", "interface/cmsis-dap.cfg", "-f", "target/stm32h7x.cfg",
+           "-c", "init", "-c", "halt",
+           "-c", f"mww 0x5C015004 0x{size:08x}",
+           "-c", "echo [format {CURPSIZE=0x%08x} [mrw 0x5C015004]]",
+           "-c", "resume", "-c", "shutdown"]
+    rc = run(cmd, cwd=BRINGUP.parents[2]).returncode
+    if rc != 0:
+        return rc
+    rc = native("trace_ctrl.py", "set-width", str(a.value)).returncode
+    if rc == 0:
+        state_update("etm", trace_width=a.value)
+        state_update("fpga", trace_width=a.value)
+        print(f"[trace_doctor] TPIU port width = {a.value} bit on STM32 + FPGA")
+    return rc
 
 
 def cmd_etm_show(a):
@@ -920,6 +971,10 @@ def build_parser():
     x = pt_sub.add_parser("set-lane", help="set per-lane IDELAY tap")
     x.add_argument("lane", type=int); x.add_argument("value", type=int)
     x.set_defaults(func=cmd_tap_set_lane)
+    x = pt_sub.add_parser("set-width",
+                          help="TPIU port width 4/2/1 on the FPGA only (runtime)")
+    x.add_argument("value", type=int, choices=(4, 2, 1))
+    x.set_defaults(func=cmd_tap_set_width)
     x = pt_sub.add_parser("sweep", help="sweep clock IDELAY tap, find best fsync")
     _add_extra(x); x.set_defaults(func=cmd_tap_sweep)
 
@@ -974,6 +1029,8 @@ def build_parser():
                         "annotation, and fallback exception table for stripped "
                         "ELFs. Exception names normally come from the ELF vector "
                         "table (default: stm32h743)")
+    x.add_argument("--width", type=int, choices=(4, 2, 1), default=4,
+                   help="TPIU port width of the capture (default 4)")
     x.set_defaults(func=cmd_decode_perf)
     # NB: tpiu-diff moved to `probe tpiu-pattern` -- it's a physical-link
     # ground-truth test (bypasses ETM), not a decode step.
@@ -1010,6 +1067,10 @@ def build_parser():
     x = pe_sub.add_parser("clear-curtpm",
         help="clear TPIU test-pattern register (mandatory after etm enable)")
     x.set_defaults(func=cmd_etm_clear_curtpm)
+    x = pe_sub.add_parser("width",
+        help="set TPIU port width 4/2/1 on BOTH STM32 and FPGA (no reflash)")
+    x.add_argument("value", type=int, choices=(4, 2, 1))
+    x.set_defaults(func=cmd_etm_width)
 
     return p
 

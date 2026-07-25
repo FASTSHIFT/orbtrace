@@ -4,6 +4,11 @@
 CSR map (fpga_core_net control port, doc 15):
   0x01  EYE delay   : ref_200m cycles for OVERSAMPLE mid-eye sampling (0=default)
   0x02  soft re-arm : any write re-arms the one-shot capture (no reflash)
+  0x03/04 SWO bit length lo/hi
+  0x05  IDELAY tap, all data lanes      0x06  per-lane tap {lane[6:5],tap[4:0]}
+  0x07  clock-lane IDELAY tap
+  0x08  TPIU port width: 4, 2 or 1 bit -- runtime, so ONE bitstream serves all
+        three widths (readback at DEPTH+33)
 
 Request payload = {reg_addr(1B), reg_value(1B)} (+pad); the FPGA latches both
 and pulses csr_we at end-of-frame.
@@ -24,6 +29,7 @@ REG_BITLEN_HI = 0x04
 REG_TAP = 0x05     # IDDR IDELAY deskew tap (0..31) for ALL lanes; loads it
 REG_TAP_LANE = 0x06  # per-lane tap: value = {lane[6:5], tap[4:0]}
 REG_TAP_CLK = 0x07   # clock-lane IDELAY tap (0..31); >100MHz eye reach
+REG_WIDTH = 0x08     # TPIU parallel port width: 4, 2 or 1 (runtime, no reflash)
 
 
 def write_csr(ip, addr, value, timeout=1.0):
@@ -58,6 +64,9 @@ def main():
     ptc = sub.add_parser("set-tap-clk",
                          help="clock-lane IDELAY tap 0..31 (>100MHz eye reach)")
     ptc.add_argument("value", type=int)
+    pw = sub.add_parser("set-width",
+                        help="TPIU port width 4/2/1 bits (runtime, no reflash)")
+    pw.add_argument("value", type=int, choices=(4, 2, 1))
     sub.add_parser("rearm")
     a = ap.parse_args()
 
@@ -78,6 +87,14 @@ def main():
     elif a.cmd == "set-tap-clk":
         write_csr(a.ip, REG_TAP_CLK, a.value & 0x1F)
         print(f"set clock IDELAY tap = {a.value & 0x1F}")
+    elif a.cmd == "set-width":
+        # The RTL accepts the literal width (4/2/1) and maps it to the traceIF
+        # encoding itself, so one bitstream covers all widths. Changing width
+        # resets traceIF's frame assembly, so re-arm afterwards for a clean
+        # capture.
+        write_csr(a.ip, REG_WIDTH, a.value)
+        write_csr(a.ip, REG_REARM, 1)
+        print(f"set TPIU port width = {a.value} bit (traceIF re-synced, capture re-armed)")
     elif a.cmd == "rearm":
         write_csr(a.ip, REG_REARM, 1)
         print("soft re-arm pulsed")

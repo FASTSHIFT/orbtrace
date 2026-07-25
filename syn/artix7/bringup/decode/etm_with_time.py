@@ -14,6 +14,15 @@ RAW capture bytes (trace_dump --timebase -> <dump>.ts.json). Here we:
 
 Usage:
   python3 etm_with_time.py <capture.bin> <capture.bin.ts.json> <out_etm.bin>
+                           [--raw-per-byte N]
+
+--raw-per-byte is needed for 2/1-bit captures. The timebase sidecar indexes RAW
+capture bytes (one per TRACECLK period), but at 2/1 bit a TPIU byte spans 2/4
+TRACECLK periods, so the byte stream handed to us has already been regrouped and
+its offsets are 2x/4x smaller than the raw indices the timebase expects. Pass the
+number of raw bytes per TPIU byte (4-bit: 1, 2-bit: 2, 1-bit: 4) to scale them
+back; without it the whole trace collapses into the first fraction of the
+timeline.
 """
 import json
 import sys
@@ -24,10 +33,17 @@ from fpga_timebase import TimeBase
 
 
 def main():
-    if len(sys.argv) < 4:
+    args = [x for x in sys.argv[1:] if not x.startswith("--")]
+    if len(args) < 3:
         print(__doc__)
         return 2
-    cap_path, ts_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+    cap_path, ts_path, out_path = args[0], args[1], args[2]
+    raw_per_byte = 1
+    for i, x in enumerate(sys.argv):
+        if x == "--raw-per-byte":
+            raw_per_byte = int(sys.argv[i + 1])
+        elif x.startswith("--raw-per-byte="):
+            raw_per_byte = int(x.split("=", 1)[1])
     raw = open(cap_path, "rb").read()
     tb = TimeBase.load(ts_path)
 
@@ -47,7 +63,11 @@ def main():
     # Stage 2: map RAW source offset -> wall-clock ns. The dump file is the RAW
     # buffer with the first `skip` bytes dropped; offsets index into that file,
     # so they are OUT indices (add skip inside TimeBase.ns_for_out).
-    times_ns = [tb.ns_for_out(o) for o in offs]
+    #
+    # raw_per_byte rescales offsets for 2/1-bit captures: the timebase is indexed
+    # by TRACECLK period (= raw capture byte), but our input has already been
+    # regrouped so that one byte covers raw_per_byte periods.
+    times_ns = [tb.ns_for_out(o * raw_per_byte) for o in offs]
 
     with open(out_path, "wb") as f:
         f.write(etm)

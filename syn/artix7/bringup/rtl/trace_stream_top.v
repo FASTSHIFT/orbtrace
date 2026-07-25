@@ -49,11 +49,14 @@ module trace_stream_top #(
                                       // captured stream must be an exact +7
                                       // mod-16 ramp; any deviation = the async
                                       // oversampling architecture itself errs.
-    parameter       TRACE_WIDTH = 4   // TPIU parallel port width: 4 or 2 bits
-                                      // (proposal 21: 2-bit downclocked DDR).
-                                      // Drives traceIF.width and which data
-                                      // lanes are used. 2-bit uses TRACED0/1
-                                      // only (pins F13/E14); TRACED2/3 ignored.
+    parameter       TRACE_WIDTH = 4   // POWER-ON DEFAULT TPIU port width: 4, 2
+                                      // or 1 bits. Runtime-switchable via CSR
+                                      // 0x08 (see below), so one bitstream
+                                      // covers all three widths -- upstream
+                                      // traceIF takes `width` as a wire, and
+                                      // making it a localparam here was what
+                                      // forced a resynthesis per width.
+                                      // 2-bit uses TRACED0/1, 1-bit TRACED0.
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -182,12 +185,17 @@ module trace_stream_top #(
 
     wire        fr_avail;
     wire [127:0] frame;
-    // traceIF width encoding: 2'b11 = 4-bit, 2'b10 = 2-bit (CoreSight TPIU-Lite).
-    localparam [1:0] TIF_WIDTH = (TRACE_WIDTH == 2) ? 2'b10 : 2'b11;
+    // traceIF width encoding (CoreSight TPIU-Lite / upstream traceIF.v):
+    //   2'b11 = 4-bit, 2'b10 = 2-bit, 2'b0x = 1-bit.
+    // Power-on value from the TRACE_WIDTH parameter, overridable at runtime via
+    // CSR 0x08 -- see tif_width_trace below.
+    localparam [1:0] TIF_WIDTH_DEF = (TRACE_WIDTH == 2) ? 2'b10 :
+                                     (TRACE_WIDTH == 1) ? 2'b00 : 2'b11;
     traceIF #(.MAXBUSWIDTH(4)) u_traceif (
-        .rst(sys_rst | ~idelayctrl_rdy),
+        .rst(sys_rst | ~idelayctrl_rdy | width_change),
         .traceDina(trace_a), .traceDinb(trace_b), .traceClkin(trace_clk),
-        .width(TIF_WIDTH), .edgeOutput(), .FrAvail(fr_avail), .Frame(frame)
+        .width(tif_width_trace), .edgeOutput(),
+        .FrAvail(fr_avail), .Frame(frame)
     );
     // Isolate FrAvail (which has an async reset in traceIF) from the BRAM
     // write-enable path with a reset-less flop, then form the toggle strobe
@@ -219,6 +227,7 @@ module trace_stream_top #(
     reg  [4:0] tap_csr0 = TAP, tap_csr1 = TAP, tap_csr2 = TAP, tap_csr3 = TAP;
     reg  [4:0] tap_csrc = 5'd0;               // clock-lane tap (0 = no clk delay)
     reg        tap_load_125 = 1'b0;
+    reg  [1:0] width_csr = TIF_WIDTH_DEF;     // TPIU port width (CSR 0x08)
     always @(posedge clk125) begin
         rearm_125 <= 1'b0;
         tap_load_125 <= 1'b0;
@@ -249,8 +258,46 @@ module trace_stream_top #(
                 tap_csrc <= csr_data_w[4:0];
                 tap_load_125 <= 1'b1;
             end
+            // TPIU port width, runtime-selectable so ONE bitstream serves 4/2/1
+            // bit. data[1:0] is the raw traceIF encoding (11=4b, 10=2b, 0x=1b);
+            // for convenience data may instead be the literal width 4/2/1.
+            if (csr_addr_w == 8'h08) begin
+                case (csr_data_w)
+                    8'd4:    width_csr <= 2'b11;
+                    8'd2:    width_csr <= 2'b10;
+                    8'd1:    width_csr <= 2'b00;
+                    default: width_csr <= csr_data_w[1:0];
+                endcase
+            end
         end
     end
+
+    // ---- runtime TPIU width: CSR (clk125) -> trace_clk domain -------------
+    // traceIF samples `width` combinationally inside its trace_clk process, so
+    // the value must be stable in that domain. It is quasi-static (set between
+    // captures), so a 2-FF sync is sufficient. Changing width invalidates any
+    // partially assembled frame and the sync-edge latch, so pulse traceIF's
+    // reset on every change to force a clean re-sync rather than letting it
+    // carry a half-built packet across the switch.
+    reg [1:0] width_s0 = TIF_WIDTH_DEF, tif_width_trace = TIF_WIDTH_DEF;
+    reg [1:0] width_prev = TIF_WIDTH_DEF;
+    reg [3:0] width_chg_cnt = 4'd0;
+    always @(posedge trace_clk) begin
+        width_s0        <= width_csr;
+        tif_width_trace <= width_s0;
+        width_prev      <= tif_width_trace;
+        // stretch the reset a few trace_clks so traceIF definitely sees it
+        if (tif_width_trace != width_prev) width_chg_cnt <= 4'hf;
+        else if (width_chg_cnt)            width_chg_cnt <= width_chg_cnt - 1'b1;
+    end
+    wire width_change = (width_chg_cnt != 4'd0);
+
+    // Readback for the host (status byte). Report the CSR value, not the
+    // trace_clk-domain copy: trace_clk can be absent (target not tracing) in
+    // which case the synced copy never updates, and reading it from clk125
+    // would be an unsynchronised cross-domain grab anyway.
+    wire [7:0] width_rb = (width_csr == 2'b11) ? 8'd4 :
+                          (width_csr == 2'b10) ? 8'd2 : 8'd1;
     // CDC the tap values + load pulse into clk200 (IDELAY C domain).
     reg [4:0] tap0_s0 = TAP, tap0_200 = TAP;
     reg [4:0] tap1_s0 = TAP, tap1_200 = TAP;
@@ -416,6 +463,8 @@ module trace_stream_top #(
                           (ext_addr == NB+30)    ? cclast_125[15:8] :
                           (ext_addr == NB+31)    ? cclast_125[23:16] :
                           (ext_addr == NB+32)    ? cclast_125[31:24] :
+                          // active TPIU port width (4/2/1), CSR 0x08
+                          (ext_addr == NB+33)    ? width_rb :
                           // ts table window: NB+64 .. NB+64+4*TS_N (LE u32/entry)
                           ts_win                 ? ts_byte : 8'h00;
         assign led1 = ~rfull;
@@ -442,7 +491,8 @@ module trace_stream_top #(
         assign ext_data = (ext_addr < NB)        ? cap_byte :
                           (ext_addr == NB+0)     ? NB[7:0] :
                           (ext_addr == NB+1)     ? NB[15:8] :
-                          (ext_addr == NB+2)     ? {7'b0, full} : 8'h00;
+                          (ext_addr == NB+2)     ? {7'b0, full} :
+                          (ext_addr == NB+33)    ? width_rb : 8'h00;
         assign led1 = ~full;
     end
     endgenerate

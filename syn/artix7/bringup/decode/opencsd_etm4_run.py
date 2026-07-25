@@ -50,6 +50,54 @@ EXPECTED = {
 TPIU_FSYNC = bytes([0xFF, 0xFF, 0xFF, 0x7F])
 
 
+def recover_assemble_width(raw, width, stream=2):
+    """Width-aware variant of recover_assemble for 2- and 1-bit captures.
+
+    The CAP_RAW byte layout ({trace_b,trace_a} per TRACECLK) is the same at every
+    width -- only the number of active lanes differs -- so a 2-bit byte spans 2
+    TRACECLK periods and a 1-bit byte spans 4. trace_width.assemble_width does
+    that regrouping; here we search its (phase, bit_order) candidates with the
+    same post-deframe A-sync ranking used at 4 bits.
+
+    Returns the same tuple shape as recover_assemble:
+      (score, phase, order_index, data, flash_isyncs, pre_deframe_asyncs, fsync)
+    """
+    import trace_width as TW
+
+    best = None
+    for ph, bo, data in TW.candidates(raw, width):
+        fsync = data.count(TPIU_FSYNC)
+        try:
+            if L.has_tpiu_sync(data):
+                etm, _ = T.deframe(data, want_stream=stream)
+            else:
+                etm = b""
+        except Exception:
+            etm = b""
+        v4d = count_async(etm)
+        v4a = count_async(data)
+        fl = sum(1 for s in L.find_isyncs(data) if L.is_flash(s.addr))
+        score = v4d * 1000000 + len(etm) * 10 + v4a * 100 + fsync + fl
+        if best is None or score > best[0]:
+            best = (score, ph, 0 if bo == "lsb" else 1, data, fl, v4a, fsync)
+    return best
+
+
+def count_async(buf):
+    """ETMv4 A-sync: >=11 zero bytes then 0x80."""
+    n = 0
+    zc = 0
+    for c in buf:
+        if c == 0:
+            zc += 1
+        elif c == 0x80 and zc >= 11:
+            n += 1
+            zc = 0
+        else:
+            zc = 0
+    return n
+
+
 def recover_assemble(raw, stream=2):
     """Streamed byte = {trace_a[k] hi, trace_b[k-1] lo}. Recover time-ordered
     half-bit nibbles and parity/order-search assemble to the period-indexed
@@ -71,19 +119,6 @@ def recover_assemble(raw, stream=2):
     for k in range(len(raw) - 1):
         nibs.append((raw[k] >> 4) & 0xF)
         nibs.append(raw[k + 1] & 0xF)
-    def count_async(buf):
-        """ETMv4 A-sync: >=11 zero bytes then 0x80."""
-        n = 0
-        zc = 0
-        for c in buf:
-            if c == 0:
-                zc += 1
-            elif c == 0x80 and zc >= 11:
-                n += 1
-                zc = 0
-            else:
-                zc = 0
-        return n
 
     best = None
     for parity in (0, 1):
@@ -285,6 +320,10 @@ def main():
                          "walk (legacy home-grown)")
     ap.add_argument("--stream", type=int, default=2,
                     help="TPIU stream/tag to extract (ETM=2)")
+    ap.add_argument("--width", type=int, choices=(4, 2, 1), default=4,
+                    help="TPIU parallel port width of the capture (default 4). "
+                         "At 2/1 bit a TPIU byte spans 2/4 TRACECLK periods, so "
+                         "the raw capture is regrouped accordingly")
     ap.add_argument("--keep", type=str, default=None,
                     help="keep the OpenCSD snapshot dir (and etm.bin) here")
     ap.add_argument("--dump-lister", type=str, default=None,
@@ -321,10 +360,16 @@ def main():
             print(f"[3] deframed ETM: {len(etm)} bytes")
     else:
         # Try the legacy 2-byte-per-period nibble path.
-        score, parity, order, data, fl, v4a, fsync = recover_assemble(
-            raw, stream=a.stream)
+        if a.width == 4:
+            score, parity, order, data, fl, v4a, fsync = recover_assemble(
+                raw, stream=a.stream)
+            what = f"parity={parity} order={order}"
+        else:
+            score, parity, order, data, fl, v4a, fsync = recover_assemble_width(
+                raw, a.width, stream=a.stream)
+            what = f"{a.width}-bit phase={parity} order={'lsb' if not order else 'msb'}"
         if L.has_tpiu_sync(data):
-            print(f"[2] legacy raw {{a,b}}: parity={parity} order={order} "
+            print(f"[2] legacy raw {{a,b}}: {what} "
                   f"assembled={len(data)}B  TPIU-fsync={fsync} "
                   f"A-syncs(v4)={v4a} flash-Isync={fl}")
             if a.deframer == "official":
