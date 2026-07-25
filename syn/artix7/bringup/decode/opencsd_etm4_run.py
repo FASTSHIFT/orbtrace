@@ -33,6 +33,7 @@ import tempfile
 
 import etm35lib as L
 import dsl_parse as D
+import tpiu_official as T
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PACKER = os.path.join(HERE, "make_opencsd_snapshot.py")
@@ -49,47 +50,62 @@ EXPECTED = {
 TPIU_FSYNC = bytes([0xFF, 0xFF, 0xFF, 0x7F])
 
 
-def recover_assemble(raw):
+def recover_assemble(raw, stream=2):
     """Streamed byte = {trace_a[k] hi, trace_b[k-1] lo}. Recover time-ordered
     half-bit nibbles and parity/order-search assemble to the period-indexed
     byte stream.
 
-    Ranking criteria, strongest first:
-      1. TPIU full-sync count (FF FF FF 7F). This is by far the most robust
-         signal because the TPIU emits it as HSYNC filler whenever the ETM has
-         no data -- so it is DENSE precisely on sparse BB-OFF streams where the
-         old criteria (A-sync / I-sync) are both zero and the search silently
-         fell through to parity=0 order=0 (which is often wrong -> the
-         'f7ff f7ff' half-nibble misalignment we chased for hours; see
-         AGENT.md pitfall 17).
-      2. ETMv4 A-sync count (>=11 zero bytes then 0x80) -- good on dense BB=1.
-      3. ETMv3.5-style I-sync anchored in flash -- final tie-breaker.
+    Ranking: score the stream AFTER TPIU-deframing with the OFFICIAL
+    (orbuculum tpiuDecoder.c port) deframer. The post-deframe A-sync count is
+    the only signal that proves the whole chain (nibble phase -> TPIU frame
+    phase -> stream demux) is aligned. Pre-deframe fsync/A-sync counts are
+    unreliable: a half-nibble misalignment still produces spurious FF FF FF 7F
+    out of HSYNC filler.
+
+    The deframer choice matters as much as the phase: tpiu_deframe_walk scans
+    HSYNC byte-by-byte and loses 16-bit frame phase when HSYNC lands on an odd
+    offset (~30% HSYNC density here). Measured on the same capture:
+    walk trace-info-after=0 / 6 decoded PCs vs official=57 / 781.
     """
     nibs = bytearray()
     for k in range(len(raw) - 1):
         nibs.append((raw[k] >> 4) & 0xF)
         nibs.append(raw[k + 1] & 0xF)
+    def count_async(buf):
+        """ETMv4 A-sync: >=11 zero bytes then 0x80."""
+        n = 0
+        zc = 0
+        for c in buf:
+            if c == 0:
+                zc += 1
+            elif c == 0x80 and zc >= 11:
+                n += 1
+                zc = 0
+            else:
+                zc = 0
+        return n
+
     best = None
     for parity in (0, 1):
         for order in (0, 1):
             data = D.assemble(nibs, parity, order)
-            # TPIU HSYNC filler -- dense on sparse streams (primary criterion)
             fsync = data.count(TPIU_FSYNC)
-            # ETMv3.5-style I-sync in flash
-            fl = sum(1 for s in L.find_isyncs(data) if L.is_flash(s.addr))
-            # ETMv4 A-sync: >=11 zero bytes then 0x80
-            v4a = 0
-            zc = 0
-            for c in data:
-                if c == 0:
-                    zc += 1
-                elif c == 0x80 and zc >= 11:
-                    v4a += 1
-                    zc = 0
+            # DEFRAME first (official deframer), then score.
+            try:
+                if L.has_tpiu_sync(data):
+                    etm, _ = T.deframe(data, want_stream=stream)
                 else:
-                    zc = 0
-            # Weight so that fsync dominates, then A-sync, then I-sync.
-            score = fsync * 10000 + v4a * 100 + fl
+                    etm = b""
+            except Exception:
+                etm = b""
+            v4d = count_async(etm)              # A-sync AFTER deframe: strongest
+            v4a = count_async(data)             # A-sync before deframe
+            fl = sum(1 for s in L.find_isyncs(data) if L.is_flash(s.addr))
+            # Ranking: post-deframe A-sync dominates (it is the only signal that
+            # proves the whole chain aligned), then deframed payload size, then
+            # pre-deframe A-sync, raw fsync, and flash I-sync as tie-breakers.
+            score = (v4d * 1000000 + len(etm) * 10 + v4a * 100
+                     + fsync + fl)
             if best is None or score > best[0]:
                 best = (score, parity, order, data, fl, v4a, fsync)
     return best
@@ -294,7 +310,6 @@ def main():
             # HSYNC lands on an odd offset -- fatal at this stream's ~30% HSYNC
             # density (A-sync trace-info-after: walk=0 vs official=57; decoded
             # PCs: walk=6 vs official=781). Default to official.
-            import tpiu_official as T
             print("[2] TPIU-framed; official (orbuculum) deframer, stream=%d"
                   % a.stream)
             etm, st = T.deframe(raw, want_stream=a.stream)
@@ -306,13 +321,19 @@ def main():
             print(f"[3] deframed ETM: {len(etm)} bytes")
     else:
         # Try the legacy 2-byte-per-period nibble path.
-        score, parity, order, data, fl, v4a, fsync = recover_assemble(raw)
+        score, parity, order, data, fl, v4a, fsync = recover_assemble(
+            raw, stream=a.stream)
         if L.has_tpiu_sync(data):
             print(f"[2] legacy raw {{a,b}}: parity={parity} order={order} "
                   f"assembled={len(data)}B  TPIU-fsync={fsync} "
                   f"A-syncs(v4)={v4a} flash-Isync={fl}")
-            etm = L.tpiu_deframe_walk(data)
-            print(f"[3] deframed ETM: {len(etm)} bytes")
+            if a.deframer == "official":
+                etm, st = T.deframe(data, want_stream=a.stream)
+                print(f"[3] deframed ETM (official): {len(etm)} bytes "
+                      f"(frames={st['packets']} fsync={st['syncs']})")
+            else:
+                etm = L.tpiu_deframe_walk(data)
+                print(f"[3] deframed ETM (walk): {len(etm)} bytes")
         else:
             print("[2] no TPIU sync detected in either raw or assembled forms;"
                   " passing bytes through as-is")

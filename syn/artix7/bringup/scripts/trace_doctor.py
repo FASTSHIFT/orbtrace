@@ -412,8 +412,13 @@ def cmd_decode_perf(a):
     if not orbetto.exists():
         print(f"[trace_doctor] orbetto binary not found at {orbetto}")
         return 2
+    # orbetto derives exception names from the ELF's own Cortex-M vector table,
+    # so no device database is needed. -D only adds the vendor peripheral
+    # register names used to annotate DMA slices (and is the fallback path for
+    # stripped ELFs). It used to be inferred from the ELF *filename*, which made
+    # orbetto abort on any ELF not named after a known part.
     cmd = [str(orbetto), "-C", str(a.freq_khz), "-t", "1", "-f", raw_path,
-           "-e", a.elf, "-F", ts_bin + ".time.bin"]
+           "-e", a.elf, "-F", ts_bin + ".time.bin", "-D", a.device]
     env = os.environ.copy()
     env.setdefault("ORBETTO_ETM_PROT", "ETM4")
     return run(cmd, env=env).returncode
@@ -959,6 +964,11 @@ def build_parser():
     x = pdc_sub.add_parser("perf", help="export Perfetto perf (etm_with_time + orbetto)")
     x.add_argument("raw"); x.add_argument("elf")
     x.add_argument("--freq-khz", type=int, default=300000)
+    x.add_argument("--device", default="stm32h743",
+                   help="orbetto vendor extra: peripheral register names for DMA "
+                        "annotation, and fallback exception table for stripped "
+                        "ELFs. Exception names normally come from the ELF vector "
+                        "table (default: stm32h743)")
     x.set_defaults(func=cmd_decode_perf)
     # NB: tpiu-diff moved to `probe tpiu-pattern` -- it's a physical-link
     # ground-truth test (bypasses ETM), not a decode step.
