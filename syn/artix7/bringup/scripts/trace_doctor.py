@@ -401,10 +401,15 @@ def cmd_decode_perf(a):
                       f"-> {raw_path}")
     except Exception as e:
         print(f"[trace_doctor] pre-align skipped ({e}); feeding raw to orbetto")
-    ts_bin = raw_path + ".time.bin"
+    # step 1: attach timebase. etm_with_time writes the clean ETM bytes to
+    # etm_out, plus the per-ETM-byte ns table to etm_out + ".time.bin" (that
+    # table is what orbetto wants via -F; orbetto itself is fed the RAW capture
+    # and runs its own TPIU deframer over it, hence both sides must deframe
+    # identically -- see the official-deframer note in etm_with_time.py).
+    etm_out = raw_path + ".etm.bin"
+    ts_bin = etm_out + ".time.bin"
     ts_json = a.raw + ".ts.json"   # timebase sidecar belongs to the ORIGINAL raw
-    # step 1: attach timebase
-    r1 = native("etm_with_time.py", raw_path, ts_json, ts_bin)
+    r1 = native("etm_with_time.py", raw_path, ts_json, etm_out)
     if r1.returncode != 0:
         return r1.returncode
     # step 2: orbetto
@@ -418,7 +423,7 @@ def cmd_decode_perf(a):
     # stripped ELFs). It used to be inferred from the ELF *filename*, which made
     # orbetto abort on any ELF not named after a known part.
     cmd = [str(orbetto), "-C", str(a.freq_khz), "-t", "1", "-f", raw_path,
-           "-e", a.elf, "-F", ts_bin + ".time.bin", "-D", a.device]
+           "-e", a.elf, "-F", ts_bin, "-D", a.device]
     env = os.environ.copy()
     env.setdefault("ORBETTO_ETM_PROT", "ETM4")
     return run(cmd, env=env).returncode

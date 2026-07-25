@@ -4,7 +4,7 @@
 Pipeline (doc 15 §24.2): the F429 ETM has no wall-clock, so the FPGA timestamps
 RAW capture bytes (trace_dump --timebase -> <dump>.ts.json). Here we:
   1. deframe the RAW TPIU capture into ETM bytes, tracking the source RAW byte
-     offset of each ETM byte (tpiu_deframe_walk_offsets),
+     offset of each ETM byte (tpiu_official.deframe with_offsets),
   2. map each ETM byte's source offset -> wall-clock ns via the sidecar table
      (fpga_timebase.TimeBase),
   3. emit the clean ETM bytes (for etm_to_tpiu.py -> orbetto) AND a parallel
@@ -19,6 +19,7 @@ import json
 import sys
 
 import etm35lib as L
+import tpiu_official as T
 from fpga_timebase import TimeBase
 
 
@@ -33,7 +34,15 @@ def main():
     # Stage 1: assemble best-aligned byte stream is already done upstream
     # (trace_dump output is the correctly-assembled RAW byte stream). Deframe
     # with source-offset tracking so each ETM byte carries its RAW origin.
-    etm, offs = L.tpiu_deframe_walk_offsets(raw)
+    #
+    # MUST be the same deframer orbetto uses (official / orbuculum tpiuDecoder
+    # semantics). The old tpiu_deframe_walk_offsets loses 16-bit frame phase on
+    # odd-offset HSYNC and yields FEWER ETM bytes than orbetto's own deframer
+    # (measured: 8734 vs 11816 on the same capture). The .time.bin array is
+    # indexed by ETM byte position, so a length/index mismatch silently skews
+    # every timestamp: orbetto then runs off the end of the table and the time
+    # axis degenerates to a 1ns-per-event counter.
+    etm, offs, st = T.deframe(raw, want_stream=2, with_offsets=True)
 
     # Stage 2: map RAW source offset -> wall-clock ns. The dump file is the RAW
     # buffer with the first `skip` bytes dropped; offsets index into that file,
@@ -60,7 +69,8 @@ def main():
     # Report
     unk = sum(1 for c in etm if L._classify(c) == "unknown")
     print(f"deframed {len(raw)} RAW -> {len(etm)} ETM bytes "
-          f"(unknown {100*unk/max(1,len(etm)):.3f}%)")
+          f"(official: frames={st['packets']} fsync={st['syncs']}, "
+          f"unknown {100*unk/max(1,len(etm)):.3f}%)")
     if times_ns:
         span = times_ns[-1] - times_ns[0]
         nondec = sum(1 for k in range(1, len(times_ns))
