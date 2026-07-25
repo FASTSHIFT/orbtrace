@@ -245,8 +245,26 @@ def cmd_tap_set_lane(a):
 
 
 def cmd_tap_sweep(a):
-    """Sweep clock IDELAY tap, find best fsync count. Wraps iddr_tap_sweep.py.
-    Falls back to inline sweep if the native script signature differs."""
+    """Sweep IDELAY tap, scored against a KNOWN TPIU AA/55 test pattern (via
+    CURTPM=0x00020004). REQUIRES the STM32 to be running with CURTPM in
+    test-pattern mode, NOT real ETM data. If you sweep against real ETM data
+    (with `td etm clear-curtpm` already run), every tap reports 100% err
+    because no byte is 0xA5/0x5A. Enable CURTPM first via openocd if needed."""
+    # Detect if CURTPM is currently 0 (real trace mode) and warn
+    r = subprocess.run(
+        ["openocd", "-f", "interface/cmsis-dap.cfg", "-f", "target/stm32h7x.cfg",
+         "-c", "init", "-c",
+         "echo CURTPM=[format 0x%08x [mrw 0x5C015204]]",
+         "-c", "shutdown"],
+        cwd=str(BRINGUP.parents[2]), capture_output=True, text=True, timeout=8)
+    import re
+    m = re.search(r"CURTPM=0x([0-9a-fA-F]+)", r.stdout + r.stderr)
+    if m and int(m.group(1), 16) != 0x00020004:
+        print(f"[trace_doctor] WARNING: TPIU_CURTPM=0x{int(m.group(1), 16):08x}, "
+              f"expected 0x00020004 (AA/55 test pattern). Real ETM data will "
+              f"score 100% err at every tap because no byte is 0xA5/0x5A.")
+        print(f"  To enable test pattern: openocd ... 'mww 0x5C015204 0x20004'")
+        print(f"  After sweep, restore with `td etm clear-curtpm`.")
     return native("iddr_tap_sweep.py", *(a.extra or [])).returncode
 
 # ============================================================================
@@ -622,18 +640,23 @@ def _check_l3_net(state, verbose=True):
 
 
 def _check_l7_etm(state, verbose=True):
-    """L7 STM32 ETM state: read CoreSight regs and check for common failure
-    modes (ETM not enabled / IDLE / test-pattern still on / auth locked)."""
+    """L7 STM32 ETM state: read CoreSight regs AND CPU aliveness (PC must be
+    in flash 0x08000000..0x0800xxxx). CPU crashed -> ETM has nothing to
+    trace -> ETF stays Empty -> TPIU only outputs HSYNC filler (0xff nibbles)
+    even though every ETM register looks 'PASS'."""
     issues = []
     r = subprocess.run(
         ["openocd", "-f", "interface/cmsis-dap.cfg", "-f", "target/stm32h7x.cfg",
          "-c", "init", "-c", "halt",
          "-c", "echo [format {PRGCTLR=0x%08x STATR=0x%08x CONFIGR=0x%08x "
-               "CURPSIZE=0x%08x CSTF=0x%08x ETF=0x%08x DBGMCU=0x%08x "
+               "CURPSIZE=0x%08x CSTF=0x%08x ETF=0x%08x ETFSTS=0x%08x DBGMCU=0x%08x "
                "CURTPM=0x%08x AUTH=0x%08x} "
                "[mrw 0xE0041004] [mrw 0xE004100C] [mrw 0xE0041010] "
                "[mrw 0x5C015004] [mrw 0x5C013000] [mrw 0x5C014020] "
-               "[mrw 0x5C001004] [mrw 0x5C015204] [mrw 0xE0041FB8]]",
+               "[mrw 0x5C01400C] [mrw 0x5C001004] [mrw 0x5C015204] "
+               "[mrw 0xE0041FB8]]",
+         # PC needs the DCRSR/DCRDR protocol, not a raw mrw. Use openocd 'reg pc'.
+         "-c", "echo PC=[reg pc]",
          "-c", "resume", "-c", "shutdown"],
         cwd=str(BRINGUP.parents[2]), capture_output=True, text=True, timeout=10)
     out = r.stdout + r.stderr
@@ -643,9 +666,32 @@ def _check_l7_etm(state, verbose=True):
         return int(m.group(1), 16) if m else None
     prg = get("PRGCTLR"); stat = get("STATR"); tpiu = get("CURPSIZE")
     cstf = get("CSTF"); etf = get("ETF"); dbg = get("DBGMCU")
-    curtpm = get("CURTPM"); auth = get("AUTH")
+    curtpm = get("CURTPM"); auth = get("AUTH"); etfsts = get("ETFSTS")
+    # PC comes from `reg pc` -> "pc (/32): 0x080089a0" or "PC=0x..." echo line;
+    # try both output forms.
+    pc = None
+    m = re.search(r"pc \(/32\):\s*0x([0-9a-fA-F]+)", out)
+    if m: pc = int(m.group(1), 16)
+    else:
+        m = re.search(r"PC=0x([0-9a-fA-F]+)", out)
+        if m: pc = int(m.group(1), 16)
     if prg is None:
         return ["L7 CoreSight readback failed (openocd/SWD?)"]
+    # CPU aliveness: PC must be in flash 0x08000000..0x0800xxxx (H743 max 2MB)
+    if pc is not None:
+        if pc < 0x08000000 or pc > 0x08200000:
+            issues.append(f"L7 CPU CRASHED/RUNAWAY: PC=0x{pc:08x} not in flash "
+                          f"(0x08000000..0x08200000). ETM has nothing to trace; "
+                          f"TPIU only emits HSYNC filler. Reset STM32 (`td burn fw` "
+                          f"or reset run) to recover.")
+        elif verbose:
+            print(f"  L7 CPU alive: PC=0x{pc:08x} in flash")
+    # ETF_STS bit4 Empty=1 is NORMAL in HW-FIFO mode: data streams through
+    # ETM -> ETF -> TPIU and the FIFO is drained continuously, so it looks
+    # empty at any given halt. Real diagnostic: read ETF_RWP twice and check
+    # it advances (RWP moves means data is flowing).
+    # (RWP checks are done by `td capture status` /`snapshot` at runtime,
+    # not by a single halted read here.)
     if prg != 1:
         issues.append(f"L7 TRCPRGCTLR=0x{prg:x} (ETM not enabled; run `td etm enable`)")
     if stat is not None and stat != 0:
