@@ -174,7 +174,23 @@ def cmd_recent(a):
 # ============================================================================
 
 def cmd_probe_voltmeter(a):
-    """TPIU AA/55 physical datapath test. Requires pin_la bit."""
+    """TPIU AA/55 physical datapath test. REQUIRES pin_la bit (which has the
+    logic analyzer wired into a BRAM ring). If you're on clktap, run
+    `td burn fpga build/trace_pin_la.bit` first, run this, then burn back."""
+    # Detect current bit signature quickly
+    r = subprocess.run(
+        ["python3", str(HERE / "trace_dump.py"), "--status-only"],
+        cwd=str(BRINGUP), capture_output=True, text=True, timeout=3)
+    import re
+    m = re.search(r"DEPTH=(\d+)", r.stdout)
+    if m and 32000 <= int(m.group(1)) < 33000:
+        pass  # pin_la, good to go
+    elif m:
+        depth = int(m.group(1))
+        print(f"[trace_doctor] WARNING: current DEPTH={depth} doesn't match pin_la "
+              f"(expected ~32639). This test will likely fail with 'pin_la not ready'.")
+        print(f"  To run voltmeter: td burn fpga build/trace_pin_la.bit")
+        print(f"  To resume normal trace: td burn fpga build/trace_iddr_clktap.bit")
     return native("hw_selftest.py", "quick", *(["--ip", a.ip] if a.ip else [])).returncode
 
 
@@ -390,7 +406,9 @@ def cmd_build_fw(a):
 
 
 def cmd_burn_fpga(a):
-    """Burn FPGA bit via openFPGALoader."""
+    """Burn FPGA bit via openFPGALoader. Auto-rearms after ~3s so subsequent
+    `capture status` doesn't read stale 0xFFFF CSR."""
+    import time
     bit = a.bit or str(BUILD_DIR / "trace_iddr_clktap.bit")
     p = Path(bit)
     if not p.exists():
@@ -399,6 +417,11 @@ def cmd_burn_fpga(a):
     if rc == 0:
         state_update("fpga", bit_file=p.name, bit_md5=md5_of(p),
                      burned_at=datetime.datetime.now().isoformat(timespec="seconds"))
+        # Give the FPGA a moment to boot, then auto-rearm so CSRs refresh
+        # from 0xFF (uninitialized) to real values. Skippable with --no-rearm.
+        if not a.no_rearm:
+            time.sleep(3)
+            native("trace_ctrl.py", "rearm")
     return rc
 
 
@@ -516,6 +539,14 @@ def _check_l2_fpga_bit(state, verbose=True):
             # 0xFF" i.e. the bit isn't answering with real state -- either not
             # loaded or wrong bit. Note gen=0xFF is NORMAL for freshly-loaded
             # clktap after some captures; do NOT gate on gen alone.
+            # Bit-signature whitelist: depth range -> plausible bit name.
+            # Used to detect state-file-vs-reality drift (e.g. hw_selftest
+            # secretly re-flashed pin_la but state still claims clktap).
+            BIT_SIGNATURE = [
+                (32000, 33000, "pin_la"),
+                (63000, 64500, "clktap 4-bit"),
+                (64500, 65000, "unknown / newer bit"),
+            ]
             if depth >= 0xFF00:
                 issues.append(
                     f"L2 FPGA DEPTH={depth} full={m.group(2)} gen={m.group(3)} "
@@ -523,7 +554,26 @@ def _check_l2_fpga_bit(state, verbose=True):
             elif depth == 0:
                 if verbose: print(f"  L2 FPGA DEPTH=0 (fresh, needs rearm to fill)")
             else:
-                if verbose: print(f"  L2 FPGA DEPTH={depth} full={m.group(2)} gen={m.group(3)}")
+                # cross-check with state file
+                expected_bit = state.get("fpga", {}).get("bit_file", "")
+                signature = "unknown"
+                for lo, hi, name in BIT_SIGNATURE:
+                    if lo <= depth < hi:
+                        signature = name
+                        break
+                if expected_bit and signature != "unknown":
+                    if "clktap" in expected_bit and "clktap" not in signature:
+                        issues.append(
+                            f"L2 FPGA state says '{expected_bit}' but DEPTH={depth} "
+                            f"matches '{signature}' — state file DRIFT, actual bit "
+                            f"different! Re-burn or `td burn fpga <correct>` to fix.")
+                    elif "pin_la" in expected_bit and "pin_la" not in signature:
+                        issues.append(
+                            f"L2 FPGA state says '{expected_bit}' but DEPTH={depth} "
+                            f"matches '{signature}' — state file DRIFT.")
+                if verbose and not issues:
+                    print(f"  L2 FPGA DEPTH={depth} matches '{signature}' "
+                          f"(state: '{expected_bit}')")
         else:
             issues.append(f"L2 FPGA status parse failed: {rc.stdout[:200]}")
     return issues
@@ -610,9 +660,14 @@ def _check_l7_etm(state, verbose=True):
         issues.append(f"L7 DBGMCU_CR trace clocks not fully enabled (0x{dbg:x})")
     if curtpm and curtpm != 0:
         issues.append(f"L7 TPIU CURTPM=0x{curtpm:x} (test-pattern on! run `td etm clear-curtpm`)")
-    if auth is not None and (auth & 0x0C) == 0:
-        issues.append(f"L7 TRCAUTHSTATUS=0x{auth:x} — Non-invasive debug bits[3:2]=00 "
-                      f"(ETM output may be gated off; check DAPLink attach)")
+    # TRCAUTHSTATUS (IHI0064H §7.3.3): bits[7:6]=SNID, bits[3:2]=NSNID.
+    # H743 is Armv7-M with no Security Extensions -> SNID indicates the
+    # permitted debug level, NSNID is always 0b00. So AUTH=0xC0 (SNID=11
+    # Secure non-invasive ENABLED) is NORMAL for this chip. Only flag
+    # AUTH=0 or SNID=00 (bits[7:6]=00) as genuinely-blocked.
+    if auth is not None and (auth & 0xC0) == 0:
+        issues.append(f"L7 TRCAUTHSTATUS=0x{auth:x} — SNID bits[7:6]=00 "
+                      f"(non-invasive debug blocked; check DAPLink attach / DAUTHCTRL)")
     if verbose and not issues:
         print(f"  L7 ETM prg=1 stat=0 tpiu=0x{tpiu:x} cstf=0x{cstf:x} etf=0x{etf:x} "
               f"auth=0x{auth:x}")
@@ -767,6 +822,8 @@ def build_parser():
     pbu = sub.add_parser("burn")
     pbu_sub = pbu.add_subparsers(dest="cmd", required=True)
     x = pbu_sub.add_parser("fpga"); x.add_argument("bit", nargs="?")
+    x.add_argument("--no-rearm", action="store_true",
+                   help="skip auto-rearm after burn (default: rearm to refresh CSRs)")
     x.set_defaults(func=cmd_burn_fpga)
     x = pbu_sub.add_parser("fw"); x.add_argument("hex"); _add_extra(x)
     x.set_defaults(func=cmd_burn_fw)
