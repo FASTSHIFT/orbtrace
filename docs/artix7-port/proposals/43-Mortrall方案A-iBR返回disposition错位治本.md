@@ -222,3 +222,181 @@ commit。**"单步坐实 > 优美启发式"再次应验——A2 就是没坐实�
 
 P0-1 done、P0-2（opencsd 参照）与 P0-3（四假设互斥）仍未做。方案 A 继续冻结，直到
 P0-3 用数据唯一确定根因（错位一位 / 批次边界 / 锚定错 / 消费逻辑）。
+
+
+---
+
+## 11. P0-2 部分结果：opencsd 参照对 0x800a 区失效（2026-08-02）
+
+### 11.1 原始数据完整性 = 确认干净
+
+零丢包 slice（cm100_slice, 8MB, seq-gap≈5）三查：
+- **seq 连续**（≈5/329641 gap，实质零丢包）。
+- **raw slice 本身已 TPIU 对齐**（decode 跳过预对齐，无 half-nibble 偏移），fsync 密度
+  全片均匀 6/64KB（比 rt300 的 3300 低，因 225M/112.5M 新固件 sync period/数据率不同，
+  均匀=正常，无骤变=无误码）。
+- **opencsd 独立解码 100% 干净**：98091 INSTR_RANGE、2773 unique PC、**100% 在 flash**、
+  lister 完整跑完（END OF TRACE，318826 字节全处理，非截断）。
+- **结论：原始数据完整可信**，后续打 log 查到的现象是真的，不是丢包/误码假象。
+
+### 11.2 opencsd 的 cm_benchmark_main=499 是 PC count，不是进入次数
+
+红方 Q3 要解释的 opencsd 那个数字：`opencsd_etm4_run.py:448` 的
+`Counter(func_of(p) for p in in_flash)` —— 是**落在函数地址范围内的不同 PC 采样计数**，
+**不是"进入函数次数"**。所以 opencsd 499 vs mortrall 256（B|begin 数）**量纲不同，
+不能直接比**。之前 fixture 的 27 我也误当成进入次数了——更正。
+
+### 11.3 opencsd 与 mortrall 在 0x800a 区执行路径分道（关键）
+
+- opencsd lister 的 INSTR_RANGE **最高只到 0x80094d4**，**完全没有 0x800a2xx**
+  （coremark_main=0x800a2f8 / cm_uart_send_char=0x800a2d4 都在 0x800a 区）。
+- 但 lister **完整跑完未截断**（END OF TRACE），且 cm_benchmark_main(0x8008118) 有覆盖。
+- 即：**opencsd 在这段 slice 里执行流从没上到 0x800a2xx，而 mortrall 走到了**
+  （mortrall 正是在 cm_uart_send_char 的 pop@0x800a2f2 触发假重入）。
+- **两个解码器在 0x800a 区分道扬镳。** 这直接影响红方 Q3：opencsd 参照对 0x800a 区
+  **失效**（它没走到那），不能拿来 diff cm_uart_send_char pop 的 atom 消耗。
+
+### 11.4 P0-3 的方向修正
+
+P0-3 的四假设互斥判定**不能用 opencsd 做基准**（它没解码 0x800a 区）。剩下两条路：
+1. **先查清 opencsd 为何不上 0x800a**：是它在某个分支选择上与 mortrall 不同（谁对？），
+   还是这段 slice 的执行流本就没进 coremark_main（那 mortrall 的 0x800a 访问反而可疑）？
+   —— 这是新的、更根本的岔路，可能重定位真凶。
+2. **手工按 IHI0064 ETM4 spec 对齐** cm_uart_send_char pop 附近的 atom（无参照，纯 spec）。
+
+**在 11.3 这个"两解码器分道"搞清楚前，方案 A 仍冻结。** 它可能意味着真凶不在
+"disposition 错位"，而在"mortrall 为何走进了 opencsd 不走的 0x800a 区"——若 mortrall
+的 0x800a 访问本身是错的（走错路），那是锚定错（H43 的 §3.5 分支），不是错位一位。
+
+
+---
+
+## 12. 分叉厘清：mortrall 进 0x800a 是对的，真值用 ELF 不用 opencsd（2026-08-02）
+
+§11.3 提出"两解码器在 0x800a 分道，可能 mortrall 走错路"。**用 ELF 静态真值直接判——
+mortrall 走进 0x800a 是对的，opencsd 没跟到是 opencsd 侧的问题。**
+
+### 12.1 ELF 静态铁证：执行流必然进 0x800a
+
+`objdump` 确认 0x800a 区函数被真实 `bl` 调用：
+```
+4× bl 800a284 <cm_uart_puts>       ← coremark_main 每轮打印结果必调
+1× bl 800a2d4 <cm_uart_send_char>  ← 唯一 caller 在 0x8009772 (ee_printf 内)
+1× bl 800a2f8 <coremark_main>
+```
+CoreMark 循环跑，每轮都打印 → cm_uart_puts → ee_printf → cm_uart_send_char。
+**执行流一定进 0x800a2xx。mortrall 走进去正确；H43 §3.5 的"锚定错/走错路"假设排除。**
+opencsd lister 没上 0x800a 是它自己的 range 发射/dump 差异，**参照对 0x800a 失效但无所谓——
+真值直接来自 ELF。**
+
+### 12.2 硬真值判据（P0-3 用这个，不用 opencsd）
+
+- `cm_uart_send_char` 唯一 caller = `0x8009772`（`bl`），故其 `pop {r4,pc}`(0x800a2f2)
+  **正确返回目标 = 0x8009776**（bl 下一条）。
+- mortrall 实测：pop 判 not-taken → workingAddr 越过进 0x800a2f4(`.word`) → 漂到
+  0x800a2f8(coremark_main 入口)。**错。应返回 0x8009776。**
+- **P0-3 可证伪判据（真值来自 ELF，无需参照解码器）**：单步 pop@0x800a2f2，
+  正确 workingAddr 应变成 0x8009776。它没有 → 定位为何没返回（disposition 消费 /
+  批次边界 / 消费逻辑），四假设里排除了"锚定错"，剩三选一。
+
+### 12.3 方向回归 r33，但判据升级
+
+真凶方向仍是 r33 §3 的"iBR 返回被 disposition 判 not-taken 而跳过"，**但现在有 ELF 硬
+真值（0x8009776）做判据**，不再依赖"无条件返回不该 not-taken"的原则推断，也不需要
+opencsd 参照。P0-3 可以直接单步 mortrall 在这一点、对着 0x8009776 这个确定目标查。
+
+
+---
+
+## 13. P0-3 结论：根因是【批次边界】，不是"错位一位"（2026-08-02，实测判定）
+
+在 cm_uart_send_char pop@0x800a2f2 逐-atom dump（ELF 真值判据，零丢包 slice），四假设
+互斥判定的数据出来了：
+
+### 13.1 关键对照：同一 pop，第一次错、后续对
+
+**第一次（错，depth=2，pop 判 not-taken）：**
+```
+INS a2ec ic=f(bl HAL) exec=1 dispbit=1 disp=5   incAddr=4
+INS a2f0 ic=8(add)    exec=1 dispbit=0 disp=0   incAddr=1   ← 这批已耗尽(disp=0,incAddr=1)
+INS a2f2 ic=1(pop)    exec=0 dispbit=0 disp=0   incAddr=1   ← pop 拿不到 atom → not-taken → 漂
+INS a2f4 (.word 字面量池, 越过 pop)
+```
+**后续（对，depth=5，pop 判 taken 正确返回）：**
+```
+INS a2ec exec=1 dispbit=1 disp=1    incAddr=1
+INS a2f0 exec=1 dispbit=1 disp=ffff incAddr=17  ← 新 EV_CH_ENATOMS 批次(BATCH wa=0800a2f4)
+INS a2f2 exec=1 dispbit=1 disp=ffff incAddr=17  ← pop taken, 正确返回 0x8009776
+```
+
+### 13.2 判定：H43 假设② 批次边界成立，①错位一位 / ③锚定错 / ④消费逻辑 排除
+
+- **不是"错位一位"**：后续同一 pop 用同样的消费逻辑判对了，disposition 位与指令的对应
+  关系没错位；错的只是第一次**这批 atom 在 pop 之前就耗尽**（disp=0, incAddr=1，a2f2
+  取到的是空）。
+- **不是"锚定错/走错路"**：§12 已排除，mortrall 进 0x800a 正确。
+- **不是消费逻辑 bug**：消费逻辑本身对（后续 467-N 次都对）。
+- **是批次边界**：`EV_CH_ENATOMS` 批次恰好切在 HAL 返回后、pop 之前。这批的 atom 被
+  a2ec 的 `bl HAL`（及之前）消费完，pop@a2f2 该拿的 taken-atom 落在**下一个** batch
+  （BATCH wa=0800a2f4，disp=ffff…）。第一次 mortrall 在批耗尽时对 pop 判了 not-taken
+  并 fall-through，而不是**等下一批**。红方 Q2 判定为批次边界，实测坐实。
+
+### 13.3 修复方向（P1，仍需 regress 双 slice 守护）
+
+iBR（JUMP 非 IMMEDIATE，返回）在**当前批 atom 已耗尽**（incAddr 到 0 / 该指令拿不到
+有效 disposition 位）时，**不能就地判 not-taken 并 fall-through**——应挂起等下一个
+`EV_CH_ENATOMS` 批次补给再判。即：把"批边界切在分支指令上"这个情况正确处理，让 pop
+的判定用它真正对应的那批 atom。
+
+- 这比 A1/A2 的"落字面量池就当返回"启发式**精确得多**——它针对确切机制（批耗尽），
+  不误伤真实 not-taken 条件分支（那些分支的 atom 在本批内有效，不受影响）。
+- 风险仍在动 atom 循环核心，但现在改动目标明确（批边界挂起），且判据硬（pop 应返回
+  0x8009776 / regress 双 slice + verify_calls）。**解冻方案 A，按此方向做 P1。**
+
+
+---
+
+## 14. 出错规律 + ETM4 手册核对（2026-08-02）
+
+修法两次失败（B/A2/无条件iBR-助记符），教训：没吃透 ETM4 atom 语义就改，误伤真实分支
+（cardinality 掉 506）。停下来量化规律 + 翻手册（IHI0064H_b）。
+
+### 14.1 出错规律（零丢包 slice，cm_uart_send_char pop@0x800a2f2，467 次）
+
+- **判定 100% 由 `disposition & 1` 决定**：
+  - 错判（exec=0，392 次）：disp bit0=0（disp=a/2/0/4/1e，全是偶数）。
+  - 对判（exec=1，75 次）：disp bit0=1（disp=1/f/7/ff/fff/ffff/3，全是奇数）。
+- 错判主要 disp=a(1010) incAddr=4（221 次）、disp=2(10) incAddr=2（72 次）、disp=0(0)
+  incAddr=1（57 次）。即 **pop 拿到的 bit0=0，但 pop 是无条件返回，必为 E(taken)**。
+
+### 14.2 ETM4 手册确认的地基（IHI0064H_b）
+
+- **§2.3.1 P0 元素**：direct + indirect branch **每条都生成一个 P0/atom**，
+  "regardless of whether they pass or fail their condition code check / are part of
+  an IT block"。→ 条件直接分支（bne/cbz）也有 atom；无条件 iBR（pop{pc}/bx lr）也有，
+  且必为 **E**。
+- **§2.6 / §6.4.x Atom Format 3**："least significant bit representing the **oldest**
+  Atom element"，`for I=0..2: A<I>? E : N`。→ **mortrall `disp&1`(bit0=oldest) + `>>=1`
+  的消费顺序与手册一致，位序没错。**
+- BATCH 实测：`eatoms=3 natoms=2 total=5 disp=0x15(10101)` → 3×E 2×N，位数一致 ✓。
+
+### 14.3 收窄后的真凶假设
+
+位序对、消费顺序对、每分支必有 atom——那 pop 拿到 bit0=0 的原因只剩：**pop 之前
+HAL_UART_Transmit 内部执行消费掉了本批 atom，到 pop 时本批已尽（disp 剩低位=0），
+pop 该用的 E-atom 在下一个 EV_CH_ENATOMS 批**。日志佐证：a2ec(bl HAL) 与 a2f0 之间没有
+BATCH 行，但 disp/incAddr 从 5/4 掉到 0/1——那是 HAL 内部指令（日志过滤没显示）消费的。
+pop 在批尽处读到空 bit0=0。
+
+**下一步（P0-3 收尾，未做）**：交叉**原始 ETM 字节**——定位 pop 附近在 etm.bin 的字节
+偏移，手工按手册解码那几个 Atom Format 包（F3/F5/F6），确认「HAL 返回的 iBR atom」与
+「pop 的 iBR atom」在字节流里的确切位置，判定 mortrall 是「批尽未等下一批」（批边界）
+还是「HAL 返回 iBR 的 atom 记账串了一位」（记账错）。**这一步定死后才改代码。**
+
+### 14.4 修法约束（血泪更新）
+
+- ❌ 不用助记符判"无条件"——**IT 块内条件指令的助记符不带 cc 后缀**（手册 §条件分支），
+  mnemonic 判据必然漏判，A2-变体已实测 cardinality 掉 506。
+- ✅ 若要判"无条件"，须用 capstone `detail->arm.cc == ARM_CC_AL`（改 loadelf 加
+  LE_IC_UNCOND 位），这是唯一可靠信号。但即便如此，"无条件 iBR 强制 taken"是否安全
+  仍需 §14.3 原始字节定死机制后再定。
