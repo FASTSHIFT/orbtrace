@@ -56,6 +56,7 @@ LOG_DIR = WORKSPACE / ".trace_doctor.log"
 DECODE_DIR = BRINGUP / "decode"
 BUILD_DIR = BRINGUP / "build"
 TARGET_DIR = BRINGUP / "target"
+FPGA_FLOW = BRINGUP / "fpga_flow"
 
 # ----------------------------------------------------------------------------
 # State file: cache of current fpga/stm32/etm/network state (proposal 41 §3.3)
@@ -155,6 +156,236 @@ def cmd_discover(a):
     print(f"FPGA at {info['ip']} on {info['iface']} (mac {mac})")
     print(f"  -> sockets bound to '{info['iface']}' reach it in both "
           f"router and dock-direct topologies")
+    return 0
+
+
+def _resolve_tcl_for_bit(bit_name):
+    """Map a bitstream name to the fpga_flow tcl that builds it.
+
+    Two ways a tcl claims a bit: (1) a literal `write_bitstream -force NAME.bit`,
+    or (2) `set outbit "DEFAULT.bit"` overridable by env OUTBIT -- in which case
+    the bit can be renamed at build time (e.g. trace_iddr_clktap_stream.bit is
+    run_trace_stream.tcl's trace_stream.bit renamed via OUTBIT). We match the
+    literal default first, then fall back to the stem before the first '_' group
+    that matches a tcl's default outbit."""
+    import re
+    stem = Path(bit_name).name
+    if not stem.endswith(".bit"):
+        stem += ".bit"
+    tcls = sorted(FPGA_FLOW.glob("run_*.tcl"))
+    # 1) exact literal write_bitstream match
+    for t in tcls:
+        txt = t.read_text(errors="ignore")
+        if re.search(r'write_bitstream\s+-force\s+' + re.escape(stem), txt):
+            return t, "literal"
+    # 2) OUTBIT-renamed variants: match a `set outbit "X.bit"` default by TOKEN
+    #    subset. OUTBIT names are arbitrary (trace_iddr_clktap_stream <-
+    #    trace_stream.bit), so prefix matching fails; instead require every '_'
+    #    token of the default base to appear in the requested stem. That keeps
+    #    trace_stream (tokens {trace,stream}) matching trace_iddr_clktap_stream
+    #    while rejecting trace_mmcm_stream (mmcm absent) and trace_direct_stream.
+    stem_tokens = set(stem[:-4].split("_"))
+    best = None
+    for t in tcls:
+        txt = t.read_text(errors="ignore")
+        m = re.search(r'set\s+outbit\s+"([^"]+\.bit)"', txt)
+        if not m:
+            continue
+        default = m.group(1)
+        base_tokens = set(default[:-4].split("_"))
+        if base_tokens <= stem_tokens:
+            # prefer the most specific (largest token set) match
+            if best is None or len(base_tokens) > best[2]:
+                best = (t, "outbit:" + default, len(base_tokens))
+    if best:
+        return best[0], best[1]
+    return None, None
+
+
+def _parse_read_verilog(tcl_path):
+    """Extract every file read_verilog/read_xdc pulls in, resolving the tcl's
+    own path vars (bdir/bringup/repo_root/ex/rtl) so we return real paths.
+
+    Deliberately simple: we evaluate the handful of `set VAR [file ...]` lines
+    the flow tcls use, then substitute $VAR / ${VAR} in read_* arguments. This
+    is the authoritative 'what actually compiles' list -- Vivado only builds
+    what these lines name."""
+    import re
+    txt = tcl_path.read_text(errors="ignore")
+    bdir = FPGA_FLOW
+    env = {
+        "bdir": bdir,
+        "bringup": BRINGUP,
+        "repo_root": ORB_ROOT,
+        "rtl": ORB_ROOT / "syn/artix7/rtl",
+        "ex": ORB_ROOT / "syn/external/verilog-ethernet/example/NexysVideo/fpga",
+    }
+    # honor any explicit `set ex ...` / `set rtl ...` overrides in the tcl
+    for m in re.finditer(r'set\s+(\w+)\s+(\$\S+/\S+)', txt):
+        var, val = m.group(1), m.group(2)
+        # resolve $repo_root/... style against known env
+        mm = re.match(r'\$(\w+)/(.+)', val)
+        if mm and mm.group(1) in env:
+            env[var] = Path(env[mm.group(1)]) / mm.group(2)
+
+    files = []          # (kind, resolved_path, raw)
+    # Strip foreach { ... } { ... } bodies first so their inner read_verilog
+    # (which uses the loop var, e.g. `read_verilog $ex/$s`) isn't mistaken for a
+    # standalone file -- the foreach pass below expands those properly.
+    txt_singles = re.sub(r'foreach\s+\w+\s+\{[^}]*\}\s*\{.*?\}', '', txt, flags=re.S)
+    # single read_verilog lines
+    for m in re.finditer(r'read_(verilog|xdc)\s+(\S+)', txt_singles):
+        kind, raw = m.group(1), m.group(2)
+        p = _expand_tcl_path(raw, env)
+        if p is not None and "$" not in str(p):
+            files.append((kind, p, raw))
+    # foreach { ... } blocks that read_verilog $ex/$s (or similar)
+    for fm in re.finditer(r'foreach\s+(\w+)\s+\{([^}]*)\}\s*\{(.*?)\}', txt, re.S):
+        loopvar, items, body = fm.group(1), fm.group(2), fm.group(3)
+        rm = re.search(r'read_(verilog|xdc)\s+(\S+)', body)
+        if not rm:
+            continue
+        kind, tmpl = rm.group(1), rm.group(2)
+        for item in items.split():
+            expanded = tmpl.replace("$" + loopvar, item).replace("${%s}" % loopvar, item)
+            p = _expand_tcl_path(expanded, env)
+            if p is not None:
+                files.append((kind, p, item))
+    return files
+
+
+def _expand_tcl_path(raw, env):
+    import re
+    s = raw
+    m = re.match(r'\$\{?(\w+)\}?/(.+)', s)
+    if m and m.group(1) in env:
+        return Path(env[m.group(1)]) / m.group(2)
+    if s.startswith("$"):
+        return None                     # unresolved var we don't track
+    return Path(s)
+
+
+def cmd_sources(a):
+    """List the exact source files a bitstream compiles -- authoritative, no
+    guessing. Parses the fpga_flow tcl's read_verilog/read_xdc (the only thing
+    Vivado actually builds), classifies project RTL vs the verilog-ethernet
+    library vs constraints, and flags any missing file.
+
+    Use before editing any bit: `td sources trace_iddr_clktap_stream.bit`."""
+    tcl, how = _resolve_tcl_for_bit(a.bit)
+    if tcl is None:
+        print(f"[sources] no fpga_flow tcl builds '{a.bit}'.")
+        print("  known bits:")
+        for t in sorted(FPGA_FLOW.glob("run_*.tcl")):
+            print(f"    {t.name}")
+        return 2
+    print(f"bit '{a.bit}' <- {tcl.name} ({how})\n")
+    files = _parse_read_verilog(tcl)
+    lib_root = (ORB_ROOT / "syn/external").resolve()
+    proj, lib, xdc, missing = [], [], [], []
+    for kind, p, raw in files:
+        rp = p.resolve()
+        exists = p.exists()
+        if not exists:
+            missing.append(p)
+        if kind == "xdc":
+            xdc.append((p, exists))
+        elif str(rp).startswith(str(lib_root)):
+            lib.append((p, exists))
+        else:
+            proj.append((p, exists))
+
+    def _rel(p):
+        try:
+            return str(p.resolve().relative_to(ORB_ROOT.resolve()))
+        except ValueError:
+            return str(p)
+
+    print(f"project RTL ({len(proj)}) -- edit these for functional changes:")
+    for p, ok in proj:
+        print(f"  {'  ' if ok else 'XX'} {_rel(p)}")
+    print(f"\nverilog-ethernet library ({len(lib)}) -- third-party, do not edit:")
+    for p, ok in lib:
+        print(f"  {'  ' if ok else 'XX'} {_rel(p)}")
+    print(f"\nconstraints ({len(xdc)}):")
+    for p, ok in xdc:
+        print(f"  {'  ' if ok else 'XX'} {_rel(p)}")
+    if missing:
+        print(f"\nWARNING: {len(missing)} listed file(s) MISSING (XX above) -- "
+              f"build would fail:")
+        for p in missing:
+            print(f"    {p}")
+        return 1
+    print(f"\ntotal {len(files)} files, all present.")
+    return 0
+
+
+def cmd_fpga_id(a):
+    """Read the BUILD_ID (0xFF70..73) from the running bitstream and compare it
+    to the .buildid sidecar of a built bit -- PROVES which bitstream is live.
+
+    Why this exists: openFPGALoader SRAM loads are volatile. A power-cycle boots
+    whatever is in QSPI flash instead, so the state file's "last burned" record
+    silently diverges from what's actually running (this bit us hard: a
+    re-plugged FPGA ran an old QSPI bit while we assumed our fresh stream bit).
+    BUILD_ID is stamped at synth time and read back over the wire, so it always
+    reflects the ACTUAL running fabric, power-cycle or not."""
+    import socket, struct, time, datetime as _dt
+    ip = getattr(a, "ip", None) or "192.168.10.42"
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(1.0)
+    val = 0
+    for off in range(4):
+        got = None
+        for _ in range(6):
+            try:
+                s.sendto(struct.pack("<H", 0xFF70 + off) + bytes(8), (ip, 5001))
+                d, _r = s.recvfrom(2048)
+                got = d[2]
+                break
+            except socket.timeout:
+                continue
+        if got is None:
+            print(f"[fpga-id] no response at 0xFF{0x70+off:02X} "
+                  f"(net down, or bit predates BUILD_ID support)", file=sys.stderr)
+            s.close()
+            return 2
+        val |= got << (8 * off)
+    s.close()
+    when = ""
+    if val not in (0, 0xDEADBEEF, 0xFFFFFFFF):
+        try:
+            when = " (" + _dt.datetime.fromtimestamp(val).isoformat(timespec="seconds") + ")"
+        except (OSError, ValueError, OverflowError):
+            when = ""
+    print(f"running BUILD_ID = 0x{val:08X} = {val}{when}")
+    if val == 0xDEADBEEF:
+        print("  -> DEADBEEF = bit built WITHOUT a stamped BUILD_ID "
+              "(old bit, or not the stream flow)")
+    # Compare against the sidecar of the bit we think is loaded
+    bit = a.bit
+    if bit is None:
+        st = state_load()
+        bit = (st.get("fpga", {}) or {}).get("bit_file")
+        if bit and not Path(bit).is_absolute():
+            bit = str(BUILD_DIR / bit)
+    if bit:
+        sidecar = Path(str(bit) + ".buildid")
+        if not sidecar.exists() and not str(bit).endswith(".bit"):
+            sidecar = Path(str(bit) + ".bit.buildid")
+        if sidecar.exists():
+            want = int(sidecar.read_text().strip())
+            if want == val:
+                print(f"  MATCH: running bit == {Path(bit).name} (built {want})")
+                return 0
+            else:
+                print(f"  MISMATCH: running=0x{val:08X} but "
+                      f"{Path(bit).name} sidecar=0x{want:08X}")
+                print(f"  -> the FPGA is NOT running that bit "
+                      f"(power-cycled to QSPI? forgot to re-burn?)")
+                return 1
+        else:
+            print(f"  (no {sidecar.name} to compare -- rebuild to stamp one)")
     return 0
 
 
@@ -945,19 +1176,36 @@ def _check_l4_phase(state, verbose=True):
     weak on sparse BB-OFF streams.
     """
     issues = []
-    # Only meaningful on pin_la. Detect via its 'LA' magic (more reliable than
-    # DEPTH, which reads 0 right after a fresh burn before any rearm).
     import re
-    r = subprocess.run(
-        ["python3", str(HERE / "check_pinla.py")],
-        cwd=str(BRINGUP), capture_output=True, text=True, timeout=8)
-    if "b'LA'" not in r.stdout:
+    # Gate on the DEPTH signature FIRST: pin_la reports DEPTH ~32639, every
+    # other bit is well outside 32000-33000. This is the robust discriminator.
+    # (The old 'LA' magic at 0xFF70 now COLLIDES with the stream bit's BUILD_ID
+    # register at the same address, so magic-matching can false-positive and
+    # then burn 120s in tpiu_testpattern -- gate on DEPTH instead.)
+    try:
+        rd = subprocess.run(
+            ["python3", str(HERE / "trace_dump.py"), "--status-only"],
+            cwd=str(BRINGUP), capture_output=True, text=True, timeout=5)
+        md = re.search(r"DEPTH=(\d+)", rd.stdout)
+        depth = int(md.group(1)) if md else -1
+    except subprocess.TimeoutExpired:
+        depth = -1
+    if not (32000 <= depth < 33000):
         if verbose:
-            print("  L4 SKIP (needs pin_la bit; `td burn fpga build/trace_pin_la.bit`)")
+            print(f"  L4 SKIP (DEPTH={depth} not pin_la ~32639; "
+                  f"phase verdicts via `td tap sweep` on the clktap bit)")
         return []
-    p = subprocess.run(
-        ["python3", str(HERE / "tpiu_testpattern_diff.py"), "--patterns", "FF00,AA55"],
-        cwd=str(BRINGUP), capture_output=True, text=True, timeout=120)
+    try:
+        p = subprocess.run(
+            ["python3", str(HERE / "tpiu_testpattern_diff.py"), "--patterns", "FF00,AA55"],
+            cwd=str(BRINGUP), capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        # Don't crash the whole diag: report as a soft issue and move on. This
+        # fires when check_pinla mis-detects 'LA' on a non-pin_la bit (e.g. the
+        # stream bit under self-TX load returns noisy status bytes).
+        issues.append("L4 tpiu-pattern timed out (120s) — likely NOT pin_la bit; "
+                      "run `td tap sweep` on the clktap bit for phase verdicts")
+        return issues
     out = p.stdout + p.stderr
     ff_div = re.search(r"FF00 speed=\d+: divergence=([\d.]+)%", out)
     aa_errs = re.findall(r"AA55 speed=\d+: D0=([\d.]+)%\s+D1=([\d.]+)%\s+"
@@ -1002,7 +1250,13 @@ def cmd_diag(a):
         ("L7 STM32 ETM", _check_l7_etm),
     ]:
         print(f"\n[{name}]")
-        issues = checker(state_load())
+        try:
+            issues = checker(state_load())
+        except Exception as e:
+            # A single layer's probe crashing (timeout, unreachable device,
+            # parse error) must not abort the whole diagnostic -- report it as
+            # an issue for this layer and keep going.
+            issues = [f"{name} check raised {type(e).__name__}: {e}"]
         if issues:
             for i in issues:
                 print(f"  FAIL {i}")
@@ -1041,6 +1295,15 @@ def build_parser():
         help="find which NIC the FPGA is wired to (router or dock direct-attach)")
     pdisc.add_argument("--ip", help="FPGA IP to ARP-probe (default 192.168.10.42)")
     pdisc.set_defaults(func=cmd_discover)
+    psrc = sub.add_parser("sources",
+        help="list the exact .v/.xdc a bitstream compiles (authoritative, no guessing)")
+    psrc.add_argument("bit", help="bitstream name, e.g. trace_iddr_clktap_stream.bit")
+    psrc.set_defaults(func=cmd_sources)
+    pid = sub.add_parser("fpga-id",
+        help="read running bit's BUILD_ID (0xFF70) and verify it matches a built bit")
+    pid.add_argument("--ip", help="FPGA IP (default 192.168.10.42)")
+    pid.add_argument("--bit", help="bit to compare against (default: state file's)")
+    pid.set_defaults(func=cmd_fpga_id)
     ps = sub.add_parser("status", help="print current state file")
     ps.add_argument("--json", action="store_true")
     ps.set_defaults(func=cmd_status)

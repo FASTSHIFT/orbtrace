@@ -21,7 +21,13 @@ import argparse
 import socket
 import sys
 
+try:
+    import fpga_net
+except ImportError:
+    fpga_net = None
+
 CTRL_PORT = 5002
+_IFACE = None      # set by main() from discovery; write_csr binds to it
 REG_EYE = 0x01
 REG_REARM = 0x02
 REG_BITLEN_LO = 0x03
@@ -33,8 +39,18 @@ REG_WIDTH = 0x08     # TPIU parallel port width: 4, 2 or 1 (runtime, no reflash)
 REG_STREAM_SELFTEST = 0x09  # 1=stream FPGA-side byte ramp instead of real trace
 
 
-def write_csr(ip, addr, value, timeout=1.0):
+def write_csr(ip, addr, value, timeout=1.0, iface=None):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    # CSR writes are ACTIVE sends to the FPGA: with a second NIC on the same
+    # subnet (dock direct-attach) the kernel routes them out the wrong port, so
+    # rearm/set-width silently never reach the FPGA. Pin to the wired iface.
+    iface = iface or _IFACE
+    if iface:
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                         (iface + "\0").encode())
+        except PermissionError:
+            pass
     s.settimeout(timeout)
     # payload: addr, value, then a few pad bytes so the frame has a clear tlast
     payload = bytes([addr & 0xFF, value & 0xFF, 0, 0])
@@ -48,7 +64,11 @@ def write_csr(ip, addr, value, timeout=1.0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ip", default="192.168.10.42")
+    ap.add_argument("--ip", default=None,
+                    help="FPGA IP (default: auto-discover, fallback 192.168.10.42)")
+    ap.add_argument("--iface", default=None,
+                    help="bind CSR writes to this NIC (default: auto-discover)")
+    ap.add_argument("--no-discover", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
     pe = sub.add_parser("set-eye")
     pe.add_argument("value", type=int)
@@ -74,6 +94,19 @@ def main():
     ps.add_argument("value", type=int, choices=(0, 1))
     sub.add_parser("rearm")
     a = ap.parse_args()
+
+    global _IFACE
+    ip = a.ip
+    _IFACE = a.iface
+    if not a.no_discover and fpga_net is not None and (ip is None or _IFACE is None):
+        try:
+            info = fpga_net.discover_fpga(ip=a.ip or fpga_net.DEFAULT_FPGA_IP)
+            if info:
+                ip = ip or info["ip"]
+                _IFACE = _IFACE or info["iface"]
+        except PermissionError:
+            pass
+    a.ip = ip or (fpga_net.DEFAULT_FPGA_IP if fpga_net else "192.168.10.42")
 
     if a.cmd == "set-eye":
         write_csr(a.ip, REG_EYE, a.value)
