@@ -37,6 +37,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    import fpga_net
+except ImportError:
+    fpga_net = None
+
 # ----------------------------------------------------------------------------
 # Paths (all resolved relative to this file so trace_doctor works from any cwd)
 # ----------------------------------------------------------------------------
@@ -126,6 +131,32 @@ def native(script: str, *args: str, cwd: Path | None = None, **kw):
 # ============================================================================
 # status / recent / help_all — meta commands
 # ============================================================================
+
+def cmd_discover(a):
+    """Find which NIC the FPGA is cabled to (ARP probe on every interface).
+
+    The FPGA answers ARP but not ICMP and keeps a fixed IP in the bitstream, so
+    plugging it into a router or straight into a Type-C dock both "just work":
+    whichever interface's ARP probe replies is the wired one, and sockets should
+    SO_BINDTODEVICE to it. Needs sudo for the raw ARP socket."""
+    if fpga_net is None:
+        print("fpga_net module not importable", file=sys.stderr)
+        return 2
+    ip = getattr(a, "ip", None) or fpga_net.DEFAULT_FPGA_IP
+    try:
+        info = fpga_net.discover_fpga(ip=ip, use_cache=False)
+    except PermissionError as e:
+        print(f"error: {e} (run under sudo)", file=sys.stderr)
+        return 2
+    if info is None:
+        print(f"FPGA ({ip}) not found on any interface")
+        return 1
+    mac = ":".join(f"{b:02x}" for b in info["mac"])
+    print(f"FPGA at {info['ip']} on {info['iface']} (mac {mac})")
+    print(f"  -> sockets bound to '{info['iface']}' reach it in both "
+          f"router and dock-direct topologies")
+    return 0
+
 
 def cmd_status(a):
     """Print current state file — always the first thing an agent should read."""
@@ -222,7 +253,16 @@ def cmd_probe_stream_link(a):
     HERE = Path(__file__).parent
     out = getattr(a, "out", None) or "/tmp/stream_selftest.bin"
     seconds = getattr(a, "seconds", 2.0)
-    ip = getattr(a, "ip", None) or "192.168.10.42"
+    ip = getattr(a, "ip", None)
+    if ip is None and fpga_net is not None:
+        try:
+            info = fpga_net.discover_fpga()
+            if info:
+                ip = info["ip"]
+                print(f"[trace_doctor] FPGA on {info['iface']} at {info['ip']}")
+        except PermissionError:
+            pass
+    ip = ip or "192.168.10.42"
     try:
         sp.run([sys.executable, str(HERE / "trace_ctrl.py"),
                 "--ip", ip, "stream-selftest", "1"], check=True)
@@ -997,6 +1037,10 @@ def build_parser():
     sub = p.add_subparsers(dest="group", required=True)
 
     # -- meta --
+    pdisc = sub.add_parser("discover",
+        help="find which NIC the FPGA is wired to (router or dock direct-attach)")
+    pdisc.add_argument("--ip", help="FPGA IP to ARP-probe (default 192.168.10.42)")
+    pdisc.set_defaults(func=cmd_discover)
     ps = sub.add_parser("status", help="print current state file")
     ps.add_argument("--json", action="store_true")
     ps.set_defaults(func=cmd_status)
@@ -1025,7 +1069,8 @@ def build_parser():
              "monotone-mod-256 receipt, bypassing ETM/TPIU/trace pins entirely")
     x.add_argument("--out", default="/tmp/stream_selftest.bin")
     x.add_argument("--seconds", type=float, default=2.0)
-    x.add_argument("--ip", default="192.168.10.42")
+    x.add_argument("--ip", default=None,
+                   help="FPGA IP (default: auto-discover, fallback 192.168.10.42)")
     x.set_defaults(func=cmd_probe_stream_link)
     x = pp_sub.add_parser("pin-la", help="pin_la bit health")
     _add_extra(x); x.set_defaults(func=cmd_probe_pin_la)

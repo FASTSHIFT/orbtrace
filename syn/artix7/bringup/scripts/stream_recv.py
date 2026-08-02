@@ -18,15 +18,30 @@ import struct
 import sys
 import time
 
+try:
+    import fpga_net
+except ImportError:
+    fpga_net = None
 
-def read_lost_cnt(ip, depth, port=5001, retries=8, timeout=1.0):
+
+def read_lost_cnt(ip, depth, port=5001, retries=8, timeout=1.0, iface=None):
     """Read the four DEPTH+34..37 status bytes via the request/reply :5001 path.
 
     Retries because while STREAM is saturating the TX path (self_busy always
     high in fpga_core_net's FSM), a :5001 echo request must wait for a gap
     between UDP packets on our side. On a busy stream the gap is small, and the
-    first few polls typically time out."""
+    first few polls typically time out.
+
+    iface, if given, pins the request socket to that interface (SO_BINDTODEVICE)
+    so the poll egresses the wire the FPGA is actually on -- needed when a second
+    NIC shares the 192.168.10.0/24 subnet (dock direct-attach)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    if iface:
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE,
+                         (iface + "\0").encode())
+        except PermissionError:
+            pass                          # non-root: fall back to kernel routing
     s.settimeout(timeout)
     payload = struct.pack("<H", depth + 34) + bytes(8)
     for _ in range(retries):
@@ -48,11 +63,37 @@ def main():
     ap.add_argument("--bind", default="0.0.0.0")
     ap.add_argument("--out", default="/tmp/stream.bin")
     ap.add_argument("--seconds", type=float, default=3.0)
-    ap.add_argument("--ip", default="192.168.10.42",
-                    help="FPGA IP for polling status (DEPTH+34..37 lost count)")
+    ap.add_argument("--ip", default=None,
+                    help="FPGA IP for polling status (default: auto-discover, "
+                         "fallback 192.168.10.42)")
+    ap.add_argument("--iface", default=None,
+                    help="bind status poll to this interface "
+                         "(default: auto-discover the wired NIC)")
+    ap.add_argument("--no-discover", action="store_true",
+                    help="skip ARP discovery, use --ip / kernel routing as-is")
     ap.add_argument("--depth", type=int, default=61440,
                     help="DEPTH parameter (for lost_cnt readback offset)")
     a = ap.parse_args()
+
+    # Locate the FPGA: whichever NIC's ARP probe answers is the wired one. This
+    # makes both topologies work with no flags -- router (single NIC, IP routing
+    # reaches it) and dock direct-attach (second NIC on the same subnet, where
+    # the status poll would otherwise egress the wrong port).
+    ip = a.ip
+    iface = a.iface
+    if not a.no_discover and fpga_net is not None and (ip is None or iface is None):
+        try:
+            info = fpga_net.discover_fpga(ip=a.ip or fpga_net.DEFAULT_FPGA_IP)
+        except PermissionError:
+            info = None
+            print("[stream_recv] note: run under sudo to auto-bind the status "
+                  "poll to the direct-attach NIC", file=sys.stderr)
+        if info:
+            ip = ip or info["ip"]
+            iface = iface or info["iface"]
+            print(f"[stream_recv] FPGA on {info['iface']} at {info['ip']}")
+    if ip is None:
+        ip = fpga_net.DEFAULT_FPGA_IP if fpga_net else "192.168.10.42"
 
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     # 64 MB kernel receive buffer: at 100 MB/s peak, 8 MB tolerates only 80 ms
@@ -69,7 +110,7 @@ def main():
     s.bind((a.bind, a.port))
     s.settimeout(0.5)
 
-    lost_before = read_lost_cnt(a.ip, a.depth)
+    lost_before = read_lost_cnt(ip, a.depth, iface=iface)
     print(f"capture-side lost_cnt before: {lost_before}")
 
     trace = bytearray()
@@ -100,7 +141,7 @@ def main():
         nbytes += len(payload)
     s.close()
 
-    lost_after = read_lost_cnt(a.ip, a.depth)
+    lost_after = read_lost_cnt(ip, a.depth, iface=iface)
     lost_delta = None
     if lost_before is not None and lost_after is not None:
         lost_delta = (lost_after - lost_before) & 0xFFFFFFFF
