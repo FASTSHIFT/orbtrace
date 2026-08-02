@@ -16,6 +16,7 @@ set rtl       $repo_root/syn/artix7/rtl
 read_verilog $rtl/trace_capture_a7.v
 read_verilog $repo_root/verilog/traceIF.v
 read_verilog $bringup/rtl/fpga_core_net.v
+read_verilog $bringup/rtl/led_diag.v
 read_verilog $bringup/rtl/trace_stream_top.v
 
 foreach s {
@@ -73,11 +74,17 @@ set capmethod "OVERSAMPLE"
 if {[info exists ::env(CAP_METHOD)]} { set capmethod $::env(CAP_METHOD) }
 set stream 0
 if {[info exists ::env(STREAM)]} { set stream $::env(STREAM) }
+# BUILD_ID = Unix epoch at synth time, stamped into readout reg 0xFF70..73.
+# The host reads it back over :5001 to PROVE the running bitstream == this build
+# (rules out "power-cycle booted stale QSPI" -- SRAM loads are volatile).
+set build_id [clock seconds]
+puts "BUILD_ID = $build_id ([clock format $build_id])"
 puts "============ TAP = $tap  CAP_RAW = $capraw  EYE = $eye  SELFTEST = $selftest  TRACE_WIDTH = $twidth  CAP_METHOD = $capmethod  STREAM = $stream ============"
 synth_design -top trace_stream_top -part $part \
     -generic TAP=$tap -generic CAP_RAW=$capraw -generic EYE=$eye \
     -generic SELFTEST=$selftest -generic TRACE_WIDTH=$twidth \
-    -generic CAP_METHOD=$capmethod -generic STREAM=$stream
+    -generic CAP_METHOD=$capmethod -generic STREAM=$stream \
+    -generic BUILD_ID=$build_id
 opt_design
 place_design
 route_design
@@ -85,4 +92,9 @@ report_timing_summary -no_detailed_paths -no_header
 set outbit "trace_stream.bit"
 if {[info exists ::env(OUTBIT)]} { set outbit $::env(OUTBIT) }
 write_bitstream -force $outbit
-puts "============ TRACE STREAM BUILD DONE (tap=$tap method=$capmethod) -> $outbit ============"
+# Sidecar: record BUILD_ID next to the bit so `td fpga-id` can compare the
+# value read back from 0xFF70 against the build that produced this bit.
+set idf [open "$outbit.buildid" w]
+puts $idf $build_id
+close $idf
+puts "============ TRACE STREAM BUILD DONE (tap=$tap method=$capmethod build_id=$build_id) -> $outbit ============"

@@ -71,6 +71,13 @@ module trace_stream_top #(
     parameter [15:0] STREAM_PAYLOAD   = 16'd1024,   // UDP payload bytes/packet
                                                     // (excluding the 4-byte seq
                                                     // header we prepend).
+    // BUILD_ID: Unix epoch stamped in by run_trace_stream.tcl at synth time,
+    // read back over :5001 at 0xFF70..73 (LE). Lets the host PROVE which
+    // bitstream is actually running -- critical because SRAM loads are volatile
+    // (a power-cycle boots whatever is in QSPI instead), so the state file's
+    // "last burned" record can silently diverge from reality. `td fpga-id`
+    // reads this and compares against the built bit.
+    parameter [31:0] BUILD_ID = 32'hDEADBEEF,
     parameter       STREAM_FIFO_DEPTH = 8192,       // clk200 -> clk125 async
                                                     // FIFO for trace bytes.
                                                     // Sized for ~80 us at the
@@ -106,8 +113,8 @@ module trace_stream_top #(
     input  wire        trace_clk_in,
     input  wire [3:0]  trace_data_in,
 
-    output wire        led0,   // idelayctrl ready
-    output wire        led1    // capture full (steady) / filling (off)
+    output wire        led0,   // TRACECLK input alive (blinks ~3 Hz; see led_diag)
+    output wire        led1    // network TX alive     (blinks ~3 Hz; see led_diag)
 );
 
     wire rst = ~rst_n;
@@ -513,9 +520,16 @@ module trace_stream_top #(
                           (ext_addr == NB+37)    ? stream_lost_cnt[31:24] :
                           // STREAM selftest mode readback (CSR 0x09)
                           (ext_addr == NB+38)    ? {7'b0, selftest_csr} :
+                          // BUILD_ID (compile Unix epoch) -- proves running bit
+                          // identity; survives power-cycle-from-QSPI reads.
+                          (ext_addr == 16'hFF70) ? BUILD_ID[7:0] :
+                          (ext_addr == 16'hFF71) ? BUILD_ID[15:8] :
+                          (ext_addr == 16'hFF72) ? BUILD_ID[23:16] :
+                          (ext_addr == 16'hFF73) ? BUILD_ID[31:24] :
                           // ts table window: NB+64 .. NB+64+4*TS_N (LE u32/entry)
                           ts_win                 ? ts_byte : 8'h00;
-        assign led1 = ~rfull;
+        // (led1 is the TX-liveness beacon driven by led_diag; the capture-full
+        //  state is available to the host via the NB+2 status byte instead.)
     end else begin : g_frame
         // ---- traceIF 16-byte frame capture (default) ----
         localparam NFR = DEPTH/16;
@@ -541,7 +555,7 @@ module trace_stream_top #(
                           (ext_addr == NB+1)     ? NB[15:8] :
                           (ext_addr == NB+2)     ? {7'b0, full} :
                           (ext_addr == NB+33)    ? width_rb : 8'h00;
-        assign led1 = ~full;
+        // (led1 driven by led_diag as TX-liveness beacon; full flag is at NB+2.)
     end
     endgenerate
 
@@ -706,7 +720,8 @@ module trace_stream_top #(
         .phy_reset_n(phy_reset_n),
         .phy_int_n(1'b1), .phy_pme_n(1'b1),
         .uart_rxd(1'b1), .uart_txd(),
-        .dbg_rx_good_frame(), .dbg_rx_bad_fcs(), .dbg_tx_axis_tvalid(),
+        .dbg_rx_good_frame(), .dbg_rx_bad_fcs(),
+        .dbg_tx_axis_tvalid(dbg_tx_axis_tvalid),
         .ext_addr(ext_addr), .ext_data(ext_data),
         .csr_addr(csr_addr_w), .csr_data(csr_data_w), .csr_we(csr_we_w),
         .stream_tdata(stream_tdata), .stream_tvalid(stream_tvalid),
@@ -716,8 +731,23 @@ module trace_stream_top #(
     assign phy_mdio = 1'bz;
     assign phy_mdc  = 1'b0;
 
-    assign led0 = ~idelayctrl_rdy;
-    // led1 is driven inside the CAP_RAW generate blocks (full/rfull).
+    // ---- diagnostic LEDs (led_diag) ----
+    // led0 = TRACECLK input alive (blinks ~3 Hz while the recovered trace clock
+    //        toggles; dark = no TRACECLK from the STM32).
+    // led1 = network TX alive (blinks ~3 Hz while the MAC transmits any frame;
+    //        dark = FPGA emits nothing -> if PC also sees nothing, fault is on
+    //        the FPGA side, not the cable/hub/PC).
+    // These two INTERNAL observations split the "PC sees no packets" ambiguity
+    // without touching the network path. NB: the old ~full/rfull "capture full"
+    // meaning of led1 moved into the CSR status bytes (NB+2 full flag), which
+    // the host already reads -- the LED is more useful as a TX liveness beacon.
+    wire dbg_tx_axis_tvalid;
+    led_diag u_led_diag (
+        .clk125(clk125), .rst(sys_rst),
+        .trace_clk(trace_clk),
+        .tx_active(dbg_tx_axis_tvalid),
+        .led0(led0), .led1(led1)
+    );
 
 endmodule
 
