@@ -786,6 +786,27 @@ def cmd_decode_perf(a):
            "-e", a.elf, "-F", ts_bin, "-D", a.device]
     env = os.environ.copy()
     env.setdefault("ORBETTO_ETM_PROT", "ETM4")
+    # OOM guard: orbetto buffers the whole decoded protobuf in RAM, so a big
+    # slice can exhaust memory and get the process (or the whole box) OOM-killed.
+    # Cap the address space with `ulimit -v` so orbetto dies cleanly with
+    # bad_alloc instead of taking the machine down. Default caps at ~70% of
+    # total RAM; override with --mem-mb (0 disables the cap).
+    mem_mb = getattr(a, "mem_mb", None)
+    if mem_mb is None:
+        try:
+            import os as _os
+            total_kb = int(next(l.split()[1] for l in open("/proc/meminfo")
+                                if l.startswith("MemTotal")))
+            mem_mb = int(total_kb / 1024 * 0.70)
+        except Exception:
+            mem_mb = 4096
+    if mem_mb and mem_mb > 0:
+        # ulimit -v is in KB; wrap via bash so the limit applies to orbetto.
+        quoted = " ".join(shlex.quote(c) for c in cmd)
+        wrapped = ["bash", "-c", f"ulimit -v {mem_mb * 1024}; exec {quoted}"]
+        print(f"[trace_doctor] orbetto memory cap: {mem_mb} MB "
+              f"(virtual address space; override with --mem-mb, 0=off)")
+        return run(wrapped, env=env).returncode
     return run(cmd, env=env).returncode
 
 
@@ -1413,6 +1434,9 @@ def build_parser():
                         "table (default: stm32h743)")
     x.add_argument("--width", type=int, choices=(4, 2, 1), default=4,
                    help="TPIU port width of the capture (default 4)")
+    x.add_argument("--mem-mb", type=int, default=None,
+                   help="cap orbetto virtual memory (MB) so a big slice can't "
+                        "OOM the box; default ~70%% of RAM, 0 disables")
     x.set_defaults(func=cmd_decode_perf)
     # NB: tpiu-diff moved to `probe tpiu-pattern` -- it's a physical-link
     # ground-truth test (bypasses ETM), not a decode step.
