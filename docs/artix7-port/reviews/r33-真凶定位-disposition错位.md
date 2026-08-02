@@ -156,3 +156,34 @@ cm_uart_send_char pop @a2f2）在推测返回路径下 atom 对齐错了一位�
   修复方案改为本文 §5 的 A/B。
 - fixture + regress.py 已固化在 `captures/mortrall_fixture/`，任何后续改动**每步**
   `regress.py --check`，退化立即可见。
+
+
+---
+
+## 7. 方案 B 实施结果（2026-08-02，已提交）
+
+按 §5 先做低风险的 B：`_inconsistentFunctionSwitch` 检测到"就地切到某函数**入口**
+（addr == lowaddr）且该函数已在栈下方某层"时，判定为漏返回 → 弹栈到那层（逐层补发
+`E|`），而不是插 E|B 就地换名。
+
+**两份独立离线数据的诚实对照**（`captures/mortrall_fixture/`，`regress.py`）：
+
+| 指标 | slice1 4MB 修前 | 修后 | slice2 8MB 修前 | 修后 |
+|---|---|---|---|---|
+| coremark_main | 358 | **7** | 961 | **21** |
+| max_depth | 18 | 10 | — | — |
+| total begins | 75224 | 74927 | 153361 | 152615 |
+| crcu32 | 3397 | 3399 | 6773 | 6796 |
+| cardinality | 2640 | 2646 | 2936 | 3038 |
+
+- **coremark_main 假嵌套 46-51× 收敛**（358→7、961→21），接近真值 1。
+- **内层高频篮子稳定**（crcu32/crc16/core_state_transition 抖动 <0.1%），未删真实调用边。
+- **cardinality 不降反微升**（真 PC 覆盖没丢，弹栈后 workingAddr 修正多覆盖了几个 PC）。
+- slice2 是 986MB 抓样里另一段（skip 200MB），完全独立 → **B 不是过拟合 slice1**。
+
+**残留 ~7-21 次**：同类 `cm_uart_send_char→HAL→coremark_main` 漏返回，弹栈边界
+（perfetto depth 未同步 / 栈里存的地址非精确 lowaddr）没接住。要压到 1 需碰
+disposition/atom 对齐（方案 A，高风险），暂不做——B 已是低风险高收益的"可用"解。
+
+**提交**：`embedded-debug-tools` c5653e3 `fix(orbetto/mortrall): recover missed iBR
+returns ...`。fixture + regress.py 固化在 `captures/mortrall_fixture/`（非 git）。
