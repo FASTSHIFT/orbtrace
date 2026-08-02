@@ -400,3 +400,88 @@ pop 在批尽处读到空 bit0=0。
 - ✅ 若要判"无条件"，须用 capstone `detail->arm.cc == ARM_CC_AL`（改 loadelf 加
   LE_IC_UNCOND 位），这是唯一可靠信号。但即便如此，"无条件 iBR 强制 taken"是否安全
   仍需 §14.3 原始字节定死机制后再定。
+
+
+---
+
+## 15. 原始字节交叉验证：设备发了、FPGA 采了、解码器漏了（2026-08-02）
+
+用户三层追问：设备端没发 / FPGA 没采 / 解码器漏了？逐层验证。
+
+### 15.1 流里 atom 总数（设备+FPGA 侧完整性）
+
+opencsd 参考解码器的 lister 逐 atom-packet 精确统计（零丢包 slice 的 etm.bin，
+318826 字节，END OF TRACE 全处理）：
+```
+total atoms = 1,415,165   (E=985360  N=429805)
+atom packets: F1=3187 F2=6238 F3=62087 F4=9988 F5=117573 F6=55834
+```
+- **设备端发了、FPGA 采了 = 确认**：1.4M 个 atom 完整在原始字节里，流无截断、零丢包。
+
+### 15.2 mortrall 消费的 atom 数（解码器侧）
+
+在 mortrall 的 `disposition>>=1; incAddr--` 消费点计数：
+```
+[ATOMS] mortrall consumed 499149 atoms   (stream has 1415165)
+```
+- **mortrall 只消费了 499149 / 1415165 = 35%，漏掉 916016 个 atom（65%）。**
+- **答案确定：解码器侧问题。** 原始字节里 atom 齐全（设备/FPGA 无责），mortrall 消费了
+  远少于流里实际的 atom 数。pop@a2f2 拿到 bit0=0 只是这 65% 漏账的一个局部表现。
+
+### 15.3 但漏 65% 远超"pop 漏几百次"——更大的账要查
+
+pop 一轮几百次，解释不了漏 91.6 万 atom。说明 mortrall 在这个 slice 上**大面积不消费
+atom**，不止 pop。两个疑点，下一步查：
+1. mortrall 是否在某类指令/某段区域**提前停止推进 instruction**（atom 还在流里但没被
+   instruction 循环消费）？—— 注意 opencsd 自己的 INSTR_RANGE 也只 98091、且只到
+   0x80094d4，两个解码器都没把 1.4M atom 全解成 instruction。可能这个 slice 的 etm.bin
+   里有大段 atom 对应两解码器都未跟进的执行（trace_on/sync 之间、或 speculation）。
+2. 是否 `_flush_proto_buffer` / 异常路径 / thread-switch 吃掉了一批未计数的 atom？
+
+### 15.4 结论与下一步
+
+- **三层定位完成：设备发了 ✓ / FPGA 采了 ✓ / 解码器漏了 ✗（35% 消费率）。** 修复战场
+  在 mortrall/orbuculum ETMv4 解码器，与采集无关（再次独立佐证 lost_cnt=0）。
+- **但根因比"pop 批边界"更大**：65% atom 未消费是系统性的。P0-3 需先解释这 91.6 万
+  atom 去哪了（提前停止 / 大段未跟进 / flush 吞账），而不是只盯 pop。可能"pop 假重入"
+  只是这个更大 atom-账不平的一个可见症状。
+- 仍守 r34 约束：机制未定死前不改代码。下一步：定位 mortrall 少消费 atom 的具体位置
+  （对比 opencsd 消费点 / 看 instruction 循环是否在某处 break）。
+
+
+---
+
+## 16. 更正 §15：不是"漏 atom"，是【过度重复行走】4.6×（2026-08-02）
+
+§15 用"atom 总数 1.4M vs mortrall 消费 499149"得出"漏 65%"——**这个对比不可靠，撤回**。
+原因：opencsd lister 的 atom-string 计数含 F5/F6 多-atom 包（F5 每包 5 atom、F6 是 E-run），
+**atom 总数 ≠ 分支数**，拿它比 mortrall 的"每分支消费一次"是 apples-to-oranges。
+
+### 16.1 干净的 apples-to-apples：指令数
+
+- **opencsd 参考解码器：721,180 条指令**（98091 ranges）。
+- **mortrall：3,334,340 条指令**（499149 个分支）。
+- **mortrall 解出的指令是 opencsd 的 4.6 倍。** 方向反了——**不是漏，是过度重复行走。**
+
+### 16.2 这才和"假重入"自洽
+
+mortrall 因返回处理错误（pop 判 not-taken → workingAddr 漂进字面量池 → 最终重新
+进入函数）**反复重走同一段代码**，指令数暴涨 4.6×。每次假重入 coremark_main/
+cm_benchmark_main 都把那一段指令重新走一遍。**指令 4.6× 膨胀 = 假重入的量化后果**，
+比 §15 的"漏 atom"结论准确得多。
+
+### 16.3 三层定位的最终修正
+
+- **设备发了 ✓ / FPGA 采了 ✓**（etm.bin 完整、END OF TRACE、零丢包）——不变。
+- **解码器问题 ✗**——仍成立，但性质是**过度行走（重复解码）**，不是漏。mortrall 走飞后
+  重入，把同段指令解了多遍。
+- pop@a2f2 判 not-taken 是触发点：一次错判 → workingAddr 漂 → 走进不该走的地方 →
+  绕一圈重新进函数 → 指令膨胀 + 假 begin。
+
+### 16.4 方法论自纠
+
+§15 差点把"atom 计数差"当成"解码器漏数据"的结论——**幸亏坚持 apples-to-apples 用指令
+数复核，方向立刻反转**。这是"没对齐量纲就下结论"的又一次险情，被指令数对比拦下。
+下一步仍是定位第一次 workingAddr 漂走的确切点（pop@a2f2 的 not-taken），但现在知道
+后果是"重走 4.6×"，修对了应该让指令数从 3.33M 回落到 ~721K（接近 opencsd）。**这给了
+一个新的、强的回归判据：instrs ≈ 721K。**
