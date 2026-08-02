@@ -110,8 +110,14 @@ def main():
     s.bind((a.bind, a.port))
     s.settimeout(0.5)
 
-    lost_before = read_lost_cnt(ip, a.depth, iface=iface)
-    print(f"capture-side lost_cnt before: {lost_before}")
+    # NB: do NOT poll the FPGA status port here. On a saturated self-TX stream
+    # the :5001 request/reply can't get a gap for up to retries*timeout seconds,
+    # during which the socket is bound but nobody calls recv() -> the kernel
+    # buffer overflows and the WHOLE capture is lost to seq-gaps (measured: a 3s
+    # window ballooned to 11.6s with 711578 gaps). Start receiving IMMEDIATELY;
+    # the capture-side lost_cnt is optional diagnostics we read AFTER the stream
+    # stops (when the TX path is idle and the poll succeeds).
+    lost_before = None
 
     trace = bytearray()
     seq_prev = None
@@ -140,6 +146,7 @@ def main():
         npkt += 1
         nbytes += len(payload)
     s.close()
+    elapsed = time.time() - t0        # measure BEFORE the (slow) status poll
 
     lost_after = read_lost_cnt(ip, a.depth, iface=iface)
     lost_delta = None
@@ -147,7 +154,6 @@ def main():
         lost_delta = (lost_after - lost_before) & 0xFFFFFFFF
 
     open(a.out, "wb").write(trace)
-    elapsed = time.time() - t0
     print(f"packets={npkt}  bytes={nbytes} ({nbytes/1e6:.2f} MB) "
           f"in {elapsed:.2f}s  -> {nbytes/elapsed/1e6:.2f} MB/s")
     print(f"seq-gap lost frames: {gaps}")
