@@ -200,3 +200,101 @@ lo=d&0xF;hi=(d>>4)&0xF;ok=np.isin(lo,[1,2,4,8])&np.isin(hi,[1,2,4,8]);\
 print('err%%',100*(~ok).mean(),'distinct',[hex(x) for x in np.unique(d)])"
 # FF00: CURTPM_VAL=0x00020008 ; check nibbles in {0x0,0xF}
 ```
+
+
+---
+
+## 7. Part C 实测：手推 ETM 输出的物理级对拍（2026-08-22，上板）
+
+**动机**：Part B 的 TPIU 图案是低熵静态流，测不到高熵 data-dependent 采样问题。用户提议
+写一段**简单到能手推 ETM 输出**的代码，做真正的物理级逐字节对拍——把 CoreMark/SysTick
+等一切干扰全删掉，只留一条会产生**唯一一种、可预测**指令流的代码。
+
+### 7.1 目标程序：一条自跳转指令（手册核对）
+
+```asm
+loop:  b loop     @ 0xE7FE，无条件直接分支，跳自己
+```
+
+- **手册依据（IHI0064H.b §2.3.1）**：直接分支**无论条件是否成立都生成一个 P0 元素**。
+  `b .` 无条件、必 taken → 每次迭代恰好一个 **E（executed）Atom**，无 load/store/call/
+  异常/中断——指令流里**只有 E atom，别无他物**。
+- **手推稳态字节（§6.4.13 Atom Format 6）**：E-atom 连续run 打包成 Format 6，
+  header = `0b11 A CCCCC`，atoms =（COUNT+3）个 E + 1 个 final(A)。最大全-E run：A=0、
+  COUNT=0b10100(20) → 24 个 E → **header = 0xD4**。所以稳态 ETM 指令流 = **一串 0xD4，
+  每个字节 = 24 次 taken 分支**，加上周期性 A-Sync(≥11×`0x00` 后 `0x80`) + Trace
+  Info(`0x01`) + Address 包。
+- **配置**：BB=0（不每分支发地址）、**STALL=0（不节流 CPU，零时序扰动）**、中断从不使能
+  （跑我们自己的 RAM stub，不是固件）。stub 用 `reg pc 0x24000000` 加载运行，TRACECLK
+  = 固件 PLL 残留 = 112.5M。cfg：`target/etm_selfbranch_h743.cfg`。
+
+### 7.2 结果：手推字节 = 实测字节，误码率 0.0018%（且全在一个孤立簇）
+
+原始抓样（64 MB，**无需重组，`FF 7F` halfsync 相位天然对齐**）：
+
+| 原始字节 | 占比 | 身份（手推） |
+|---|---|---|
+| `0xFF`/`0x7F` | 90.8% | TPIU halfsync 空闲填充（源产得慢，formatter 填满带宽）|
+| **`0xD4`** | **8.33%** | **手推的 24-E Atom Format 6** ✓ |
+| `0x00`/`0x80`/`0x01`/`0x05`/`0x24`… | ~0.9% | A-Sync / Trace Info / Address 包 |
+
+deframe 出 ETM stream（id=2，5486471 字节）后：
+
+```
+0xD4 (正确 24-E)         : 99.9982%   (5357879 / 5357977 atom-region bytes)
+非 0xD4 (故障+解析级联)  :  0.0018%   (98 bytes)
+sync framing (async/traceinfo/address): 128494 bytes, 全部合法
+```
+
+- **手推预测被逐字节坐实**：atom 区 **99.9982% 是 0xD4**，正是手册推出来的字节。
+- **误码率 = 0.0018%（98 / 5357977）**，而且**98 个坏字节全部挤在一个孤立簇**里
+  （ETM offset 576818..577170，约 350 字节窗口），**这个簇之外 0 个坏字节**。
+
+### 7.3 故障签名：单字节 nibble 位翻转（isolated glitch）
+
+坏簇的原始字节：`... D4 D4 D4 [0x04] D4 D4 ...`——**一个 0xD4 被打成 0x04**（高 nibble
+`D→0`，掉了一个 nibble 的位）。周围的 `0xD5`（Format 5，COUNT 差一）是解码器从这一个坏
+字节起的轻微 mis-parse 级联。**这就是 SI/采样裕度导致的孤立 bit/nibble 错**——不是系统性
+的、不是每字节的，是偶发、成簇的（与 §20/§21 "坏包成簇、时变" 完全一致）。
+
+### 7.4 三部分合起来的结论
+
+| 实验 | 码流 | 通路 | 误码率 |
+|---|---|---|---|
+| Part A（RTL 仿真）| 理想 walking | 数字 CDC（行为级 IDDR）| 0%（架构无 bug）|
+| Part B（TPIU 图案）| 低熵周期 | 真实引脚+IDDR | 0%（周期流采样完美）|
+| **Part C（自跳转，手推）** | **单一 atom（0xD4）** | **真实引脚+IDDR+stream** | **0.0018%，孤立簇** |
+
+- **Part C 是真正的物理级对拍**：手推字节 0xD4 与实测 99.9982% 吻合，误码率**直接量出来
+  = 0.0018%**（此工作点、此程序），且故障是**偶发孤立的单 nibble 翻转**，不是系统性错误。
+- **与真实 ETM 的 0.75%–10% 坏包对比**：自跳转流的 0xD4 是**低熵、固定跳变**（每字节都
+  一样），误码率 0.0018%；真实 ETM 是**高熵、任意 nibble 大摆幅跳变**，坏包率高 2–3 个
+  数量级。**同一采集通路、同一 TRACECLK，误码率随码流熵/跳变模式暴涨** → **直接坐实
+  §6.4 的 data-dependent 采样裕度假设**：坏包量由码流的跳变模式决定，不是固定的通路
+  底噪。这正是为什么周期图案（Part B）零误码、真实 ETM 高误码。
+
+### 7.5 诚实边界
+
+- 0xD4 虽是真实 ETM 会用的 atom 字节，但自跳转流里它**每字节相同**，跳变模式单一，
+  仍不是真实 ETM 的全熵。要扫"误码率 vs 熵"的完整曲线，下一步可用**不同 run 长度的分支
+  pattern**（如交替 taken/not-taken 产生 0xF7/0xF6 混合、或加 load 产生地址包）阶梯式
+  提高熵，逐档量误码率。但 Part C 已足够证明**误码率强烈 data-dependent**这个定性结论。
+- 本次 TRACECLK=112.5M 单点。位宽（4/2/1）× 频率（100/50M）扫描仍未做（原 Part C 计划），
+  留待后续——但"手推对拍"这个方法已建立，可复用到任意工作点。
+
+### 7.6 复现
+
+```bash
+# arm the self-branch loop with ETM (BB=0, STALL=0), run from RAM
+openocd -f interface/cmsis-dap.cfg -f target/stm32h7x.cfg \
+  -f syn/artix7/bringup/target/etm_selfbranch_h743.cfg
+# capture via the real stream path
+sudo python3 syn/artix7/bringup/scripts/trace_ctrl.py --ip 192.168.10.42 stream-selftest 0
+sudo python3 syn/artix7/bringup/scripts/trace_ctrl.py rearm
+sudo python3 syn/artix7/bringup/scripts/stream_recv.py --seconds 2 --out /tmp/sb_4bit.bin
+# deframe + verify: atom region must be ~100% 0xD4 (hand-derived 24-E Format 6)
+python3 -c "import numpy as np,sys; sys.path.insert(0,'orbtrace/syn/artix7/bringup/decode'); \
+import tpiu_official; d=np.fromfile('/tmp/sb_4bit.bin',np.uint8); \
+etm,st=tpiu_official.deframe(d.tobytes(),want_stream=2); a=np.frombuffer(etm,np.uint8); \
+print('D4 frac %.4f%%'%(100*(a==0xD4).sum()/((~np.isin(a,[0,0x80,1,5,0xc3,0x83,0x24,0xdb])).sum())))"
+```
