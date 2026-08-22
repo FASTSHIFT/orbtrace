@@ -216,3 +216,46 @@ flowchart LR
    若零丢 → L1 达标最简路径 = 降频，重传作为偶发丢包兜底。
 2. **P0f**：换非 USB 网卡测 112MB/s 真实上限（隔离"是 AX88179 特有还是普遍线速问题"）。
 3. FPGA 侧 deframe（大 L1 杠杆）作为独立 RTL 任务评估。
+
+
+---
+
+## 12. P0b 实测：recvmmsg + CPU pin 把丢包砍 45×，但没到零（2026-08-22）
+
+红方 r36 点名"单线程 recvfrom 是未排除的瓶颈"。写了 C 版 `stream_recvmmsg.c`
+（`recvmmsg(2)` 批量收，BATCH=1024，一次 syscall 收上千包）实测：
+
+| 收流方式 | 112MB/s 下丢包 | 相对 |
+|---------|---------------|------|
+| python 单线程 recvfrom | 0.013-0.05% | 基线 |
+| **C recvmmsg（不 pin）** | 59 events / 6503 帧 = **0.20%** | 更差（批量延迟？）|
+| **C recvmmsg + taskset core15 + chrt -f 90** | **4 events / 100 帧 = 0.0045%** | **砍 45×** |
+
+分层计数器（pinned recvmmsg 20s）：NIC `rx_dropped` delta=**0**、softnet CPU7=**0**、
+UDP `RcvbufErrors`=**0**、`InErrors`/`InCsumErrors`=**0**——**主机各层仍全 0，但还差 100 帧**。
+
+### 12.1 结论修正（比之前更准）
+
+- **收流软件路径 WAS 主要贡献**（recvmmsg+pin 砍 45×）——推翻 §6.4"pin 无效→不是收流端"
+  的过早结论。之前 pin python 无效，是因为瓶颈在**单线程逐包 syscall 速率**，pin 救不了
+  syscall 率；**recvmmsg 批量收才是对的杠杆**（一次 syscall 收上千包），配 pin 后砍 45×。
+  红方 r36 主张 2 完全正确。
+- **残留 0.0045% 仍是 USB 网卡静默丢**：主机所有计数器全 0，帧凭空少——AX88179 在
+  USB 传输/芯片层丢，内核不可见。这是软件榨不掉的**不可约残留**。
+- **recvmmsg + pin 应作为标准收流方式**（并入 stream_recv/stream_endurance），把主机侧
+  贡献降到最低。
+
+### 12.2 对可靠传输方案的影响（正向）
+
+- 残留丢包从 ~0.2% 降到 **0.0045%** → **L3 NACK 重传的活变得极小**（每秒重传几十帧而非
+  几千帧），重传雪崩风险几乎消失，DDR 历史窗口压力也小。
+- **三层防御依然需要**（要"环境无关零丢"）：recvmmsg+pin 是 L1 的一部分（把主机侧榨干），
+  但 USB 网卡静默残留只能靠 L3 NACK 重传兜底。
+- **不用降 TRACECLK 砍带宽**：112MB/s 满速 + recvmmsg+pin + NACK 重传补 0.0045% 残留，
+  比降到 58MB/s 划算得多。**保住带宽，靠协议补残留**——正是用户要的方向。
+
+### 12.3 下一步
+1. recvmmsg+pin 固化为标准收流（并入 stream_recv/stream_endurance）。
+2. 换非 USB 网卡（P0f）确认残留是否 AX88179 特有——若板载千兆 recvmmsg+pin 直接零丢，
+   则 NACK 重传只在"用户用劣质 USB 网卡"时才需要（渐进增强）。
+3. L3 NACK 重传按 doc 19 P1-P4 推进（现在活很小，优先级可降）。
