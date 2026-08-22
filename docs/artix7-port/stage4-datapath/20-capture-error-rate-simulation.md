@@ -113,3 +113,90 @@ iverilog -g2012 -Ptb_iddr_cdc_async.TCLK_HALF=5050 -Ptb_iddr_cdc_async.RUN_NS=16
 # skew×频率交互（注入 300ps skew → 特定相位/频率撕裂）
 bash run_sweep.sh
 ```
+
+
+---
+
+## 6. Part B 实测：真实引脚 + 真实 IDDR 采集误码率（2026-08-22，上板）
+
+**目的**：Part A 只证了数字 CDC 架构零误码（行为级 IDDR）。Part B 用 TPIU 内建测试图案
+走**真实引脚 → 真实 IDDR 采样 → 真实 stream 通路**（与真实 ETM 完全同一条采集链），
+逐字节量采集误码率。
+
+### 6.1 方法
+
+- **图案源**：TPIU CURTPM（`target/arm_walking_h743.cfg`），CPU halt、PLL 不动。
+  绕开 M7/ETM/CSTF/ETF/formatter，直接从 TPIU 驱动 4 lane。
+- **采集通路**：**stream bit（与真实 ETM 抓取同一个 bit、同一 IDDR、同一 tap=17）**，
+  `stream_recv.py` 收 :5555。**不是** pin_la bit——刻意用真实抓取通路。
+- **TRACECLK = 112.5 MHz**（固件 PLL：HSE25/M2×N36/R2/2；比多数真实 ETM 抓取的 100M 还高，
+  不是更宽松的工作点）。
+- **判据**：每字节 = `{falling_nibble, rising_nibble}`（一个 TRACECLK 周期两条边）。
+  - walking-1s：每 nibble 必是 one-hot ∈ {1,2,4,8}；且整流严格旋转（抓 drop/extra nibble）。
+  - FF00：每 nibble 必是 0x0 或 0xF（4 lane 同步翻转，最大 SSN）。
+
+### 6.2 结果
+
+| 图案 | SSN | TRACECLK | 抓取量 | 判据 | **误码率** |
+|---|---|---|---|---|---|
+| walking-1s | 低（单 lane 轮转）| 112.5M | **223 MB** | nibble one-hot + 严格旋转 | **0.000000%**（0 / 223797248）|
+| FF00 | **最大**（4 lane 齐翻）| 112.5M | **225 MB** | nibble ∈ {0x0,0xF} | **0.0000%**（0 / 224928768）|
+
+- **walking-1s**：整条 223 MB 只有两个字节值 `0x42`/`0x18` 严格交替，**0 次偏离**——
+  零 bit 错、零 lane skew、零丢/重 nibble、零相位滑移。
+- **FF00**：224 MB 全 `0x0F`，**0 个坏 nibble**——最大同步开关噪声下仍零误码。
+
+### 6.3 关键推论
+
+- **真实引脚 + 真实 IDDR 采集通路，在 112.5M、含最大 SSN 图案下，误码率 = 0%。**
+  Part A（数字架构 0%）+ Part B（真实模拟采集对**周期图案** 0%）都指向：**采集硬件对
+  可预测/周期性码流是零误码的**。
+- 这**收窄**了真实 ETM 那 0.75%–10% 坏包的来源：不是"引脚/IDDR/走线在 112.5M 采不动"
+  的普遍能力问题（能，且零误码），而是**与真实 ETM 码流的某种特性相关**（见 §6.4）。
+
+### 6.4 诚实边界：Part B 证不了什么（关键，别过度解读）
+
+**TPIU 测试图案是低熵、周期、静态的**——walking-1s 就两个字节无限重复，FF00 就一个字节。
+一旦 IDDR 锁上一个稳定采样相位，周期码流会**永远命中同一相位**，自然零误码。
+**它没有复现真实 ETM 的两个特性**：
+
+1. **高熵、任意 nibble 跳变**：真实 ETM 每周期 4 lane 独立、任意组合跳变（0x0→0xF、
+   0x3→0xC 等大摆幅 + 任意小摆幅混合），data-dependent jitter / ISI / 串扰只在这种
+   随机跳变下暴露；周期图案的固定跳变模式测不到。
+2. **数据相关的边沿位置抖动**：不同 nibble pattern 的上升/下降沿因串扰/负载被推前/拖后
+   不同量，采样窗口在高熵流里被动态压缩——这正是坑点 17/21"半-nibble 相位错位"的物理
+   来源，周期图案里边沿位置固定，测不出。
+
+**所以 Part B 的正确结论是**：采集通路对**周期/低熵码流** 0% 误码（排除了"硬件根本采不动
+112.5M"），但**真实 ETM 的坏包大概率来自高熵码流特有的 data-dependent 采样裕度问题**，
+Part B 的静态图案无法复现，也就无法用它测出真实 ETM 的坏包率。
+
+### 6.5 下一步（Part C，若要坐实高熵假设）
+
+要真正量"高熵码流下的采集误码率"，图案本身必须高熵且可预测。选项：
+1. **TPIU 不提供伪随机图案**（只有 AA55/FF00/W1/W0 四种低熵）——此路不通。
+2. **ETM 已知固定程序**：让 M7 跑一段**确定性、无数据依赖分支**的紧循环，ETM 输出可由
+   ELF 静态预测，再逐包比对——但这又回到"解码器是否忠实"的耦合，不纯。
+3. **位宽/降频对照（最实际）**：真实 ETM 抓取时扫 4/2/1-bit 与 100M/50M，看坏包率是否
+   随 SSN（位宽）/时序裕度（频率）单调下降。若是 → 坐实 data-dependent 采样裕度；
+   这不需要新图案，直接在真实 ETM 抓取上测（AGENT.md §21.4 第 3、4 条）。
+
+**建议**：Part B 已排除"硬件采不动"，Part C 用**真实 ETM 抓取的位宽/降频扫描**（坏包率
+vs 位宽 vs 频率）最省事且直接对准高熵假设——留待下次连设备批量抓。
+
+### 6.6 复现命令
+
+```bash
+# 1) arm walking-1s on real pins (CPU halted, firmware PLL => 112.5M TRACECLK)
+CURTPM_VAL=0x00020001 openocd -f interface/cmsis-dap.cfg -f target/stm32h7x.cfg \
+  -f syn/artix7/bringup/target/arm_walking_h743.cfg
+# 2) FPGA real-trace path (NOT selftest), rearm, capture via the real stream bit
+sudo python3 syn/artix7/bringup/scripts/trace_ctrl.py --ip 192.168.10.42 stream-selftest 0
+sudo python3 syn/artix7/bringup/scripts/trace_ctrl.py rearm
+sudo python3 syn/artix7/bringup/scripts/stream_recv.py --seconds 2 --out /tmp/w1_4bit.bin
+# 3) per-byte check: every nibble one-hot {1,2,4,8}, strict 0x42/0x18 rotation
+python3 -c "import numpy as np;d=np.fromfile('/tmp/w1_4bit.bin',np.uint8);\
+lo=d&0xF;hi=(d>>4)&0xF;ok=np.isin(lo,[1,2,4,8])&np.isin(hi,[1,2,4,8]);\
+print('err%%',100*(~ok).mean(),'distinct',[hex(x) for x in np.unique(d)])"
+# FF00: CURTPM_VAL=0x00020008 ; check nibbles in {0x0,0xF}
+```
