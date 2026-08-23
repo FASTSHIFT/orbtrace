@@ -589,3 +589,66 @@ print('golden 0x9f',g[0x9f],'raw 0x9f',r[0x9f],'raw 0x90',r[0x90])"
 PC 侧解码、MAC/PHY、FIFO 都已复用上游；采集前端自研是因为 7-series I/O 原语
 （IDELAYE2/IDDR/IDELAYCTRL）没有可直接搬的上游，属合理自研。**framed 流打通后，PC 侧
 还能进一步简化**——直接吃 deframe 后的字节，砍掉相位候选搜索这段自研补丁。
+
+
+---
+
+## 10. 定论：tap 扫描证明是【采样相位/SI】不是数字 bug，tap=17 偏出眼心（2026-08-23）
+
+§9 修复（STREAM_FRAMED 复用 traceIF）后 `0x9f` 仍在（15%）——说明滑移在 **traceIF 上游的
+IDDR nibble 捕获**层。用户问"SI 问题会导致这个吗"。做 IDELAY tap 扫描（移采样相位）一锤定音。
+
+### 10.1 判据（r26 定的，本次有 golden ETF 真值加持）
+
+- 数字配对 bug → 误码**对 tap 完全不敏感**（IDELAY 够不着的下游逻辑错）。
+- SI/采样相位 → 误码**随 tap 变化**（采样点相对数据的相位移动）。
+
+### 10.2 实测：0x9f 坏字节占比 vs 数据-lane IDELAY tap（framed bit, BB=1 自跟踪流, 112.5M）
+
+| tap | 0 | 2 | 4 | 6 | 8 | 10 | 12 | 14 | 16 | **17** | 18 | 20 | 22 | 24 | 28 | 30 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| bad% | 0 | **0** | 0 | 0 | .3 | .4 | .7 | 9 | 18 | **49** | 72 | 85 | 86 | 91 | .3 | 20 |
+
+细扫 tap 0-7 全部 0%（除 4/7 有 <1% 噪声）。**这是一张教科书眼图**：
+- **tap 0-6 = 眼睛睁开区，0% 误码**；
+- tap 8→24 误码从 0 平滑爬到 **91%**（采样点滑进数据跳变沿）；
+- tap 28 又回 0.3%（眼的另一侧）。
+
+### 10.3 结论
+
+- **误码 100% 是采样相位 / SI / 时序裕度问题，不是数字配对 bug**（强 tap 依赖，非平坦）。
+  这和 Part A（数字 CDC 架构仿真 0%）自洽，也和 r26 证伪"数字 CDC 撕裂是当年真凶"的方法
+  一致——只是这次结论反过来指向**模拟采样相位**，且有 golden 真值，判据无歧义。
+- **真凶 = tap=17 偏出眼心**：一直用的 tap=17 正好在坏窗边缘（18% 往上爬），上升沿 nibble
+  采样点贴到数据跳变沿，4 条 lane 一起误采（`0000`→`1111`，即 `0x90`→`0x9f`）。
+- **切到 tap=2（眼心）后 `0x9f`/`0x9c` 完全归零**，字节词汇表与 golden ETF 完全一致，流干净。
+
+### 10.4 为什么之前的 tap 校准没抓到（重要教训）
+
+AGENT.md 坑点 13/17 说"clktap 眼很宽，tap 4-31 全 err=0%，眼宽 28"——那是用 **AA/55 测试
+图案 + RESERVED 字节错**判据测的。**AA/55 是低频宽眼方波，眼确实宽**；但**真实高熵 ETM
+流（尤其 BB=1 密流）的眼窄得多**，同一个 tap=17 在 AA/55 下 0 错、在真实流下 49% 错。
+**这解释了 doc 20 全篇的困惑**：Part B（AA/55）0% 误码是真的，但它的宽眼掩盖了真实流的
+窄眼；tap 必须用**真实流 + golden 真值**校准，不能用 AA/55。这是"用错判据校 tap"的教训。
+
+### 10.5 下一步
+
+- **改 tap 默认到眼心（tap≈2-3）**：`trace_ctrl` / bit 默认 TAP、trace_doctor 状态。
+- **重跑之前所有"坏包/盲区"结论**：doc 20 前半（63% 盲区、0.75-10% 坏包、"下降沿塌 0"
+  candidate B 等）都是在 **tap=17 偏心**下测的，坏包大概率被 tap 偏心放大。tap=2 重测
+  真实 CoreMark 流的坏包率/盲区率——很可能大幅下降。
+- **eye-center 自动校准**：用 golden ETF 真值 + tap 扫描做一次性 per-board 眼心标定，
+  写进 trace_doctor（比 AA/55 判据可信）。
+
+### 10.6 复现
+
+```bash
+# framed bit + BB=1 self-trace firmware running; sweep data-lane tap, measure 0x9f
+for T in 0 2 4 6 8 10 12 14 16 17 18 20 22 24 28 30; do
+  sudo python3 trace_ctrl.py set-tap $T; sudo python3 trace_ctrl.py rearm; sleep 0.3
+  sudo python3 stream_recv.py --seconds 1 --out /tmp/t.bin
+  python3 -c "import numpy as np;d=np.fromfile('/tmp/t.bin',np.uint8);\
+n90=(d==0x90).sum();n9f=(d==0x9f).sum();print('tap',$T,'bad',n9f/max(n90+n9f,1))"
+done
+# tap 0-6 -> 0%, tap 18-24 -> 85-91%, tap=17 (old default) -> 49%. Eye center ~tap 2.
+```
