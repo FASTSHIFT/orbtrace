@@ -447,3 +447,96 @@ import tpiu_official; d=np.fromfile('/tmp/sb_4bit.bin',np.uint8); \
 etm,st=tpiu_official.deframe(d.tobytes(),want_stream=2); a=np.frombuffer(etm,np.uint8); \
 print('D4 frac %.4f%%'%(100*(a==0xD4).sum()/((~np.isin(a,[0,0x80,1,5,0xc3,0x83,0x24,0xdb])).sum())))"
 ```
+
+
+---
+
+## 8. Part D 突破：ETF-DAP 黄金对拍 + 饱和 trace，坐实真凶是【半-nibble 相位滑移】（2026-08-23）
+
+前面 Part A/B/C 一直缺一个**无可辩驳的真值来源**——不知道 TPIU 到底发了什么，只能靠
+"手推 0xD4"或统计分布。Part D 用两个新方法一举突破：
+
+### 8.1 方法：DAP 读 ETF = 黄金真值（成帧前的裸 ETM 字节）
+
+- **ETF（Embedded Trace FIFO，CoreSight TMC @0x5C014000）** 存的是 ETM 吐出的字节，**在
+  TPIU 并口成帧之前**。用 **DAP over SWD** 读 ETF（circular 模式 + RRD 寄存器 drain）——
+  SWD 有奇偶校验 + 重传，**物理上不可能读错**。所以 DAP 读出的 ETF 字节 = TPIU/ETM 真实
+  产生的字节，是黄金真值，不经过会出错的并口→IDDR 模拟链路。
+- **对拍逻辑**：同一个确定性程序，ETF 读一份（真值）、FPGA 并口抓一份（可能有错），
+  逐字节比 → 直接量并口采集误码，真值来源无可辩驳。ETF 与 FPGA 两个模式互斥（circular
+  vs HW-FIFO），但程序确定性周期，两条流是同一序列的不同相位，可对齐。
+
+### 8.2 关键工程：trace 配置全写进固件（避免 openocd 反复配 + D1 AP stall）
+
+- **`H743_Blink` 固件加 `ETM_SELFTRACE` 模式**（`Core/coremark_port/etm_selftrace.c`）：
+  固件 `SystemClock_Config` 后**自己**配 GPIO/TPIU/CSTF/ETF/ETM，**关 SysTick**，跑确定性
+  小循环（`det_iter`：固定 call/return 树，无数据依赖分支）。**openocd 只需 reset + 读
+  ETF**，不再运行时配 trace。
+- **为什么这么做**：openocd 在 CPU 跑起来后配 trace 极不稳——反复触发 H7 **D1 调试域 AP
+  stalled**（读 `0xe00e1004` CTI 失败），srst 救不回要断电。固件自配置 + CPU 持续跑紧
+  循环让 D1 常醒，AP 稳定。**这是烧掉多个 session 的坑，务必记住（见 AGENT.md）。**
+
+### 8.3 关键工程：饱和 trace 消除 halfsync（让对拍成立）
+
+- 稀疏流（self-branch 每分支 1 atom，24 atom 才 1 字节 0xD4）**93% 是 halfsync 空闲填充**
+  （`ff 7f`），deframe 在稀疏 halfsync 上 nibble 归批漂移 → 满屏 **0xD5 artifact**（假象，
+  raw 里 D5=0）。
+- **开 BB=1（分支广播）**：每个 taken 分支发一个 Address 包 → 字节率暴涨 ~20-30×，
+  **halfsync 从 93% 降到 29%**，流变密。deframe 立刻能锁（fullsync 从 ~18-36 涨到 2801），
+  0xD5 artifact 大减。STALL=1 保证无溢出（lossless）。
+
+### 8.4 铁证：golden 里 `0x9f`=0，FPGA raw 里 `0x9f`≈`0x90`（各 ~45 万）
+
+同一 BB=1 确定性流，golden ETF（DAP 真值）vs FPGA raw（引脚抓取）字节统计：
+
+| 字节 | golden ETF（真值） | FPGA raw（引脚） | 判定 |
+|---|---|---|---|
+| `0x90`（Address 短包） | 664 | 459706 | 合法 |
+| **`0x9f`** | **0** | **432443** | **采集错（真值里根本没有）** |
+| `0x9c` | 0 | 24240 | 采集错 |
+
+golden 完整词汇表里**根本没有 `0x9f`/`0x9c`**——它们 100% 是 FPGA 采集产生的坏字节。
+
+### 8.5 真凶：不是随机 SI 位错，是【半-nibble 字节边界相位成段滑移】
+
+FPGA raw 序列样本：
+```
+9f f6 9f f6 9f f6 90 f7 90 f7 05 90 f6 9f f6 9f f6 ... fc 9f f7 90 f7 90 f7 90 ...
+```
+- golden 真值单元是 `f6 90` / `f7 90`（Address 包 `90` + atom `f6`/`f7`）。
+- FPGA raw **成段地**在两个相位间跳：对的段 `90 f7`（nibble 相位对）、错的段 `9f f6`
+  （**整段偏了半个 nibble**——`90` 的高 nibble `9` 与下一字节的高 nibble 配错，读出 `9f`）。
+- **这是坑点 17/21 的"半-nibble 字节边界滑移"，用黄金真值第一次坐实**：采集偶尔丢/多半个
+  nibble，从该点起整段字节配对偏移，直到下一次重同步。**不是随机 bit 翻转、不是模拟 SI
+  眼图闭合、不是占空比**（推翻了 §7.3 candidate B 的"下降沿塌 0"猜测——那是稀疏流里
+  0xD4 偏移的表象；密流里真相是整段 nibble 相位滑移）。
+
+### 8.6 为什么饱和才暴露
+
+稀疏 0xD4 流里每字节都一样，半-nibble 滑移后还是类似值（0xD4→0x04 之类），看着像"偶发
+孤立位错"；**饱和的 `f6 90` 密流里，滑移立刻把 `90`→`9f`，一眼可见、且高频**。所以
+"误码率随码流熵暴涨"（§7.4）的真机制是：**熵越高，半-nibble 滑移的可见后果越大**，不是
+data-dependent 采样裕度（那个假设可以降级了）。
+
+### 8.7 修复方向：FPGA 侧 nibble 边界重同步（不是模拟死结）
+
+**这是可在 FPGA RTL 修的数字对齐问题，不是买示波器/改模拟的死胡同。** 拼字节的
+`cap_byte = {iddr_b, iddr_a}`（`trace_capture_a7.v` 的 CAP_RAW/stream 路径，**本项目
+新增代码**，非上游）没有 nibble 边界重同步——一旦采样丢/多半个 nibble，配对永久偏移。
+上游 `traceIF.v`（orbtrace 原生）**有** TPIU frame-sync/isSync 重同步逻辑，但 **CAP_RAW
+流式路径绕过了 traceIF**，直接把 `{iddr_b,iddr_a}` 推进 FIFO。修复方向见 §9。
+
+### 8.8 复现（离线数据 + 命令）
+
+```bash
+# 固件（BB=1 饱和 + 自配置 trace）
+make -C $H743 C_DEFS='... -DETM_SELFTRACE'   # etm_selftrace.c, BB=1/STALL=1
+# 烧录后固件自动配 trace（openocd 不配），抓 FPGA 侧
+sudo python3 stream_recv.py --seconds 1 --out bb1.bin
+# DAP 读 ETF golden（circular + RRD drain）
+openocd ... -f target/etf_dump_h743.cfg   # -> golden_bb1.bin
+# 对拍：golden 里 0x9f=0，raw 里 0x9f≈0x90 → 半-nibble 滑移
+python3 -c "from collections import Counter; \
+g=Counter(open('golden_bb1.bin','rb').read()); r=Counter(open('bb1.bin','rb').read()); \
+print('golden 0x9f',g[0x9f],'raw 0x9f',r[0x9f],'raw 0x90',r[0x90])"
+```
