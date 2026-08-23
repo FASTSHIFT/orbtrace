@@ -740,3 +740,48 @@ ISR 作为独立帧、主调用树不被污染、begin/end 配平——**印证�
 - **20-40 个 NACC @ 0x800f59x**（段外地址）根因待查，量级 0.007-0.01% 可忽略。
 - **产物**：`selftrace_o0_tap2.perftrace`（无 SysTick）、`systick_multitrack_tap2.perftrace`
   （SysTick + 多 track），可拖进 ui.perfetto.dev。
+
+
+---
+
+## 13. 那 20-40 个 NACC 与"丢失的 det_iter"根因（2026-08-23）
+
+§11.2/§12.1 遗留的"20-40 个 ADDR_NACC @ 0x800f59x/0x800f5ac"以及 Perfetto 上偶尔缺一个
+`det_iter` 父帧（只剩裸 `n n n` 叶子），根因查清：
+
+### 13.1 现象
+
+- NACC 目标地址固定复现 `0x800f5ac / 0x800f5b2`——**超出 mem 镜像**（O0 镜像覆盖到
+  0x800dfd4），且 ELF 里无任何符号。
+- 触发点固定：`0x800d3c2 bx lr (E iBR V7:impl ret)` = **det_iter 的返回**（det_iter=
+  0x800d39c，systick_off=0x800d3cc，det_iter 体是 0x800d39c–0x800d3cc）。
+- NACC 周期性成簇（每 ~13.5K 行一次），**周期与 SysTick 中断一致**。
+
+### 13.2 根因：SysTick 扰动 ETMv4 隐式返回栈 → opencsd 返回预测错 → 落到镜像外 → NACC
+
+- ETMv4 用**隐式返回栈**解无条件返回（`bx lr` 不发地址，解码器从返回栈弹目标，
+  §opencsd `V7:impl ret`）。det_iter 返回本应弹回 etm_selftrace_run 的循环。
+- **SysTick 异常打断 det_iter 时，异常 entry/exit 扰动了返回栈**，opencsd 弹出的预测
+  返回地址错成 `0x800f5b2`（镜像外）→ 无法取指令 → **ADDR_NACC**→ 靠下一个显式地址包
+  (0x800d39c) 重锚回 det_iter。
+- **不是物理采集错**（BAD_SEQUENCE=I_RESERVED=0，raw `0x9f/0x9c` 仅 0.01% 异常边界残留）。
+  是**异常与返回栈交互**导致的解码器预测偏差，opencsd 自己 NACC 标出、下一个地址包恢复。
+
+### 13.3 "丢失的 det_iter"
+
+Perfetto 上某段只见 `n n n`（node/leaf）不见 `det_iter` 父帧，正是这个 NACC 的下游：
+返回预测错落到镜像外时，cortrace 栈机的**盲区保护**触发（`after_blind_`，丢弃 pending
+call、不捏造帧），于是那一轮的 det_iter 没被重新 push，只剩它内部的叶子调用可见。
+
+- 这是 cortrace **诚实的盲区处理**（宁可漏一个父帧，也不捏造错帧）——与 mortrall 的
+  "带病乱走填满"相反。代价是极少数（40/306K=0.01%）父帧缺失。
+- **两条改进路**：(a) 给 opencsd 完整 mem 镜像（含所有段/库函数），让"镜像外"这类
+  NACC 消失——但 0x800f5ac 超出所有符号，更像返回栈预测错而非缺镜像；(b) cortrace 用
+  **BL 静态目标 + 返回地址栈**重建，跨 NACC 时按返回址回填 det_iter 帧（架构文档 §3.2
+  的产品级 callee 识别）。
+
+### 13.4 结论
+
+20-40 NACC 不是采集问题（物理层 tap=2 后零坏包），是 **SysTick 扰动 ETMv4 返回栈的解码器
+预测偏差**，量级 0.01%，opencsd 如实标 NACC 恢复。"丢失的 det_iter"是 cortrace 盲区保护
+的正确保守行为。彻底消除需产品级栈机（BL 静态目标 + 返回址回填），列入 cortrace 待办。
