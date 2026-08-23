@@ -83,7 +83,7 @@ module trace_stream_top #(
                                                     // Sized for ~80 us at the
                                                     // 100 MHz TRACECLK peak;
                                                     // grow if lost_cnt trips.
-    parameter       STREAM_SELFTEST = 0             // 1: bypass the trace
+    parameter       STREAM_SELFTEST = 0,            // 1: bypass the trace
                                                     // front-end and stream a
                                                     // free-running clk125 byte
                                                     // counter -- pure network
@@ -96,6 +96,22 @@ module trace_stream_top #(
                                                     // loss is unambiguous.
                                                     // Runtime CSR 0x09 also
                                                     // toggles it (data[0]=1).
+    parameter       STREAM_FRAMED = 0               // 1: stream the DEFRAMED
+                                                    // ETM bytes from upstream
+                                                    // traceIF (16 bytes/frame,
+                                                    // TPIU-sync + halfsync
+                                                    // stripped + nibble-boundary
+                                                    // RE/FE resync all handled
+                                                    // by traceIF) instead of the
+                                                    // raw {trace_b,trace_a}
+                                                    // nibble bytes. Fixes the
+                                                    // half-nibble phase slip
+                                                    // (doc 20 Part D): the raw
+                                                    // path had NO resync, so a
+                                                    // lost/extra half-nibble
+                                                    // permanently offset byte
+                                                    // pairing. Reuses the proven
+                                                    // upstream frame-sync FSM.
 ) (
     input  wire        sys_clk_50,
     input  wire        rst_n,
@@ -609,9 +625,47 @@ module trace_stream_top #(
         always @(posedge clk200) begin selftest_s0 <= selftest_csr; selftest_200 <= selftest_s0; end
         assign selftest_active = selftest_200;
 
-        // Mux into the FIFO input.
-        wire [7:0] src_data  = selftest_active ? bw_cnt   : cap_byte;
-        wire       src_valid = selftest_active ? bw_valid : cap_valid;
+        // ---- STREAM_FRAMED source: serialize traceIF's 128-bit frame -------
+        // Reuse upstream traceIF (already instantiated above) which does TPIU
+        // frame-sync, halfsync (0x7fff) stripping, and RE/FE nibble-boundary
+        // resync -- exactly the resync the raw {trace_b,trace_a} path lacks
+        // (doc 20 Part D half-nibble slip). We take its 128-bit `frame` +
+        // `frame_strobe` (trace_clk domain), cross the strobe into clk200, and
+        // shift the 16 bytes out MSB-first as a normal AXIS byte source into the
+        // SAME async FIFO the raw path uses. No new FIFO/packetiser/network.
+        wire [7:0] framed_data;
+        wire       framed_valid;
+        wire       framed_ready = fifo_in_ready & ~selftest_active;
+        if (STREAM_FRAMED) begin : g_framer
+            // cross frame_strobe (trace_clk) -> clk200 as a single pulse
+            reg fs_s0=0, fs_s1=0, fs_s2=0;
+            always @(posedge clk200) begin fs_s0<=frame_strobe; fs_s1<=fs_s0; fs_s2<=fs_s1; end
+            wire fs_pulse200 = fs_s1 ^ fs_s2;   // one clk200 pulse per frame
+            // latch the frame (stable between strobes) and shift 16 bytes out
+            reg [127:0] sh = 128'b0;
+            reg [4:0]   cnt = 5'd0;             // bytes remaining (0 = idle)
+            always @(posedge clk200) begin
+                if (sys_rst) begin cnt <= 5'd0; end
+                else if (fs_pulse200) begin
+                    sh  <= frame;               // capture whole frame
+                    cnt <= 5'd16;               // 16 bytes to emit
+                end else if (cnt != 0 && framed_ready) begin
+                    sh  <= {sh[119:0], 8'h00};  // shift MSB-first
+                    cnt <= cnt - 5'd1;
+                end
+            end
+            assign framed_data  = sh[127:120];
+            assign framed_valid = (cnt != 0);
+        end else begin : g_no_framer
+            assign framed_data  = 8'h00;
+            assign framed_valid = 1'b0;
+        end
+
+        // Mux into the FIFO input. Priority: selftest ramp > framed > raw.
+        wire [7:0] src_data  = selftest_active ? bw_cnt :
+                               STREAM_FRAMED    ? framed_data : cap_byte;
+        wire       src_valid = selftest_active ? bw_valid :
+                               STREAM_FRAMED    ? framed_valid : cap_valid;
         assign     bw_ready  = fifo_in_ready & selftest_active;
 
         // clk200 -> clk125 async FIFO
@@ -649,7 +703,7 @@ module trace_stream_top #(
         // gates its advance), so this reports drops only in real-trace mode --
         // which is exactly what we care about.
         reg [31:0] lost200 = 32'd0;
-        wire       drop = cap_valid & ~fifo_in_ready & ~selftest_active;
+        wire       drop = src_valid & ~fifo_in_ready & ~selftest_active;
         always @(posedge clk200) begin
             if (sys_rst)    lost200 <= 32'd0;
             else if (drop)  lost200 <= lost200 + 1'b1;

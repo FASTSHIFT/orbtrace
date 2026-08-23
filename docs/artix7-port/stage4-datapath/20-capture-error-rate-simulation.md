@@ -540,3 +540,52 @@ python3 -c "from collections import Counter; \
 g=Counter(open('golden_bb1.bin','rb').read()); r=Counter(open('bb1.bin','rb').read()); \
 print('golden 0x9f',g[0x9f],'raw 0x9f',r[0x9f],'raw 0x90',r[0x90])"
 ```
+
+
+---
+
+## 9. 修复：STREAM 路径复用上游 traceIF 重同步（方案 1）+ 复用审计（2026-08-23）
+
+### 9.1 根因回顾（代码血缘）
+
+- **上游 orbtrace `verilog/traceIF.v`**：成熟的 TPIU-Lite 帧组装器。把 rising/falling nibble
+  移进 36-bit `construct` 移位寄存器，**同时检测 RE 和 FE 两种 nibble 对齐下的 full sync
+  `7fff_ffff`**（`REsyncPacket`/`FEsyncPacket`）→ 用 `isREsync` 选对 nibble 边界、丢
+  halfsync(`7fff`)、组 8×16-bit=128-bit 帧。**这正是 nibble 边界重同步。**
+- **本项目新增的 CAP_RAW/STREAM 路径**（`trace_capture_a7.v` 的 `{iddr_b,iddr_a}` 打包 +
+  `trace_stream_top.v` 的 `g_stream`）：把裸 `cap_byte` 直接推进 async FIFO → UDP，
+  **完全绕过 traceIF，没有任何重同步**。一旦 IDDR 丢/多半个 nibble，配对永久偏移
+  → Part D 的半-nibble 滑移（`90`→`9f`）。
+
+### 9.2 修复（方案 1，复用上游，不自研）
+
+`trace_stream_top.v` 加 `STREAM_FRAMED` 参数：置 1 时 STREAM 路径不发裸 `cap_byte`，
+改发 **traceIF 的 128-bit `frame`**（已 TPIU-sync + halfsync 剥离 + RE/FE nibble 重同步）。
+实现：把 `frame_strobe`（trace_clk 域）跨到 clk200，收到脉冲锁存整帧、MSB-first 移出
+16 字节，喂进**同一个** async FIFO/packetiser/网络（零改动下游）。build tcl 加
+`STREAM_FRAMED` generic。产出 `trace_iddr_clktap_stream_framed.bit`。
+
+- **PC 侧**：framed 流是**已 deframe 的 ETM 字节**（每帧 16 字节，无 TPIU 填充），
+  所以收流后**不需要再 deframe**——直接是 stream 2 的 ETM 字节。省掉 PC 侧
+  `tpiu_official.deframe` + nibble 相位候选搜索（那些正是 0xD5 artifact 的来源）。
+- **判据**：framed 流应与 golden ETF 逐字节一致（除 A-Sync 时间位置差异），
+  `0x9f`/`0x9c` 应消失。待上板验证。
+
+### 9.3 复用审计：还有哪些该复用没复用（用户要求）
+
+盘一遍上游件的复用状态：
+
+| 组件 | 上游 | 现状 | 结论 |
+|---|---|---|---|
+| TPIU 帧组装 + nibble 重同步 | `traceIF.v` | one-shot/g_frame 路径用了；**STREAM 路径曾绕过** | **本次已修**（STREAM_FRAMED 复用）|
+| TPIU deframe（PC 侧） | orbuculum `tpiuDecoder.c` | `tpiu_official.py` 忠实移植 | ✅ 已复用（移植）|
+| ETM 指令流解码（PC 侧） | orbuculum `traceDecoder*`+`loadelf.c` | `orbetm.c` 链接、`drive_orbmortem.py` 驱动 | ✅ 已复用 |
+| ETM→Perfetto | orbetto/Mortrall | edt/ext/orbetto | ✅ 已复用（另有 cortrace 新路线）|
+| 采集前端 IBUF/IDELAY/IDDR | 无直接上游（ECP5 风格参考）| `trace_capture_a7.v` 自研（7-series 原语必须自写）| ⚠️ 合理自研（Xilinx 原语）|
+| 以太网 MAC/PHY | verilog-ethernet | `fpga_core_net` 复用 | ✅ 已复用 |
+| 异步 FIFO CDC | verilog-ethernet `axis_async_fifo` | 复用 | ✅ 已复用 |
+
+**结论**：主要的"该复用没复用"就是 STREAM 路径绕过 traceIF 这一处（本次修复）。其余
+PC 侧解码、MAC/PHY、FIFO 都已复用上游；采集前端自研是因为 7-series I/O 原语
+（IDELAYE2/IDDR/IDELAYCTRL）没有可直接搬的上游，属合理自研。**framed 流打通后，PC 侧
+还能进一步简化**——直接吃 deframe 后的字节，砍掉相位候选搜索这段自研补丁。

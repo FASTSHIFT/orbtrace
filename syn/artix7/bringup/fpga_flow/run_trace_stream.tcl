@@ -74,6 +74,8 @@ set capmethod "OVERSAMPLE"
 if {[info exists ::env(CAP_METHOD)]} { set capmethod $::env(CAP_METHOD) }
 set stream 0
 if {[info exists ::env(STREAM)]} { set stream $::env(STREAM) }
+set framed 0
+if {[info exists ::env(STREAM_FRAMED)]} { set framed $::env(STREAM_FRAMED) }
 # BUILD_ID = Unix epoch at synth time, stamped into readout reg 0xFF70..73.
 # The host reads it back over :5001 to PROVE the running bitstream == this build
 # (rules out "power-cycle booted stale QSPI" -- SRAM loads are volatile).
@@ -84,6 +86,7 @@ synth_design -top trace_stream_top -part $part \
     -generic TAP=$tap -generic CAP_RAW=$capraw -generic EYE=$eye \
     -generic SELFTEST=$selftest -generic TRACE_WIDTH=$twidth \
     -generic CAP_METHOD=$capmethod -generic STREAM=$stream \
+    -generic STREAM_FRAMED=$framed \
     -generic BUILD_ID=$build_id
 opt_design
 place_design
