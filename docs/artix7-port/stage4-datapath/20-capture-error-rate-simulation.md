@@ -785,3 +785,55 @@ call、不捏造帧），于是那一轮的 det_iter 没被重新 push，只剩�
 20-40 NACC 不是采集问题（物理层 tap=2 后零坏包），是 **SysTick 扰动 ETMv4 返回栈的解码器
 预测偏差**，量级 0.01%，opencsd 如实标 NACC 恢复。"丢失的 det_iter"是 cortrace 盲区保护
 的正确保守行为。彻底消除需产品级栈机（BL 静态目标 + 返回址回填），列入 cortrace 待办。
+
+
+---
+
+## 14. 真实时基 perf + 5 分钟长时压测（2026-08-23）
+
+### 14.1 真实时基 perf（1ms SysTick，tap=2）
+
+固件改用 **1ms SysTick**（`etm_selftrace.c` `systick_on()` RVR=149999 @150MHz sysclk，
+匹配 CubeMX 默认 1kHz tick）。合成时基：TRACECLK 恒定 112.5MHz，每 RAW 字节 = 1 周期 =
+8.889ns，`time.bin[i] = round(raw_offset_i × 8.889)`（频率恒定，精确无累积误差）。
+
+cortrace `--time` 解 8.85ms 窗口：
+
+| 指标 | 值 |
+|---|---|
+| SysTick 异常 | 9 个 |
+| **SysTick 间隔（实测）** | **[1.0, 1.001, 0.999, 1.0, 1.001, 1.0, 1.0, 1.0] ms** |
+| track | main thread + IRQ:SysTick（各自配平，final depth 0）|
+| **盲区率** | **0.03%（覆盖 99.97%）** |
+| dropped calls | 0 |
+
+**SysTick 间隔精确到 1ms（3 位小数）**——合成时基正确，perf 时间轴是真实 ns。产物
+`systick_1ms_timed.perftrace`（可拖进 ui.perfetto.dev，两条泳道 + 每 1ms 一个 SysTick）。
+
+### 14.2 5 分钟流式长时压测
+
+`stream_endurance.py --seconds 300`（同一 self-trace 小程序，tap=2）：
+
+```
+时长 300s，收 33.4 GB @ 111.3 MB/s（32596681 packets）
+wire seq-gap: 280 events, 362670 lost frames = 1.10%
+最坏区间: 51 gaps @ t=60s
+capture-side lost_cnt: poll 未成功（线太忙，:5001 被淹，已知）
+```
+
+### 14.3 分层结论（关键：采集 vs 传输是两层）
+
+- **传输层 1.10% 丢帧 = AX88179 USB 网卡在 ~112MB/s 线速下的静默丢帧上限**（AGENT.md 记的
+  USB 天花板）。**不是采集坏帧**——是 UDP 帧在 USB 芯片/内核层丢，seq-gap 计得到。
+- **采集层（tap=2）零坏包**：压测前干净测量 opencsd 0 BAD_SEQUENCE / 0 I_RESERVED，
+  盲区 0.03%（§14.1 真实时基实测）。物理采集链路干净。
+- **要真零丢包必须治传输层**：换非 USB 网卡（板载/PCIe），或**L3 NACK 选择性重传**
+  （doc 19）——ETM 数据不可再生，重传必须 FPGA 侧 DDR 存历史。
+
+### 14.4 诚实标注：压测中无法干净量采集误码
+
+压测在 111MB/s 有 1.10% 传输丢帧，丢帧把字节流拼接错位，**污染任何对 sample 的采集
+误码测量**（endurance sample 的 0x9x 统计不可信）。且不同固件 build 字节词汇表不同
+（BB=1 build 地址包=0x90，1ms-SysTick build=0x91-0x97），不能跨 build 用固定字节当判据。
+**采集误码要干净量，必须先让网卡零丢帧**（降速到 ~58MB/s 已知零丢，或换卡），否则传输
+丢帧混进来。这也是上马 NACK 重传的直接动机——重传保证传输完整后，采集误码才可独立测。
