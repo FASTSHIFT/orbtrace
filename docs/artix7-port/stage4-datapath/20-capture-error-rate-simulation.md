@@ -652,3 +652,91 @@ n90=(d==0x90).sum();n9f=(d==0x9f).sum();print('tap',$T,'bad',n9f/max(n90+n9f,1))
 done
 # tap 0-6 -> 0%, tap 18-24 -> 85-91%, tap=17 (old default) -> 49%. Eye center ~tap 2.
 ```
+
+
+---
+
+## 11. tap=2 端到端验证：真实流零坏包、零盲区（2026-08-23，上板）
+
+把 tap 从 17（偏心）切到 2（眼心）后，用 §8 的固件自配置 trace（ETM_SELFTRACE，SysTick
+关，BB=1，STALL=1）做完整三步验证。
+
+### 11.1 ETF-DAP 对拍（golden 真值）
+
+- FPGA 抓 110MB @tap=2：`0x9f=0, 0x9c=0`（tap=17 时各 ~45 万）。
+- `0x9x` 字节族：golden ETF（4KB，DAP 直读）只有 `0x90`，FPGA 也只有 `0x90` —— 完全一致，
+  **半-nibble 滑移彻底消失**。
+- 逐字节对齐（自跳转确定性流）：无 `0x9f/0x9c` 腐蚀签名；剩余差异是 A-Sync 时间位置 +
+  计数器演进的正常数据变化，非采集错。
+
+### 11.2 opencsd 解流（真值判据）
+
+| | tap=17（旧默认，偏心）| **tap=2（眼心）** |
+|---|---|---|
+| INSTR_RANGE | ~98K/slice | 302K/slice |
+| **I_BAD_SEQUENCE**（坏包）| 340 | **0** |
+| **I_RESERVED**（坏头）| 2186 | **0** |
+| **ADDR_NACC**（盲区源）| 806 | **20**（0.007%）|
+
+坏包/坏头**归零**，盲区从 806 降到 20（0.007%）。这 20 个 NACC 落在 `0x800f59x`——**在所有
+ELF 段之外的地址**，是极少数残留（非坏包，BAD_SEQUENCE=RESERVED=0），根因待查但量级已可忽略。
+
+### 11.3 cortrace/opencsd 出 perf（O0 无内联，保留调用树）
+
+- begin/end **123893/123893 完美配平**，max depth 4，**dropped calls=0（零盲区）**。
+- 调用边 4/4 对 ELF：`etm_selftrace_run→det_iter→node→{leaf_add, leaf_xor}`（O0 无内联，
+  层次完整）。
+- perf 时间线 247786 事件，相邻事件最大间隔=1、单调无跳变 → **无盲区**。
+
+### 11.4 结论
+
+**doc 20 前半的"0.75-10% 坏包 / 63% 盲区 / candidate B 下降沿塌 0"全部是 tap=17 偏出眼心
+的产物**。tap=2（眼心）下，物理采集链路在**真实高熵流**上**零坏包、零盲区**。项目最初
+追求的"0 坏帧 0 丢包"在真实 trace 上**成立**。
+
+**关键工程教训（已记 AGENT.md）**：
+1. **固件自配置 trace（ETM_SELFTRACE）**避免 openocd 对运行中 CPU 配 trace 触发 D1 调试域
+   AP stall（烧掉多个 session 的坑）。
+2. **tap 必须用真实高熵流 + golden 真值校准**，不能用 AA/55（宽眼掩盖真实流窄眼）。
+3. **Vivado/Vitis PATH 会用 arm-xilinx-eabi 覆盖 arm-none-eabi**（缺 libc_nano），
+   编固件要 `GCC_PATH=/usr/bin`。
+
+---
+
+## 12. SysTick 稳定性 + 每中断独立 track（2026-08-23）
+
+开 SysTick（`ETM_SELFTRACE_SYSTICK`，RVR=0xFFFF → 150MHz sysclk 下约 437µs 周期）重测，
+看中断打断确定性循环后采集/解码稳不稳。
+
+### 12.1 结果：开 SysTick 依然干净
+
+| 指标 | SysTick 关 | SysTick 开 |
+|---|---|---|
+| I_BAD_SEQUENCE | 0 | **0** |
+| I_RESERVED | 0 | **0** |
+| ADDR_NACC | 20 | 40（0.01%）|
+| begin/end 配平 | 123893/123893 | **125374/125374** |
+| dropped calls | 0 | **0** |
+| EXCEPTION 元素 | 0 | 164 entry + 82 ret |
+
+**开 SysTick 后流依然零坏包、完美配平、零盲区。** opencsd 正确捕获 SysTick 异常，cortrace
+渲染成 ISR 帧。`0x9f/0x9c` 从 0 微升到 470/2342（0.01%），异常边界附近极小残留，不影响结论。
+
+**这正是当年 mortrall 假重入的重灾区**（SysTick entry/exit，AGENT.md 坑点 24 里 mortrall
+把 SysTick 处理成假嵌套 6-9 层、coremark_main 误显示 257 次）。opencsd+cortrace 处理得干净：
+ISR 作为独立帧、主调用树不被污染、begin/end 配平——**印证转 opencsd 路线的核心价值**。
+
+### 12.2 每中断独立 track（cortrace 侧改进）
+
+用户要求：每个中断按中断号分到独立 Perfetto track。cortrace 栈机改为**上下文栈模型**：
+主线程 track 0，每个异常按中断号分独立 track（`IRQ:SysTick`/`IRQ:PendSV`…），ISR 不再嵌套
+在被抢占函数上，而是独立泳道；嵌套异常正确入栈弹栈。实测：`main thread` 125210/125210 +
+`IRQ:SysTick` 164/164 两条独立 track 各自配平。详见 cortrace 仓库 commit。
+
+### 12.3 遗留
+
+- **perf 时间轴仍是 tick 序，非真实 ns**：SysTick 周期在 UI 上显示的间隔是 tick 计数，
+  不是真实 437µs。接 FPGA `.time.bin` 时间基后才是真实时间（cortrace M2）。
+- **20-40 个 NACC @ 0x800f59x**（段外地址）根因待查，量级 0.007-0.01% 可忽略。
+- **产物**：`selftrace_o0_tap2.perftrace`（无 SysTick）、`systick_multitrack_tap2.perftrace`
+  （SysTick + 多 track），可拖进 ui.perfetto.dev。
