@@ -298,3 +298,86 @@ UDP `RcvbufErrors`=**0**、`InErrors`/`InCsumErrors`=**0**——**主机各层�
   NACK 重传是"生产级零丢"的增强，不是解码的前置。
 
 **验收状态**：物理层"0 坏帧"✅ 达标；"0 丢帧"⚠️ 达到 0.0045%（软件下限），真零丢待 L3。
+
+---
+
+## 14. P1-P4 实施与离线验证（2026-08-23）
+
+按 §8 分阶段落地。**动 RTL 前先离线仿真定位"逻辑对"**（项目纪律：先仿真再上板），
+P0e / P1 / P2 用 iverilog 对拍，P4 用纯 Python loopback 端到端验证——**全部无需硬件**。
+
+### 14.1 P0e 定论：并发读写同一 ring 可行（复用现有 DDR 基础设施）
+
+红方 r36 点名的"持续并发读写同一 ring 是全新场景"，读现有 RTL 后定位到**两个关键既有
+性质直接满足需求**，不用自己搓仲裁：
+
+| 性质 | 来源（既有 RTL） | 对可靠传输的意义 |
+|------|-----------------|-----------------|
+| writer 与 reader **同在 `ui_clk` 域** | `la_ddr_writer` / `la_ddr_reader` 端口 | 被追的 `wr_ptr` **同域读取**，无跨时钟亚稳态——doc 原担心的 CDC 指针风险直接消除 |
+| 仲裁器**写优先** | `ddr3_arbit.v`：`if(wr_req) WRITE else if(rd_req) READ` | ETM 源头写**永不被重传读饿死**，读只填进写突发之间的空隙 |
+
+**结论**：并发读写是安全的，且**源头永不背压**（§2 要求）这条硬约束由既有仲裁器天然保证。
+
+### 14.2 P1：DDR 历史环形缓冲 drain 通路（`la_ddr_ring_streamer.v`）
+
+新增 `la_ddr_ring_streamer`（**复用** `axis_async_fifo` + 既有 `ddr3_*ctrl`），区别于
+只读快照的 `la_ddr_reader`：**与 writer 并发**，持续追 `wr_ptr` 恒速泄出到网络，每包带
+`seq`。关键设计：
+
+- **seq 单调、与 wrap 无关**：`seq = 单调 drained-word 计数 / PKT_WORDS`（不是 wrap 后的
+  `rd_ptr`）。这样一个 NACK 的 seq 跨 ring 圈仍唯一映射回 DDR 地址（§4 要求）。
+- **overrun 诚实标注**：用**绝对 backlog**（`committed - drained`，单调计数）判断 writer
+  是否套圈覆盖未泄出的历史，而非 wrap 指针差（后者分不清"套一圈"和"并肩"）。超 ring
+  容量即置 `ring_overrun`（§6 能力边界可观测），不静默吐损坏数据。
+
+### 14.3 P2/P3：NACK 重传 FSM（同一 read 端口，重传优先）
+
+重传服务并入 streamer 同一读 FSM（**不搞第二个 read mux**）：
+
+- NACK 请求（clk125 CTRL 域）toggle-sync 进 ui_clk，`seq→绝对 word→ring 地址`。
+- **重传优先于常态 drain**，但因仲裁器写优先，仍不背压源头（P3 防雪崩的根子）。
+- **窗口检查**：请求 seq 若已被覆盖（`committed - abs_word > RING_CAP` 或尚未写入）→
+  走 `X_FAIL` 置 `nack_fail`（§5.3 NACK-fail，能力边界诚实暴露）。
+- 每个重传字节标 `stream_rtx=1` + 原 seq，PC 按原 seq 归位。
+
+### 14.4 仿真验证（iverilog，真实 vendor ctrl + 行为化 MIG）
+
+`sim/tb_la_ddr_ring.v`（`run_tb_ring.sh`）例化 **真实** `ddr3_wr_ctrl` /
+`ddr3_rd_ctrl` / `ddr3_arbit` + 行为化 MIG 存储，writer 与 streamer 并发跑同一 ring：
+
+| 用例 | 场景 | 断言 | 结果 |
+|------|------|------|------|
+| **A** | drain≥fill 并发读写 | 泄出字节流逐字节连续 ramp，0 dup/gap，overrun=0 | **PASS** |
+| **B** | drain 被饿死，writer 套圈 | `ring_overrun` 诚实置位（非静默） | **PASS** |
+| **C** | NACK 重传 seq 5..7（窗口内） | 3 包 ×1KB 重发，标 rtx，seq 范围正确 | **PASS** |
+| **D** | NACK seq 越界（未写入） | `nack_fail` 诚实置位 | **PASS** |
+
+TEST A 是 **P0e 的直接实证**：并发读写经写优先仲裁器，数据零污染 + seq 正确。
+
+### 14.5 P4：PC 协议离线端到端验证（无硬件）
+
+PC 侧三件套（**复用 recvmmsg 收流路径**，只加协议层）：
+- `nack_protocol.py`：包格式（数据包头加 `retransmit` 标志位；NACK 用 `NK` magic 区别于
+  既有 `{addr,value}` CSR 写，不动 CSR 通路）+ 缺口合并 `coalesce_gaps`。
+- `nack_rx.py`：`ReliableReceiver`——**传输无关**的重组 + 缺口检测 + NACK 调度（抖动去抖
+  §5.2、重试预算、永久 gap 判定）。live UDP 前端收 :5555 / 发 NACK 到 :5002。
+- `nack_loopback_test.py`：**P4 离线验收**。假 FPGA（内存 ring + 注入丢包）驱动真
+  `ReliableReceiver`，证明重传后 seq-gap=0：
+
+| 用例 | 注入 | 断言 | 结果 |
+|------|------|------|------|
+| **T1** | 2% 随机丢，窗口内 | 重传后**字节与源完全一致，0 hole** | **PASS**（重传 46）|
+| **T2** | 长突发丢，超历史窗口 | 精确报告 permanent gap（诚实边界），其余完好 | **PASS**（152 gap）|
+| **T3** | 20% 随机丢，窗口内 | 多轮重传后仍 **0 hole** | **PASS**（重传 634）|
+
+T1/T3 是"**环境不可靠也零丢**"（§目标）的直接证明；T2 是能力边界（§6）的诚实兑现。
+
+### 14.6 状态与遗留
+
+- ✅ P0e/P1/P2/P3 RTL 逻辑经仿真验证（并发读写零污染 + overrun/nack-fail 诚实）。
+- ✅ P4 PC 协议经离线 loopback 验证（2%/20% 丢包零 hole，越界诚实报 gap）。
+- ⚠️ **尚未上板**：待综合 `la_ddr_ring_streamer` 进 top（接 `fpga_core_net` self-TX +
+  CTRL :5002 NACK 解析），跑真实注入丢包（`tc netem` / AX88179 满速）的端到端 P4。
+  下一步：top 集成 + 时序收敛 + 硬件 P4。
+- **复用审计**：`axis_async_fifo`（帧缓冲）、`ddr3_wr_ctrl/rd_ctrl/arbit`（既有 vendor 通路）、
+  recvmmsg 收流路径、CTRL :5002（加 NACK opcode 不动 CSR）——均复用未自搓。
