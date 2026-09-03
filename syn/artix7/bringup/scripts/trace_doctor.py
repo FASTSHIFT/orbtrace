@@ -987,8 +987,10 @@ def _check_l0(state, verbose=True):
             issues.append(f"L0 USB device missing: {name} ({did})")
     if not Path("/dev/ttyACM0").exists():
         issues.append("L0 /dev/ttyACM0 missing (DAPLink VCP)")
-    if not Path("/mnt/hgfs/DESIGN/STM32_Project/H743_Blink/Makefile").exists():
-        issues.append("L0 hgfs firmware share unreadable (H743 project)")
+    # Firmware is a local git repo on the physical machine (was hgfs share on the old VM).
+    fw_mk = Path(__file__).resolve().parents[5] / "stm32h743-etm-trace-firmware" / "Makefile"
+    if not fw_mk.exists():
+        issues.append(f"L0 firmware repo Makefile not found ({fw_mk})")
     return issues
 
 
