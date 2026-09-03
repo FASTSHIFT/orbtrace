@@ -1,0 +1,6 @@
+# RIGOL USBTMC (MSO8304A etc.) -- allow plugdev group access without sudo.
+# Install: sudo cp 60-rigol-usbtmc.rules /etc/udev/rules.d/
+#          sudo udevadm control --reload-rules && sudo udevadm trigger
+# User must be a member of 'plugdev'.
+SUBSYSTEM=="usbmisc", KERNEL=="usbtmc*", ATTRS{idVendor}=="1ab1", GROUP="plugdev", MODE="0660"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1ab1", GROUP="plugdev", MODE="0660"
