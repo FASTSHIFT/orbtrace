@@ -49,3 +49,5 @@ syn/artix7/*.v.bak
 trc_pkt_lister.ppl
 # stream_grab: C build artefact from scripts/stream_grab.c
 syn/artix7/bringup/scripts/stream_grab
+syn/artix7/bringup/sim/bad_bytes.csv
+*.vvp

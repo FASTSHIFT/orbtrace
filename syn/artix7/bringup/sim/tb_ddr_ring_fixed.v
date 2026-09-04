@@ -167,21 +167,37 @@ module tb_ddr_ring_fixed;
 
     // Stall parameters (deliberately conservative; scale up if P0-1 doesn't
     // reproduce ≥0.1% pollution).
+`ifdef HEAVY_STALL
+    localparam integer WDF_STALL_CLK   = 200;
+    localparam integer RDY_STALL_CLK   = 200;
+    localparam integer RD_LAT_BASE     = 20;
+    localparam integer RD_LAT_JITTER   = 80;
+    localparam integer NET_STALL_EVERY = 50;
+    localparam integer NET_STALL_LEN   = 30;
+`else
     localparam integer WDF_STALL_CLK   = 40;   // app_wdf_rdy low after each beat
     localparam integer RDY_STALL_CLK   = 60;   // app_rdy low after each burst cmd
     localparam integer RD_LAT_BASE     = 6;    // base read latency
     localparam integer RD_LAT_JITTER   = 20;   // random jitter added to base
     localparam integer NET_STALL_EVERY = 100;  // stream_tready pulse-low every N clk
     localparam integer NET_STALL_LEN   = 10;   // ... for this many clk
+`endif
 
     localparam integer MEM_WORDS = 8192;
     reg [127:0] mem [0:MEM_WORDS-1];
     integer i0;
+    // r37 §1.3 cross-alignment: allow mem init override to prove "错值 = DDR 内容"
+    // is stable across all pre-write values (not an artefact of 0x11 specifically).
 `ifdef SIM_MEM_INIT_11
-    initial for (i0 = 0; i0 < MEM_WORDS; i0 = i0 + 1) mem[i0] = 128'h11111111_11111111_11111111_11111111;
+    localparam [127:0] MEM_INIT_VAL = 128'h11111111_11111111_11111111_11111111;
+`elsif SIM_MEM_INIT_00
+    localparam [127:0] MEM_INIT_VAL = 128'h00000000_00000000_00000000_00000000;
+`elsif SIM_MEM_INIT_FF
+    localparam [127:0] MEM_INIT_VAL = 128'hFFFFFFFF_FFFFFFFF_FFFFFFFF_FFFFFFFF;
 `else
-    initial for (i0 = 0; i0 < MEM_WORDS; i0 = i0 + 1) mem[i0] = 128'hDEADBEEF_DEADBEEF_DEADBEEF_DEADBEEF;
+    localparam [127:0] MEM_INIT_VAL = 128'hDEADBEEF_DEADBEEF_DEADBEEF_DEADBEEF;
 `endif
+    initial for (i0 = 0; i0 < MEM_WORDS; i0 = i0 + 1) mem[i0] = MEM_INIT_VAL;
 
     // app_wdf_rdy stall: after each accepted data beat, hold low for
     // WDF_STALL_CLK cycles (models MIG write-data FIFO drain to physical DDR3).
@@ -219,10 +235,65 @@ module tb_ddr_ring_fixed;
     end
     assign app_rdy = rdy_r;
 
-    // Write path: latch data into mem on wdf_wren & wdf_rdy (real MIG behaviour).
+    // ---- Correct MIG write model (r37 §2.3 tb fix) --------------------
+    // In real MIG, app_addr is captured on each cmd-accept and app_wdf_data
+    // is captured on each data-accept; MIG internally pairs them in insertion
+    // order. When we stall wdf/rdy asymmetrically, at data-accept time
+    // app_addr no longer corresponds to the correct beat (since app_addr
+    // advances only on cmd-accept in the writer). A naive
+    // `mem[app_addr] <= app_wdf_data` model drops the address<->data pairing
+    // and leaves some addresses UNWRITTEN — a tb artifact that would falsely
+    // reproduce "H7" pollution.
+    //
+    // Fix: FIFO of pending (addr) at cmd-accept; drain into mem on data-accept.
+    localparam integer WQ_DEPTH = 256;   // >= 4 bursts worth (LENGTH=64)
+    reg [28:0] wq_addr [0:WQ_DEPTH-1];
+    reg [7:0]  wq_head = 0, wq_tail = 0;
+    integer wq_writes = 0, wq_drains = 0;
+    initial for (i0 = 0; i0 < WQ_DEPTH; i0 = i0 + 1) wq_addr[i0] = 29'd0;
+    // Only enqueue write commands, not read commands (rd_ctrl also drives
+    // app_en when wr_busy=0 via the mux above).
+    //
+    // Realistic MIG semantics: cmd and data are independent streams; MIG
+    // pairs them in insertion order. If data arrives before its matching cmd
+    // it must WAIT (MIG buffers up to a small write-data FIFO). We model this
+    // by a data queue in parallel with the addr queue; a mem write happens
+    // only when BOTH heads are populated.
+    wire wr_cmd_accept = wr_busy && wr_app_en && app_rdy;
+    wire wdf_accept    = app_wdf_wren && app_wdf_rdy;
+    reg [127:0] wq_data [0:WQ_DEPTH-1];
+    reg [7:0]   wq_dh = 0, wq_dt = 0;      // data head / tail (8-bit is fine for depth<=256)
+    initial for (i0 = 0; i0 < WQ_DEPTH; i0 = i0 + 1) wq_data[i0] = 128'd0;
+
+    // Enqueue cmd addr on wr_cmd_accept, enqueue data on wdf_accept.
     always @(posedge clk) begin
-        if (app_wdf_wren & app_wdf_rdy)
-            mem[app_addr[15:3]] <= app_wdf_data;
+        if (rst_ui) begin wq_tail <= 0; wq_dt <= 0; wq_head <= 0; wq_dh <= 0; end
+        else begin
+            if (wr_cmd_accept) begin
+                wq_addr[wq_tail] <= wr_app_addr;
+                wq_tail <= wq_tail + 1;
+                wq_writes <= wq_writes + 1;
+            end
+            if (wdf_accept) begin
+                wq_data[wq_dt] <= app_wdf_data;
+                wq_dt <= wq_dt + 1;
+            end
+        end
+    end
+
+    // Pair heads: whenever both queues have entries, commit one mem write.
+    // Using a small state to advance one commit per clk (matches MIG's
+    // committed-order semantics).
+    wire cmd_avail  = (wq_tail != wq_head);
+    wire data_avail = (wq_dt   != wq_dh);
+    always @(posedge clk) begin
+        if (rst_ui) begin /* heads reset above */ end
+        else if (cmd_avail && data_avail) begin
+            mem[wq_addr[wq_head][15:3]] <= wq_data[wq_dh];
+            wq_head   <= wq_head + 1;
+            wq_dh     <= wq_dh   + 1;
+            wq_drains <= wq_drains + 1;
+        end
     end
 
     // Read path with jittery latency. Read command is app_en && cmd==1 && rdy.
@@ -320,6 +391,137 @@ module tb_ddr_ring_fixed;
         end
     end
 
+    // ---- r37 §2.3 experiment D: H7-A/B/C variant probes ------------------
+    // For each streamer read burst we ask: at the moment ddr3_rd_start goes
+    // high, is mem[rd_addr] already the committed "0x42×16" pattern, or is it
+    // still stale (equal to MEM_INIT_VAL)? This distinguishes H7-A/C ("streamer
+    // shot before writer's data physically landed") from H7-B ("wbuf/out_idx
+    // race — write path itself corrupts the mem contents").
+    //
+    // In parallel we count end_cmd_cnt vs end_data_cnt skew inside the vendor
+    // wr_ctrl: H7-A/C requires cmd finishing before data (cmd_first > 0), while
+    // H7-B is orthogonal (cmd/data can be simultaneous).
+    //
+    // Enabled by default (SIM_H7_PROBE gate kept for future gated builds).
+    localparam [127:0] COMMITTED_PATTERN_FIXED = {16{8'h42}};
+    integer rd_at_stale       = 0;
+    integer rd_at_committed   = 0;
+    integer rd_at_other       = 0;
+    integer cmd_first_cnt     = 0;
+    integer data_first_cnt    = 0;
+    integer same_clk_cnt      = 0;
+    integer cmd_data_max_skew = 0;
+    integer cur_skew          = 0;
+    integer end_cmd_pulses    = 0;
+    integer end_data_pulses   = 0;
+    reg     cmd_pending       = 1'b0;   // cmd finished but data hasn't
+    reg     data_pending      = 1'b0;   // data finished but cmd hasn't
+
+    // Sample committed-ness of first word in the read burst on rd_start rising.
+    // Note: ddr3_rd_addr is set the clk *before* rd_start goes high (per
+    // streamer R_START), so on the rd_start clk we look at mem[rd_addr>>3].
+    always @(posedge clk) begin
+        if (rd_start) begin
+`ifdef RAMP
+            // In ramp mode we don't have a fixed committed pattern; compare
+            // against MEM_INIT_VAL only.
+            if (mem[rd_addr[15:3]] == MEM_INIT_VAL)
+                rd_at_stale <= rd_at_stale + 1;
+            else
+                rd_at_committed <= rd_at_committed + 1;
+`else
+            if (mem[rd_addr[15:3]] == COMMITTED_PATTERN_FIXED)
+                rd_at_committed <= rd_at_committed + 1;
+            else if (mem[rd_addr[15:3]] == MEM_INIT_VAL)
+                rd_at_stale <= rd_at_stale + 1;
+            else
+                rd_at_other <= rd_at_other + 1;
+`endif
+        end
+    end
+
+    // Track end_cmd_cnt vs end_data_cnt ordering *inside the same burst*.
+    // A burst starts on ddr3_wr_start (from writer) and finishes when both
+    // end_cmd_cnt and end_data_cnt have pulsed. We tag which one fired first.
+    // Bind hierarchical ref to local wires for readability + iverilog stability.
+    // end_cmd_cnt = app_en & app_rdy & (cmd_cnt==MAX_NUM)
+    // end_data_cnt = app_wdf_wren & app_wdf_rdy & (data_cnt==MAX_NUM)
+    // We re-derive here to avoid iverilog hierarchical-ref quirks.
+    wire end_cmd_w  = wr_app_en && app_rdy && (u_wrc.cmd_cnt == (LENGTH-1));
+    wire end_data_w = app_wdf_wren && app_wdf_rdy && (u_wrc.data_cnt == (LENGTH-1));
+    always @(posedge clk) begin
+        if (end_cmd_w)  end_cmd_pulses  <= end_cmd_pulses  + 1;
+        if (end_data_w) end_data_pulses <= end_data_pulses + 1;
+    end
+    always @(posedge clk) begin
+        if (rst_ui) begin
+            cmd_pending  <= 0; data_pending <= 0; cur_skew <= 0;
+        end else begin
+            // Case 1: cmd was already pending (cmd fired earlier alone) and
+            //         data arrives now -> H7-A/C (cmd-first) closure
+            if (cmd_pending && end_data_w) begin
+                cmd_first_cnt <= cmd_first_cnt + 1;
+                if (cur_skew > cmd_data_max_skew) cmd_data_max_skew <= cur_skew;
+                cmd_pending <= 1'b0;
+                cur_skew    <= 0;
+                // if cmd also fires now start a new pending pair on cmd side
+                if (end_cmd_w) cmd_pending <= 1'b1;
+            end
+            // Case 2: data was pending, cmd arrives -> data-first closure
+            else if (data_pending && end_cmd_w) begin
+                data_first_cnt <= data_first_cnt + 1;
+                data_pending <= 1'b0;
+                cur_skew     <= 0;
+                if (end_data_w) data_pending <= 1'b1;
+            end
+            // Case 3: both fire same clk with nothing pending -> tied
+            else if (end_cmd_w && end_data_w) begin
+                same_clk_cnt <= same_clk_cnt + 1;
+                cur_skew     <= 0;
+            end
+            // Case 4: cmd alone -> start cmd-pending
+            else if (end_cmd_w) begin
+                cmd_pending <= 1'b1;
+                cur_skew    <= 0;
+            end
+            // Case 5: data alone -> start data-pending
+            else if (end_data_w) begin
+                data_pending <= 1'b1;
+                cur_skew     <= 0;
+            end
+            // Case 6: pending in flight -> tick skew
+            else if (cmd_pending || data_pending) begin
+                cur_skew <= cur_skew + 1;
+            end
+        end
+    end
+
+    // Per-word committedness probe: for every mem lookup driven by a read cmd
+    // (app_en && app_cmd==1 && app_rdy), record whether the mem word at that
+    // address is committed (COMMITTED_PATTERN_FIXED) or stale (MEM_INIT_VAL).
+    // This catches H7-A/C where wr_ptr advanced before ALL words of the burst
+    // were committed (rd_start-only sampling only sees the first word).
+    integer rd_word_at_committed = 0;
+    integer rd_word_at_stale     = 0;
+    integer rd_word_at_other     = 0;
+    always @(posedge clk) begin
+        if (app_en && (app_cmd == 3'd1) && app_rdy) begin
+`ifdef RAMP
+            if (mem[app_addr[15:3]] == MEM_INIT_VAL)
+                rd_word_at_stale <= rd_word_at_stale + 1;
+            else
+                rd_word_at_committed <= rd_word_at_committed + 1;
+`else
+            if (mem[app_addr[15:3]] == COMMITTED_PATTERN_FIXED)
+                rd_word_at_committed <= rd_word_at_committed + 1;
+            else if (mem[app_addr[15:3]] == MEM_INIT_VAL)
+                rd_word_at_stale <= rd_word_at_stale + 1;
+            else
+                rd_word_at_other <= rd_word_at_other + 1;
+`endif
+        end
+    end
+
     // ---- stimulus ----
     integer i;
     initial begin
@@ -334,6 +536,7 @@ module tb_ddr_ring_fixed;
         repeat (200000) @(posedge clk);
 
         $display("==== fixed-source diag ====");
+        $display("mem init value: %h", MEM_INIT_VAL);
         $display("words_written = %0d, words_drained = %0d", words_written, words_drained);
         $display("wr_lost = %0d, ring_overrun = %0b", wr_lost_bytes, ring_overrun);
         $display("stream bytes received = %0d, non-0x42 count = %0d", rx_cnt, bad_cnt);
@@ -341,6 +544,22 @@ module tb_ddr_ring_fixed;
         for (i = 0; i < 32 && i < rx_cnt; i = i + 1)
             $write(" %02x", rx_bytes[i]);
         $display("");
+        // r37 experiment D result summary
+        $display("---- H7-A/B/C probe (r37 §2.3) ----");
+        $display("rd_start @committed        = %0d", rd_at_committed);
+        $display("rd_start @stale            = %0d", rd_at_stale);
+        $display("rd_start @other            = %0d", rd_at_other);
+        $display("per-word rd @committed     = %0d", rd_word_at_committed);
+        $display("per-word rd @stale         = %0d", rd_word_at_stale);
+        $display("per-word rd @other         = %0d", rd_word_at_other);
+        $display("wq addr enqueues                : %0d", wq_writes);
+        $display("wq data drains (mem writes)     : %0d", wq_drains);
+        $display("end_cmd_cnt total pulses        : %0d", end_cmd_pulses);
+        $display("end_data_cnt total pulses       : %0d", end_data_pulses);
+        $display("end_cmd_cnt before end_data_cnt : %0d", cmd_first_cnt);
+        $display("end_data_cnt before end_cmd_cnt : %0d", data_first_cnt);
+        $display("same-clk                        : %0d", same_clk_cnt);
+        $display("max cmd->data skew (clk)        : %0d", cmd_data_max_skew);
         if (bad_cnt == 0 && rx_cnt > 0) begin
             $display("RESULT=ALL_PASS (all received bytes == 0x42)");
         end else if (rx_cnt == 0) begin

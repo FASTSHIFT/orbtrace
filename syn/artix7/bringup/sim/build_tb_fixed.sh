@@ -10,6 +10,9 @@ for a in "$@"; do
         ramp)     DEFS="$DEFS -DRAMP" ;;
         tag_seq)  DEFS="$DEFS -DSIM_TAG_SEQ" ;;      # r36 P0-2 H1 probe
         mem_11)   DEFS="$DEFS -DSIM_MEM_INIT_11" ;;  # r36 P0-2 H7 corroboration
+        mem_00)   DEFS="$DEFS -DSIM_MEM_INIT_00" ;;  # r37 §1.3 cross-align
+        mem_ff)   DEFS="$DEFS -DSIM_MEM_INIT_FF" ;;  # r37 §1.3 cross-align
+        heavy)    DEFS="$DEFS -DHEAVY_STALL" ;;      # r37 corrective sweep
     esac
 done
 BRINGUP=..
