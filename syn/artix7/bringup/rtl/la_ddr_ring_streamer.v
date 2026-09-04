@@ -216,7 +216,11 @@ module la_ddr_ring_streamer #(
                         // MONOTONIC seq: absolute drained-word index / PKT_WORDS
                         // (wrap-independent, so a NACK for seq S maps to a
                         // unique DDR address across ring laps).
+`ifdef SIM_TAG_SEQ
+                        f_wr_seq   <= 32'hA5A5_5A5A;   // r36 P0-2 H1 probe
+`else
                         f_wr_seq   <= words_drained / PKT_WORDS;
+`endif
                         f_wr_rtx   <= 1'b0;
                         f_wr_valid <= 1'b1;
                         cur_word_idx <= cur_word_idx + 29'd1;
@@ -241,7 +245,11 @@ module la_ddr_ring_streamer #(
                 X_RUN: begin
                     if (ddr3_rd_data_vld) begin
                         f_wr_data  <= ddr3_rd_data;
+`ifdef SIM_TAG_SEQ
+                        f_wr_seq   <= 32'hA5A5_5A5A;   // r36 P0-2 H1 probe
+`else
                         f_wr_seq   <= rtx_abs_word / PKT_WORDS;
+`endif
                         f_wr_rtx   <= 1'b1;               // mark retransmit
                         f_wr_valid <= 1'b1;
                         rtx_abs_word   <= rtx_abs_word + 32'd1;

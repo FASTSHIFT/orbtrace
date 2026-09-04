@@ -154,47 +154,167 @@ module tb_ddr_ring_fixed;
         .ddr3_wr_ack(wr_ack), .ddr3_rd_ack(rd_ack)
     );
 
-    // Behavioural MIG (identical to tb_la_ddr_ring)
+    // ---- Behavioural MIG with realistic stalls (P0-1 per r36 §4.1) ---------
+    // r36 硬伤 B: the trivial MIG model in tb_la_ddr_ring never stalls, so the
+    // "concurrent R/W" race window that only opens when write bursts take real
+    // physical time is compressed to zero. Add four stall/latency knobs so the
+    // TB can *cover* the on-board race mechanism before we accept or reject any
+    // hypothesis (蓝方 partial-write / 红方 H1 FIFO leak / H5 wbuf skew / ...).
+    //
+    // Enabled by default (WITH_MIG_STALL default 1). Set to 0 to run the
+    // baseline model (matches tb_la_ddr_ring.v).
+    localparam integer WITH_MIG_STALL = 1;
+
+    // Stall parameters (deliberately conservative; scale up if P0-1 doesn't
+    // reproduce ≥0.1% pollution).
+    localparam integer WDF_STALL_CLK   = 40;   // app_wdf_rdy low after each beat
+    localparam integer RDY_STALL_CLK   = 60;   // app_rdy low after each burst cmd
+    localparam integer RD_LAT_BASE     = 6;    // base read latency
+    localparam integer RD_LAT_JITTER   = 20;   // random jitter added to base
+    localparam integer NET_STALL_EVERY = 100;  // stream_tready pulse-low every N clk
+    localparam integer NET_STALL_LEN   = 10;   // ... for this many clk
+
     localparam integer MEM_WORDS = 8192;
     reg [127:0] mem [0:MEM_WORDS-1];
     integer i0;
+`ifdef SIM_MEM_INIT_11
+    initial for (i0 = 0; i0 < MEM_WORDS; i0 = i0 + 1) mem[i0] = 128'h11111111_11111111_11111111_11111111;
+`else
     initial for (i0 = 0; i0 < MEM_WORDS; i0 = i0 + 1) mem[i0] = 128'hDEADBEEF_DEADBEEF_DEADBEEF_DEADBEEF;
-    assign app_rdy     = 1'b1;
-    assign app_wdf_rdy = 1'b1;
+`endif
+
+    // app_wdf_rdy stall: after each accepted data beat, hold low for
+    // WDF_STALL_CLK cycles (models MIG write-data FIFO drain to physical DDR3).
+    reg  [15:0] wdf_stall_cnt = 0;
+    reg         wdf_rdy_r     = 1'b1;
+    always @(posedge clk) begin
+        if (rst_ui) begin wdf_stall_cnt <= 0; wdf_rdy_r <= 1'b1; end
+        else if (WITH_MIG_STALL == 0) wdf_rdy_r <= 1'b1;
+        else if (app_wdf_wren && wdf_rdy_r) begin
+            wdf_stall_cnt <= WDF_STALL_CLK;
+            wdf_rdy_r     <= 1'b0;
+        end else if (wdf_stall_cnt != 0) begin
+            wdf_stall_cnt <= wdf_stall_cnt - 1'b1;
+        end else begin
+            wdf_rdy_r <= 1'b1;
+        end
+    end
+    assign app_wdf_rdy = wdf_rdy_r;
+
+    // app_rdy stall: after each accepted command (app_en pulse), hold low for
+    // RDY_STALL_CLK cycles (models MIG bank activate/precharge time).
+    reg  [15:0] rdy_stall_cnt = 0;
+    reg         rdy_r         = 1'b1;
+    always @(posedge clk) begin
+        if (rst_ui) begin rdy_stall_cnt <= 0; rdy_r <= 1'b1; end
+        else if (WITH_MIG_STALL == 0) rdy_r <= 1'b1;
+        else if (app_en && rdy_r) begin
+            rdy_stall_cnt <= RDY_STALL_CLK;
+            rdy_r         <= 1'b0;
+        end else if (rdy_stall_cnt != 0) begin
+            rdy_stall_cnt <= rdy_stall_cnt - 1'b1;
+        end else begin
+            rdy_r <= 1'b1;
+        end
+    end
+    assign app_rdy = rdy_r;
+
+    // Write path: latch data into mem on wdf_wren & wdf_rdy (real MIG behaviour).
     always @(posedge clk) begin
         if (app_wdf_wren & app_wdf_rdy)
             mem[app_addr[15:3]] <= app_wdf_data;
     end
-    reg [127:0] rd_reg1 = 0, rd_reg2 = 0;
-    reg         rd_v1 = 0, rd_v2 = 0;
-    always @(posedge clk) begin
-        rd_reg1 <= mem[app_addr[15:3]];
-        rd_v1   <= app_en && app_cmd == 3'd1;
-        rd_reg2 <= rd_reg1; rd_v2 <= rd_v1;
-    end
-    assign app_rd_data       = rd_reg2;
-    assign app_rd_data_valid = rd_v2;
-    assign app_rd_data_end   = rd_v2;
 
-    // ---- byte tap: capture stream_tdata into a queue for later inspection ----
+    // Read path with jittery latency. Read command is app_en && cmd==1 && rdy.
+    // Instead of a fixed 2-stage pipe we push {addr, valid} into a small shift
+    // register keyed by RD_LAT_BASE + $random%RD_LAT_JITTER so different reads
+    // can interleave differently.
+    localparam integer RD_MAX_LAT = RD_LAT_BASE + RD_LAT_JITTER + 4;
+    reg         rd_lat_v [0:RD_MAX_LAT-1];
+    reg [127:0] rd_lat_d [0:RD_MAX_LAT-1];
+    integer rk;
+    initial for (rk = 0; rk < RD_MAX_LAT; rk = rk + 1) begin
+        rd_lat_v[rk] = 0; rd_lat_d[rk] = 0;
+    end
+    reg [31:0] rand_seed = 32'h1;
+    always @(posedge clk) begin
+        // shift the pipe forward every clock
+        for (rk = RD_MAX_LAT - 1; rk > 0; rk = rk - 1) begin
+            rd_lat_v[rk] <= rd_lat_v[rk-1];
+            rd_lat_d[rk] <= rd_lat_d[rk-1];
+        end
+        rd_lat_v[0] <= 1'b0;
+        // accept a read cmd only when ready
+        if (app_en && (app_cmd == 3'd1) && app_rdy) begin
+            // deterministic pseudo-random jitter derived from addr to avoid $random
+            // side effects on other RNG consumers.
+            rand_seed <= rand_seed ^ {app_addr, 3'b0};
+            // slot the data at (RD_LAT_BASE + rand%RD_LAT_JITTER)
+            begin : slot_it
+                integer slot;
+                if (WITH_MIG_STALL == 0) slot = 2;
+                else slot = RD_LAT_BASE + (rand_seed[7:0] % (RD_LAT_JITTER==0?1:RD_LAT_JITTER));
+                rd_lat_v[slot] <= 1'b1;
+                rd_lat_d[slot] <= mem[app_addr[15:3]];
+            end
+        end
+    end
+    assign app_rd_data       = rd_lat_d[RD_MAX_LAT-1];
+    assign app_rd_data_valid = rd_lat_v[RD_MAX_LAT-1];
+    assign app_rd_data_end   = rd_lat_v[RD_MAX_LAT-1];
+
+    // Network backpressure: pulse stream_tready low every NET_STALL_EVERY clk
+    // for NET_STALL_LEN clk to simulate downstream slower than writer.
+    reg [15:0] net_stall_cnt = 0;
+    reg        net_stall_active = 0;
+    always @(posedge clk125) begin
+        if (rst_sys) begin net_stall_cnt <= 0; net_stall_active <= 0; end
+        else if (WITH_MIG_STALL == 0) net_stall_active <= 0;
+        else begin
+            net_stall_cnt <= net_stall_cnt + 1'b1;
+            if (net_stall_cnt == NET_STALL_EVERY) begin
+                net_stall_active <= 1'b1;
+                net_stall_cnt <= 0;
+            end else if (net_stall_active && net_stall_cnt == NET_STALL_LEN) begin
+                net_stall_active <= 1'b0;
+                net_stall_cnt <= 0;
+            end
+        end
+    end
+    // (stream_tready is a reg initialised to 1; drive it here instead)
+    always @(*) stream_tready = (WITH_MIG_STALL == 0) ? 1'b1 : ~net_stall_active;
+
+    // ---- byte tap: capture stream_tdata + log every bad byte ---------------
+    // r36 §4.1 P1 step 5: dump each (rx_offset, expected, actual) so pattern
+    // is inspectable offline.
     integer rx_cnt = 0;
     integer bad_cnt = 0;
+    integer bad_fd  = 0;
     reg [7:0] rx_bytes [0:255];
 `ifdef RAMP
-    // in ramp mode, verify byte k == prev+1 mod 256
     reg [7:0] rx_prev = 0;
     reg       have_prev = 0;
 `endif
+    initial bad_fd = $fopen("bad_bytes.csv", "w");
     always @(posedge clk125) begin
         if (stream_tvalid && stream_tready) begin
             if (rx_cnt < 256) rx_bytes[rx_cnt] <= stream_tdata;
 `ifdef RAMP
-            if (have_prev && stream_tdata !== ((rx_prev + 8'd1) & 8'hFF))
+            if (have_prev && stream_tdata !== ((rx_prev + 8'd1) & 8'hFF)) begin
                 bad_cnt <= bad_cnt + 1;
+                if (bad_fd) $fdisplay(bad_fd, "%0d,%0d,%02x,%02x,%08x,%b",
+                    $time, rx_cnt, (rx_prev + 8'd1) & 8'hFF, stream_tdata,
+                    stream_seq, stream_rtx);
+            end
             rx_prev   <= stream_tdata;
             have_prev <= 1'b1;
 `else
-            if (stream_tdata !== 8'h42) bad_cnt <= bad_cnt + 1;
+            if (stream_tdata !== 8'h42) begin
+                bad_cnt <= bad_cnt + 1;
+                if (bad_fd) $fdisplay(bad_fd, "%0d,%0d,42,%02x,%08x,%b",
+                    $time, rx_cnt, stream_tdata,
+                    stream_seq, stream_rtx);
+            end
 `endif
             rx_cnt <= rx_cnt + 1;
         end
