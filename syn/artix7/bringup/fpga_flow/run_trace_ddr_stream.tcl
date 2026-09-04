@@ -112,17 +112,6 @@ set_clock_groups -asynchronous \
 set_false_path -from [get_pins rst_sync_reg[3]/C] \
                -to [get_pins -hier -filter {NAME =~ *rgmii_phy_if_inst*rx_rst_reg_reg*/PRE}]
 
-# Quasi-static CSR crossings (clk125 -> clk200) for the trace_capture_a7
-# IDELAY tap / eye delay values. These are written at rest and captured by
-# a 2FF synchroniser inside trace_ddr_stream_top; false-path so Vivado
-# doesn't try to close the async setup path.
-set_false_path -from [get_cells {tap_csr_reg* tap_lane_csr_reg* tap_clk_csr_reg* tap_ld_reg eye_csr_reg* selftest_csr_reg* src_fixed_125_reg}] \
-               -to   [get_cells {tap0_s0_reg* tap1_s0_reg* tap2_s0_reg* tap3_s0_reg* tapc_s0_reg* tap_ld_s0_reg eye_s0_reg* selftest_s0_reg src_fixed_s0_reg}]
-
-# snap_tog toggle is the only bit that crosses ui_clk -> clk125 for the
-# writer/streamer snapshot; the toggle handshake is intentionally async.
-set_false_path -from [get_cells snap_tog_reg] -to [get_cells tog_s0_reg]
-
 opt_design
 place_design
 route_design
