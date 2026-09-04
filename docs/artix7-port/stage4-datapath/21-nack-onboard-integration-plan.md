@@ -133,10 +133,21 @@ STM32/DAPLink 可完全断开，只留 FPGA + 网线。
 - `wr_done` / `rd_done` 交替出现，比例 1:1
 
 **S1a 完成后我们得到**：
-- 板上 DDR3 硬件（DIMM 或板载 IC）在 400 MHz 下**零错**
+- 板上 DDR3 硬件（板载 IC）在 400 MHz 下**零错**
 - Vivado 2021.1 + MIG IP + XDC 引脚映射**综合流可用**
 - orbtrace 的 `ddr3_ctrl / ddr3_wr_ctrl / ddr3_rd_ctrl / ddr3_arbit`（与 demo 同源）行为一致
-- 上板 flow（openFPGALoader + Hardware Manager + ILA）就绪
+- 上板 flow（openFPGALoader + `fpga_health.py` / `ddr_selftest_status.py`）就绪
+
+**⚠️ 便宜路径**：orbtrace 已有 `trace_ddr_selftest_top.v` + `run_trace_ddr_selftest.tcl`，
+就是厂商 `21_ddr3_test` 的移植版并加了以太网 :5001 状态出口。直接综合它、烧、跑
+`scripts/ddr_selftest_status.py`（读 0xFF50-0xFF73），不用抄厂商工程也不用 ILA。
+
+**2026-09-04 S1a 实测结果** ✅：BUILD_ID `0x6a9a3fc7`（trace_ddr_selftest.bit）烧板后：
+- magic 0xD3、MIG calib OK、local calib OK、error sticky clean
+- errc=0（10 s 观察全程零错）
+- pass bytes 688→703 MB（~1.6 MB/s 写-读-比对，WRITE/READ FSM 交替）
+
+**结论**：DDR3 硬件 + MIG IP + `ddr3_ctrl` 抽象层在这块板上零错。基础设施就绪，进 S1b。
 
 ### 3.4 S1b 落地清单
 
