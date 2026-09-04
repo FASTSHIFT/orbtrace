@@ -47,3 +47,5 @@ syn/artix7/*.v.bak
 # Local OpenCSD CLI build artifact (190MB, do not commit — exceeds GitHub limit)
 *.ppl
 trc_pkt_lister.ppl
+# stream_grab: C build artefact from scripts/stream_grab.c
+syn/artix7/bringup/scripts/stream_grab
