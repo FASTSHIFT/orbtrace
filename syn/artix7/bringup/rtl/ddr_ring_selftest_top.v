@@ -148,7 +148,11 @@ module ddr_ring_selftest_top #(
     reg [7:0] ramp = 8'd0;
     reg       ramp_valid = 0;
     reg       calib_done = 0;
+`ifdef ILA_DEBUG
+    (* mark_debug = "true" *) reg       src_fixed_125 = 1'b0;
+`else
     reg       src_fixed_125 = 1'b0;              // clk125-domain CSR bit
+`endif
     reg       src_fixed_s0 = 0, src_fixed = 0;
     always @(posedge ui_clk) begin
         src_fixed_s0 <= src_fixed_125;
@@ -192,6 +196,18 @@ module ddr_ring_selftest_top #(
     );
 
     // ============= streamer (DDR ring -> UDP, ui_clk + clk125) ==========
+`ifdef ILA_DEBUG
+    (* mark_debug = "true" *) wire [7:0]  stream_tdata;
+    (* mark_debug = "true" *) wire        stream_tvalid;
+    wire        stream_tready;
+    (* mark_debug = "true" *) wire [31:0] stream_seq;
+    (* mark_debug = "true" *) wire        stream_rtx;
+    wire [28:0] rd_ptr_words;
+    wire [31:0] words_drained;
+    (* mark_debug = "true" *) wire        ring_overrun;
+    (* mark_debug = "true" *) wire        nack_busy;
+    (* mark_debug = "true" *) wire        nack_fail;
+`else
     wire [7:0]  stream_tdata;
     wire        stream_tvalid;
     wire        stream_tready;
@@ -201,6 +217,7 @@ module ddr_ring_selftest_top #(
     wire [31:0] words_drained;
     wire        ring_overrun;
     wire        nack_busy, nack_fail;
+`endif
 
     la_ddr_ring_streamer #(
         .LENGTH(LENGTH),
@@ -247,10 +264,17 @@ module ddr_ring_selftest_top #(
     // per PKT_WORDS*16 bytes of ring content, so we frame with a 4-byte BE seq
     // header prepended once per packet, then STREAM_PAYLOAD data bytes.
     localparam integer PKT = STREAM_PAYLOAD + 4;
+`ifdef ILA_DEBUG
+    (* mark_debug = "true" *) reg  [15:0] pos = 0;
+    (* mark_debug = "true" *) reg  [31:0] pkt_seq = 0;
+    (* mark_debug = "true" *) reg         pkt_active = 0;
+    (* mark_debug = "true" *) reg  [31:0] latched_seq = 0;
+`else
     reg  [15:0] pos = 0;
     reg  [31:0] pkt_seq = 0;
     reg         pkt_active = 0;
     reg  [31:0] latched_seq = 0;
+`endif
 
     // Latch the streamer seq at packet start (first byte of a payload chunk).
     // The streamer's stream_seq is stable across a packet's bytes.
@@ -259,13 +283,19 @@ module ddr_ring_selftest_top #(
                            (pos == 16'd1) ? latched_seq[23:16] :
                            (pos == 16'd2) ? latched_seq[15:8]  :
                                             latched_seq[7:0];
+`ifdef ILA_DEBUG
+    (* mark_debug = "true" *) wire        pkt_tready;
+    (* mark_debug = "true" *) wire        pkt_tvalid = pkt_active & (in_header | stream_tvalid);
+    (* mark_debug = "true" *) wire [7:0]  pkt_tdata  = in_header ? seq_byte : stream_tdata;
+`else
     wire        pkt_tready;
+    wire        pkt_tvalid = pkt_active & (in_header | stream_tvalid);
+    wire [7:0]  pkt_tdata  = in_header ? seq_byte : stream_tdata;
+`endif
     // Advance the streamer only when fpga_core_net actually consumes a payload
     // byte from us (payload phase && our valid && fpga ready). Otherwise the
     // streamer would rush ahead and the received bytes get scrambled.
-    wire        pkt_tvalid = pkt_active & (in_header | stream_tvalid);
     assign      stream_tready = pkt_active & ~in_header & pkt_tready & pkt_tvalid;
-    wire [7:0]  pkt_tdata  = in_header ? seq_byte : stream_tdata;
 
     always @(posedge clk125) begin
         if (sys_rst) begin pos <= 0; pkt_active <= 0; pkt_seq <= 0; latched_seq <= 0; stream_pause_125 <= 0; end
@@ -286,6 +316,71 @@ module ddr_ring_selftest_top #(
                 if (pos == PKT-1) begin
                     pos <= 0; pkt_seq <= pkt_seq + 1'b1; pkt_active <= 1'b0;
                 end else pos <= pos + 1'b1;
+            end
+        end
+    end
+
+    // ============= r38 P0-4 diagnostic latches (clk125) =================
+    // The on-board 0.39% pollution needs the actual bad byte value + its seq
+    // to distinguish "streamer emitted bad byte" from "packetiser corrupted
+    // byte on the way to fpga_core_net". These sticky latches let a CSR
+    // reader query the FPGA-side view without any ILA/hw_manager dance.
+    //
+    // All in clk125 domain (same as pkt_tdata / stream_tdata / stream_tvalid).
+    // Latch on the FIRST bad byte observed since reset (or since clr via CSR
+    // 0x0C = 1 write); stream_pulses / bad_byte_count keep counting.
+    reg [7:0]  bad_byte_val  = 0;
+    reg [7:0]  bad_byte_pos  = 0;   // pos[7:0] at time of latch (packet offset)
+    reg [31:0] bad_byte_seq  = 0;
+    reg [7:0]  bad_stream_td = 0;   // stream_tdata at same tick (before mux)
+    reg        bad_byte_latched = 0;
+    reg [31:0] bad_byte_count   = 0;
+    reg [31:0] stream_pulses    = 0;  // (stream_tvalid & stream_tready)
+    reg [31:0] pkt_active_pulses = 0; // rising edges of pkt_active
+    reg        pkt_active_d = 0;
+    reg        diag_clear_125 = 0;
+
+    always @(posedge clk125) begin
+        pkt_active_d <= pkt_active;
+        if (sys_rst) begin
+            bad_byte_val     <= 0;  bad_byte_pos <= 0;
+            bad_byte_seq     <= 0;  bad_stream_td <= 0;
+            bad_byte_latched <= 0;
+            bad_byte_count   <= 0;
+            stream_pulses    <= 0;
+            pkt_active_pulses <= 0;
+            diag_clear_125   <= 0;
+        end else begin
+            // CSR 0x0C = 1 -> clear all diag latches (fire-and-forget).
+            if (csr_we_w && csr_addr_w == 8'h0C && csr_data_w[0]) begin
+                bad_byte_latched  <= 0;
+                bad_byte_count    <= 0;
+                stream_pulses     <= 0;
+                pkt_active_pulses <= 0;
+            end
+
+            // Count pkt_active rising edges (=packets started).
+            if (pkt_active && !pkt_active_d)
+                pkt_active_pulses <= pkt_active_pulses + 1'b1;
+
+            // Count every payload byte handed off from streamer to packetiser.
+            if (stream_tvalid && stream_tready)
+                stream_pulses <= stream_pulses + 1'b1;
+
+            // Bad byte: fire on the WIRE-side (pkt_tdata is what actually
+            // leaves via fpga_core_net). Only in payload phase (pkt_active &&
+            // ~in_header). Only when in 0x42 mode (src_fixed_125).
+            if (src_fixed_125 && pkt_active && !in_header &&
+                pkt_tvalid && pkt_tready &&
+                (pkt_tdata != 8'h42)) begin
+                bad_byte_count <= bad_byte_count + 1'b1;
+                if (!bad_byte_latched) begin
+                    bad_byte_val     <= pkt_tdata;
+                    bad_byte_pos     <= pos[7:0];
+                    bad_byte_seq     <= latched_seq;
+                    bad_stream_td    <= stream_tdata;
+                    bad_byte_latched <= 1'b1;
+                end
             end
         end
     end
@@ -388,15 +483,45 @@ module ddr_ring_selftest_top #(
         (ext_addr == 16'hFF71) ? BUILD_ID[15:8]      :
         (ext_addr == 16'hFF72) ? BUILD_ID[23:16]     :
         (ext_addr == 16'hFF73) ? BUILD_ID[31:24]     :
+        // r38 P0-4 diag latches (0xFF80..0xFF8F)
+        (ext_addr == 16'hFF80) ? 8'hD2               : // magic: diag latches
+        (ext_addr == 16'hFF81) ? {6'b0, src_fixed_125, bad_byte_latched} :
+        (ext_addr == 16'hFF82) ? bad_byte_val        :
+        (ext_addr == 16'hFF83) ? bad_stream_td       :
+        (ext_addr == 16'hFF84) ? bad_byte_pos        :
+        (ext_addr == 16'hFF85) ? bad_byte_seq[7:0]   :
+        (ext_addr == 16'hFF86) ? bad_byte_seq[15:8]  :
+        (ext_addr == 16'hFF87) ? bad_byte_seq[23:16] :
+        (ext_addr == 16'hFF88) ? bad_byte_seq[31:24] :
+        (ext_addr == 16'hFF89) ? bad_byte_count[7:0]    :
+        (ext_addr == 16'hFF8A) ? bad_byte_count[15:8]   :
+        (ext_addr == 16'hFF8B) ? bad_byte_count[23:16]  :
+        (ext_addr == 16'hFF8C) ? bad_byte_count[31:24]  :
+        (ext_addr == 16'hFF8D) ? stream_pulses[7:0]     :
+        (ext_addr == 16'hFF8E) ? stream_pulses[15:8]    :
+        (ext_addr == 16'hFF8F) ? stream_pulses[23:16]   :
+        // 0xFF90..0xFF9F: stream_pulses top byte + pkt_active_pulses
+        (ext_addr == 16'hFF90) ? stream_pulses[31:24]   :
+        (ext_addr == 16'hFF91) ? pkt_active_pulses[7:0] :
+        (ext_addr == 16'hFF92) ? pkt_active_pulses[15:8]:
+        (ext_addr == 16'hFF93) ? pkt_active_pulses[23:16]:
+        (ext_addr == 16'hFF94) ? pkt_active_pulses[31:24]:
         8'h00;
     wire ring_page = (ext_addr[15:8] == 8'hFF) &&
-                     (ext_addr[7:4] >= 4'h5) && (ext_addr[7:4] <= 4'h7);
+                     (ext_addr[7:4] >= 4'h5) && (ext_addr[7:4] <= 4'h9);
     assign ext_data = dbg_page  ? dbg_rdata   :
                       ring_page ? ring_status : 8'h00;
 
+    // NB: STREAM_PKT_BYTES must MATCH the packetiser output length
+    // (STREAM_PAYLOAD + 4 seq header). r38 P0-4 pinpointed the 0.39%
+    // pollution to a 1024 vs 1028 mismatch — fpga_core_net cut UDP frames
+    // at 1024 bytes while the packetiser emitted 1028-byte packets, causing
+    // per-packet 4-byte drift of the seq header into the payload of the
+    // following frame.
     fpga_core_net #(
         .TARGET("XILINX"), .STREAM(1),
-        .STREAM_DEST_IP(DEST_IP), .STREAM_DEST_PORT(DEST_PORT)
+        .STREAM_DEST_IP(DEST_IP), .STREAM_DEST_PORT(DEST_PORT),
+        .STREAM_PKT_BYTES(PKT[15:0])
     ) u_eth (
         .clk(clk125), .clk90(clk125_90), .rst(sys_rst),
         .btnu(1'b0), .btnl(1'b0), .btnd(1'b0), .btnr(1'b0), .btnc(1'b0),
