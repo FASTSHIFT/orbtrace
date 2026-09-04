@@ -1,0 +1,9 @@
+name: resync
+description: "traceIF re-sync and back-to-back frames — expect >= 3 FRAMEs printed"
+sources:
+  - verilog/traceIF.v
+  - verilog/testbeds/traceIF_resync_tb.v
+expect:
+  # The tb prints "FRAME[N] ..." on separate lines; require at least 3.
+  regex: "FRAME\\[0\\][\\s\\S]*FRAME\\[1\\][\\s\\S]*FRAME\\[2\\]"
+tags: [traceif, upstream]

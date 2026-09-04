@@ -1,0 +1,14 @@
+name: la_ddr_ring
+description: "doc 19 P0e/P1/P2/P3 — writer + streamer + NACK on shared ring"
+sources:
+  - syn/artix7/bringup/sim/tb_la_ddr_ring.v
+  - syn/artix7/bringup/rtl/la_ddr_writer.v
+  - syn/artix7/bringup/rtl/la_ddr_ring_streamer.v
+  - syn/artix7/bringup/rtl/ddr3/ddr3_wr_ctrl.v
+  - syn/artix7/bringup/rtl/ddr3/ddr3_rd_ctrl.v
+  - syn/artix7/bringup/rtl/ddr3/ddr3_arbit.v
+  - syn/external/verilog-ethernet/lib/axis/rtl/axis_async_fifo.v
+expect:
+  contains: "RESULT=ALL_PASS"
+tags: [ring, nack]
+timeout_s: 180

@@ -1,0 +1,10 @@
+name: iddr_gap
+description: "IDDR source-sync capture with a stopping TRACECLK — no phantom bytes"
+sources:
+  - syn/artix7/bringup/sim/tb_iddr_gap.v
+  - syn/artix7/rtl/trace_capture_a7.v
+  - syn/artix7/rtl/sim/xil_stubs.v
+  - syn/external/verilog-ethernet/lib/axis/rtl/axis_async_fifo.v
+expect:
+  contains: "RESULT=ALL_PASS"
+tags: [capture]

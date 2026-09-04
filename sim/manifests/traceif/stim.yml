@@ -1,0 +1,8 @@
+name: stim
+description: "traceIF real-capture stimulus (slowitm) — expect TPIU sync detected"
+sources:
+  - verilog/traceIF.v
+  - verilog/testbeds/traceIF_stim_tb.v
+expect:
+  contains: "Got sync"
+tags: [traceif, upstream]

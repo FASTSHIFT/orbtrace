@@ -1,0 +1,15 @@
+name: ddr_ring_fixed_heavy_stall
+description: "S1b MIG-stall aggressive (WDF=200, RDY=200, RD_LAT 20+80, NET 50/30)"
+sources:
+  - syn/artix7/bringup/sim/tb_ddr_ring_fixed.v
+  - syn/artix7/bringup/rtl/la_ddr_writer.v
+  - syn/artix7/bringup/rtl/la_ddr_ring_streamer.v
+  - syn/artix7/bringup/rtl/ddr3/ddr3_wr_ctrl.v
+  - syn/artix7/bringup/rtl/ddr3/ddr3_rd_ctrl.v
+  - syn/artix7/bringup/rtl/ddr3/ddr3_arbit.v
+  - syn/external/verilog-ethernet/lib/axis/rtl/axis_async_fifo.v
+defines: [HEAVY_STALL]
+expect:
+  contains: "RESULT=ALL_PASS"
+tags: [ring, mig-stall]
+timeout_s: 180

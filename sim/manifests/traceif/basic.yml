@@ -1,0 +1,8 @@
+name: basic
+description: "traceIF width=4 single-frame decode (upstream unit test)"
+sources:
+  - verilog/traceIF.v
+  - verilog/testbeds/traceIF_tb.v
+expect:
+  contains: "OUTPUT=123402030405060708090a0b0c0d0e0f"
+tags: [traceif, upstream]

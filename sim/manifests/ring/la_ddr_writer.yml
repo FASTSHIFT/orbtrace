@@ -1,0 +1,10 @@
+name: la_ddr_writer
+description: "la_ddr_writer stress: cap->128b AsyncFIFO->pack->burst byte-contiguous"
+sources:
+  - syn/artix7/bringup/sim/tb_la_ddr_writer.v
+  - syn/artix7/bringup/rtl/la_ddr_writer.v
+  - syn/external/verilog-ethernet/lib/axis/rtl/axis_async_fifo.v
+expect:
+  contains: "RESULT=ALL_PASS"
+tags: [ring]
+timeout_s: 120

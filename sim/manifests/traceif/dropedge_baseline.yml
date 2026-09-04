@@ -1,0 +1,10 @@
+name: dropedge_baseline
+description: "traceIF dropped-edge tb, no drop injected (DROP_AT=999) — baseline"
+sources:
+  - verilog/traceIF.v
+  - verilog/testbeds/traceIF_dropedge_tb.v
+parameters:
+  traceIF_dropedge_tb.DROP_AT: 999
+expect:
+  contains: "RESULT=PASS"
+tags: [traceif, r27]

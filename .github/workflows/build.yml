@@ -119,94 +119,25 @@ jobs:
           if-no-files-found: ignore
 
   iverilog_testbenches:
-    # Verilog testbench regression (added in artix7-port branch).
-    # Runs iverilog against the hand-written Verilog (traceIF.v) and the three
-    # testbenches under verilog/testbeds/ to prevent silent regressions in the
-    # physical-layer framing logic, which is otherwise only covered indirectly.
+    # Verilog testbench regression via the sim/ framework (manifests-based).
+    # See sim/README.md for how to add a new test. The runner discovers all
+    # sim/manifests/**/*.yml, compiles each with iverilog, runs vvp, matches
+    # expected markers, prints per-tag / slowest-N / manifest-coverage
+    # summary, and writes JUnit XML for the GitHub test-reporter UI.
+    #
+    # Adding a new tb = one YAML manifest, no CI edit.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-      - run: sudo apt-get update && sudo apt-get install -y iverilog
-      - name: traceIF basic (width=4)
-        run: |
-          iverilog -o /tmp/sim verilog/traceIF.v verilog/testbeds/traceIF_tb.v
-          vvp /tmp/sim | tee /tmp/out
-          grep -q 'OUTPUT=123402030405060708090a0b0c0d0e0f' /tmp/out
-      - name: traceIF re-sync and back-to-back frames
-        run: |
-          iverilog -o /tmp/sim verilog/traceIF.v verilog/testbeds/traceIF_resync_tb.v
-          vvp /tmp/sim | tee /tmp/out
-          # Expect 6 frames printed (3 real + 3 flush zero frames).
-          test "$(grep -c 'FRAME\[' /tmp/out)" -ge 3
-      - name: traceIF real-capture stimulus (slowitm)
-        run: |
-          iverilog -o /tmp/sim verilog/traceIF.v verilog/testbeds/traceIF_stim_tb.v
-          vvp /tmp/sim | tee /tmp/out
-          # Real capture should at least feed bytes and detect TPIU sync words.
-          grep -q 'Got sync' /tmp/out
-
-      - name: traceIF dropped-edge derails frame (r27 R7B root-cause)
-        run: |
-          # Locks in the root cause of the real-ETM 99.7% illegal rate: a SINGLE
-          # dropped/added TRACECLK edge (IDDR sampling-completeness fault on
-          # edge-aligned data) derails traceIF's construct shift register for
-          # the whole frame and after -- while framing on IDEAL input is 100%
-          # correct. Guards the diagnosis: framing logic is not the culprit,
-          # sampling edge integrity is.
-          iverilog -PtraceIF_dropedge_tb.DROP_AT=999 -o /tmp/nd \
-            verilog/traceIF.v verilog/testbeds/traceIF_dropedge_tb.v
-          vvp /tmp/nd | tee /tmp/nd.out
-          grep -q 'RESULT=PASS' /tmp/nd.out
-          iverilog -PtraceIF_dropedge_tb.DROP_AT=30 -o /tmp/dr \
-            verilog/traceIF.v verilog/testbeds/traceIF_dropedge_tb.v
-          vvp /tmp/dr | tee /tmp/dr.out
-          grep -q 'RESULT=PASS' /tmp/dr.out
-
-      - name: IDDR source-sync capture gap tolerance (gapping ETM clock)
-        run: |
-          # Proves the source-synchronous IDDR capture path in trace_capture_a7
-          # tolerates a STOPPING TRACECLK (an ETM whose clock gates on/off, e.g.
-          # with trace filtering): during a frozen clock it emits ZERO bytes
-          # (no phantoms), and after the clock resumes the byte stream is clean
-          # with no DDR-pairing misalignment across the gap. This is the key
-          # advantage of source-sync over any PLL/MMCM scheme (which would lose
-          # lock across a gap).
-          iverilog -g2012 -o /tmp/sim_gap \
-            syn/artix7/bringup/sim/tb_iddr_gap.v \
-            syn/artix7/rtl/trace_capture_a7.v \
-            syn/artix7/rtl/sim/xil_stubs.v \
-            syn/external/verilog-ethernet/lib/axis/rtl/axis_async_fifo.v
-          vvp /tmp/sim_gap | tee /tmp/out_gap
-          grep -q 'RESULT=ALL_PASS' /tmp/out_gap
-
-      - name: la_ddr_writer on-chip-LA stress test (Artix-7 pin-LA writer)
-        run: |
-          # Method-X width-matched black-box writer: proves the cap->128b
-          # AsyncFIFO->pack->DDR3-burst path stays byte-contiguous at full
-          # 200 MB/s sampling (no dropped/duplicated bytes), and that genuine
-          # DDR3 overload is flagged honestly (sticky overflow, monotonic
-          # canary) rather than silently sprinkling losses. Guards against the
-          # v1 regression (100 MB/s pack throughput -> 86% step=2 byte drop).
-          bash syn/artix7/bringup/sim/run_tb.sh
-
-      - name: la_ddr_ring concurrent R/W + NACK regression (doc 19 P0e/P1/P2/P3)
-        run: |
-          # doc 19 P0e (writer/streamer sharing one ring), P1 (concurrent
-          # read/write with real vendor wr_ctrl/rd_ctrl/arbit), P2 (NACK
-          # retransmit tagged rtx, correct seq range), P3 (out-of-window NACK
-          # honestly reports nack_fail). Guards the entire DDR-ring bring-up
-          # baseline that doc 19 §14 relies on.
-          bash syn/artix7/bringup/sim/run_tb_ring.sh
-
-      - name: DDR-ring S1b MIG-stall regression sweep (r36-r38, 6 variants)
-        run: |
-          # r38 §6.5: guard the tb MIG cmd/wdf-pairing model + prevent the
-          # 32.6% "H7 pseudo-reproduction" from returning. Sweeps six variants:
-          #   baseline (DEADBEEF), SIM_MEM_INIT_11 / _00 / _FF (cross-align),
-          #   RAMP source (order-preservation), HEAVY_STALL (200/200 stalls).
-          # Any RTL change under la_ddr_writer / la_ddr_ring_streamer must not
-          # regress this sweep — this is where the previous tb bug would have
-          # been caught on the day it landed.
-          bash syn/artix7/bringup/sim/run_sim_regression.sh
+      - run: sudo apt-get update && sudo apt-get install -y iverilog python3-yaml
+      - name: Run Verilog regression
+        run: python3 sim/run_verilog_tests.py --coverage --junit sim-results.xml
+      - name: Upload JUnit XML
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sim-junit
+          path: sim-results.xml
+          if-no-files-found: ignore

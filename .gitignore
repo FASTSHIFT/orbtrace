@@ -51,3 +51,4 @@ trc_pkt_lister.ppl
 syn/artix7/bringup/scripts/stream_grab
 syn/artix7/bringup/sim/bad_bytes.csv
 *.vvp
+bad_bytes.csv

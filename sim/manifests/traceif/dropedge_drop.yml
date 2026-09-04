@@ -1,0 +1,10 @@
+name: dropedge_drop
+description: "traceIF dropped-edge tb, drop at edge 30 — expect frame derails (r27 R7B)"
+sources:
+  - verilog/traceIF.v
+  - verilog/testbeds/traceIF_dropedge_tb.v
+parameters:
+  traceIF_dropedge_tb.DROP_AT: 30
+expect:
+  contains: "RESULT=PASS"
+tags: [traceif, r27]
