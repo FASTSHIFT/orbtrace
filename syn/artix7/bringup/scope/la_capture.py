@@ -43,8 +43,12 @@ def read_line(s, src, n, q):
     s.w(f":WAVeform:SOURce {src}")
     s.w(":WAVeform:MODE RAW")
     s.w(":WAVeform:FORMat BYTE")
-    avail = int(float(q(":WAVeform:POINts?")))
-    m = min(avail, n)
+    pts = q(":WAVeform:POINts?")
+    try:
+        avail = int(float(pts))
+    except ValueError:
+        raise RuntimeError(f":WAVeform:POINts? returned {pts!r} for {src}")
+    m = min(avail, int(n))
     out = []
     start, CH = 1, 1_000_000
     while start <= m:
@@ -101,47 +105,66 @@ def capture(timebase="1e-5", mdepth="10M", out="/tmp/scope_capraw.bin",
     def nib(i):
         return (d3[i] << 3) | (d2[i] << 2) | (d1[i] << 1) | d0[i]
 
-    raw = bytearray()
-    rising = None
+    # Time-ordered edge nibbles (rising and falling), record edge type + nibble.
+    # We defer pairing to the search below because which edge starts a byte
+    # depends on where the trigger landed in the TRACECLK cycle.
+    edges = []  # list of (edge_type, nibble); edge_type: 1=rising 0=falling
     for i in range(1, n):
-        if clk[i - 1] == 0 and clk[i] == 1:            # rising
-            j = min(i + off, n - 1)
-            rising = nib(j)
-        elif clk[i - 1] == 1 and clk[i] == 0 and rising is not None:  # falling
-            j = min(i + off, n - 1)
-            raw.append((nib(j) << 4) | rising)         # {trace_b, trace_a}
-            rising = None
-    open(out, "wb").write(raw)
-    print(f"CAP_RAW bytes={len(raw)} -> {out}", flush=True)
+        if clk[i - 1] == 0 and clk[i] == 1:
+            j = min(i + off, n - 1); edges.append((1, nib(j)))
+        elif clk[i - 1] == 1 and clk[i] == 0:
+            j = min(i + off, n - 1); edges.append((0, nib(j)))
+    print(f"edges captured: {len(edges)}", flush=True)
 
-    # deframe self-check
-    try:
-        import trace_width as TW, etm35lib as L, tpiu_official as T
-        best = None
-        for ph, bo, data in TW.candidates(bytes(raw), 4):
-            fsync = data.count(bytes([0xFF, 0xFF, 0xFF, 0x7F]))
-            etm = b""
-            if L.has_tpiu_sync(data):
+    # Search 4 pairing options: start parity {0,1} x swap {0,1}. rev is not
+    # useful in practice (lanes are always LSB-first on this board), so we
+    # skip it -- add it back if a board change ever requires bit-reversal.
+    def build(start, swap):
+        nseq = [n for _, n in edges][start:]
+        out_ = bytearray()
+        for k in range(0, len(nseq) - 1, 2):
+            a, b = nseq[k], nseq[k + 1]
+            out_.append((a << 4) | b if swap else (b << 4) | a)
+        return bytes(out_)
+
+    import trace_width as TW, etm35lib as L, tpiu_official as T
+    def score(data):
+        fsync = data.count(bytes([0xFF, 0xFF, 0xFF, 0x7F]))
+        etm = b""
+        if L.has_tpiu_sync(data):
+            try:
                 etm, _ = T.deframe(data, want_stream=2)
-            a = zc = 0
-            for c in etm:
-                if c == 0:
-                    zc += 1
-                elif c == 0x80 and zc >= 11:
-                    a += 1; zc = 0
-                else:
-                    zc = 0
-            key = (a, len(etm), fsync)
-            if best is None or key > best[0]:
-                best = (key, ph, bo)
-        print(f"deframe best: phase={best[1]} order={best[2]} "
-              f"(A-sync,deframed,fsync)={best[0]}", flush=True)
-    except Exception as e:
-        print("deframe self-check skipped:", e, flush=True)
+            except Exception:
+                etm = b""
+        a = zc = 0
+        for c in etm:
+            if c == 0: zc += 1
+            elif c == 0x80 and zc >= 11: a += 1; zc = 0
+            else: zc = 0
+        return (a, len(etm), fsync)
+
+    best = None
+    for start in (0, 1):
+        for swap in (0, 1):
+            data = build(start, swap)
+            sc = score(data)
+            print(f"  try start={start} swap={swap}: bytes={len(data)} "
+                  f"(A-sync,deframed,fsync)={sc}", flush=True)
+            if best is None or sc > best[0]:
+                best = (sc, start, swap, data)
+    raw = best[3]
+    open(out, "wb").write(raw)
+    print(f"CAP_RAW bytes={len(raw)} start={best[1]} swap={best[2]} "
+          f"(A-sync,deframed,fsync)={best[0]} -> {out}", flush=True)
     s.close()
     return out
 
 
 if __name__ == "__main__":
     a = sys.argv[1:]
-    capture(*(a + [])[:4]) if a else capture()
+    kw = {}
+    if len(a) > 0: kw["timebase"] = a[0]
+    if len(a) > 1: kw["mdepth"] = a[1]
+    if len(a) > 2: kw["out"] = a[2]
+    if len(a) > 3: kw["maxpts"] = int(a[3])
+    capture(**kw)
