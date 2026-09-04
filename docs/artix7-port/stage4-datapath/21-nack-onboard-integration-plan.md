@@ -152,7 +152,41 @@ STM32/DAPLink 可完全断开，只留 FPGA + 网线。
 ### 3.4 S1b 落地清单
 
 在 S1a 全绿的基础上，把 ramp 数据源、la_ddr_writer、la_ddr_ring_streamer、fpga_core_net
-接起来。三个改动：
+接起来。
+
+**2026-09-04 S1b 进展（部分通、剩一个 race，已冻结待 r36 评审）** ⚠️：
+- **99.61% 字节正确**（固定 0x42 源，实测 232M 字节中 232M-905K = 99.61% 是 0x42）
+- **剩余 0.39% race**：错值分布均匀在 packet 内 1023 个位置，non-0x42 集中在 `0x01 / 0x80±3`
+  等小值，模式看似 seq/rtx flag 或 partial-updated DDR word
+- **根因假说**：writer 满速（100+ MB/s）持续 lapping streamer（drain 116 MB/s 网络限），
+  ring 一直处于 overrun 状态；`avail_raw = (wr_ptr - rd_ptr) mod ring` 在 writer 越过
+  rd_ptr **同一个 burst 写入进行中** 那一 clk，可能刚好 ≥ LENGTH*8 → streamer 判 burst_avail
+  开始读 → 读到 **partial-written DDR word**（writer 还没写完这个 burst）
+- **仿真复现挂**：`tb_ddr_ring_fixed.v`（0x42 + ramp 两种模式均 pass）用**行为化 MIG**
+  1 clk 完成一 burst，**上板 DDR3 写 burst 需数十 clk** —— race window 在仿真里被压缩没了
+- **doc 19 §7 P0e "concurrent R/W 零污染" 仿真结论没伪造**，只是没覆盖真实 DDR write burst
+  耗时下的 race。tb_la_ddr_ring 也一样：drain 快到 write 完成前不会追上 wr_ptr
+- **可能修复方向（未实施，待评审）**：
+  - a) 让 streamer 保持一个 `LENGTH` 的**安全距离** —— `burst_avail = avail >= 2*LENGTH*8`
+    永远不追到 writer 正在写的 burst
+  - b) 让 writer 只在 `ddr3_wr_done` 后再更新 `wr_ptr_words`（现有代码就是这样，见
+    la_ddr_writer.v:230），确认 avail_raw 只在 wr_done 到 rd_ptr 读同一 burst 之间出现
+    race — 若是则问题在 rd_ptr 更新时机而非 wr_ptr
+  - c) 在 tb 里模拟真实 DDR write burst 延迟（比如 app_wdf_rdy 每 burst 期间下拉 N clk）
+    先复现 race
+- **冻结**：动 `la_ddr_ring_streamer.v`（doc 19 上游 RTL）需要红方评审，本文档同期打提示词
+
+**S1b 部分产物已可用**：
+- `rtl/ddr_ring_selftest_top.v` 上板通过、99.61% 字节正确
+- `sim/tb_ddr_ring_fixed.v` 离线复现器（0x42/ramp 模式），未来任何 S1b RTL 修改先跑这个
+- `scripts/stream_grab.c` 零丢主机收流器（recv 线程 + 写盘线程解耦）
+- `scripts/ddr_selftest_status.py` 状态读出工具（S1a、可扩展支持 0xD1 magic 的 S1b）
+
+**S1b 完全通过的验收标准（99.61% → 100%）**：
+- fixed 0x42 源：整段抓样非 0x42 计数 = 0
+- ramp 源：`_rampcheck.py` 报 100% monotone-mod-256
+
+三个改动（S1b 落地：已 commit）：
 
 1. **RTL**：`trace_stream_top.v` 加 `USE_DDR_RING` generic + CSR bit `USE_DDR_RAMP`：
    ```verilog
