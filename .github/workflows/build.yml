@@ -95,8 +95,28 @@ jobs:
         run: pip install 'amaranth==0.5.4' amaranth-yosys 'cobs>=1.2.1' 'pytest>=8.3.5' pytest-cov
       - name: Run tests
         run: PYTHONPATH=. pytest tests/ -v
-      - name: Coverage on trace pipeline
-        run: PYTHONPATH=. pytest tests/ --cov=orbtrace.trace --cov=orbtrace.stream --cov-report=term
+      # Coverage gate (r38 §6): lock in current baseline and only ratchet up.
+      # Baseline is stored in .ci/coverage-baseline.txt (single integer percent).
+      # To raise the bar: run locally with `pytest ... --cov-report=term`, note
+      # the percentage, bump the baseline file, and commit — CI will enforce.
+      # Never lower without explicit review; CI failures on this gate mean the
+      # PR removed test coverage from orbtrace.trace / orbtrace.stream.
+      - name: Coverage gate (orbtrace.trace + orbtrace.stream)
+        run: |
+          set -eu
+          BASELINE=$(head -n1 .ci/coverage-baseline.txt | tr -d '[:space:]')
+          echo "Enforcing minimum coverage: ${BASELINE}%"
+          PYTHONPATH=. pytest tests/ \
+              --cov=orbtrace.trace --cov=orbtrace.stream \
+              --cov-report=term --cov-report=xml:coverage.xml \
+              --cov-fail-under="${BASELINE}"
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: orbtrace-python-coverage
+          path: coverage.xml
+          if-no-files-found: ignore
 
   iverilog_testbenches:
     # Verilog testbench regression (added in artix7-port branch).
@@ -169,9 +189,24 @@ jobs:
           # DDR3 overload is flagged honestly (sticky overflow, monotonic
           # canary) rather than silently sprinkling losses. Guards against the
           # v1 regression (100 MB/s pack throughput -> 86% step=2 byte drop).
-          iverilog -g2012 -o /tmp/sim_la \
-            syn/artix7/bringup/sim/tb_la_ddr_writer.v \
-            syn/artix7/bringup/rtl/la_ddr_writer.v \
-            syn/external/verilog-ethernet/lib/axis/rtl/axis_async_fifo.v
-          vvp /tmp/sim_la | tee /tmp/out_la
-          grep -q 'RESULT=ALL_PASS' /tmp/out_la
+          bash syn/artix7/bringup/sim/run_tb.sh
+
+      - name: la_ddr_ring concurrent R/W + NACK regression (doc 19 P0e/P1/P2/P3)
+        run: |
+          # doc 19 P0e (writer/streamer sharing one ring), P1 (concurrent
+          # read/write with real vendor wr_ctrl/rd_ctrl/arbit), P2 (NACK
+          # retransmit tagged rtx, correct seq range), P3 (out-of-window NACK
+          # honestly reports nack_fail). Guards the entire DDR-ring bring-up
+          # baseline that doc 19 §14 relies on.
+          bash syn/artix7/bringup/sim/run_tb_ring.sh
+
+      - name: DDR-ring S1b MIG-stall regression sweep (r36-r38, 6 variants)
+        run: |
+          # r38 §6.5: guard the tb MIG cmd/wdf-pairing model + prevent the
+          # 32.6% "H7 pseudo-reproduction" from returning. Sweeps six variants:
+          #   baseline (DEADBEEF), SIM_MEM_INIT_11 / _00 / _FF (cross-align),
+          #   RAMP source (order-preservation), HEAVY_STALL (200/200 stalls).
+          # Any RTL change under la_ddr_writer / la_ddr_ring_streamer must not
+          # regress this sweep — this is where the previous tb bug would have
+          # been caught on the day it landed.
+          bash syn/artix7/bringup/sim/run_sim_regression.sh
