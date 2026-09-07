@@ -1,11 +1,45 @@
 # Stage-4 · 采集相位复盘：TPIU 数据是 center-aligned，IDELAY/MMCM 全是弯路
 
 > 日期：2026-09-07
-> 结论一句话：**STM32H743 TPIU 并口输出的数据相对 TRACECLK 是 CENTER-ALIGNED**
-> （数据跳变落在离时钟边沿半个 UI 处，时钟边沿正好在数据眼中心）。
-> 因此 **IDDR 直接在 TRACECLK 边沿采就命中眼中心**，我们做的 IDELAY tap 扫描
-> 和 MMCM 90° 相移两套机制**都是基于一个错误的 "edge-aligned" 假设**，属于
-> 不必要的复杂度。
+> 结论一句话（**已按扫频实测修正**）：STM32H743 TPIU 数据相对 TRACECLK 的对齐
+> **是频率相关的**——低频（≤77MHz pin）稳定 **center-aligned**（IDDR 直接采命中
+> 眼中心，IDELAY/MMCM 不需要）；高频（112MHz pin）退化到 **intermediate/偏
+> edge**（对齐度 0.42），此时相位补偿才有意义。**弯路的真正错误不是"用了
+> IDELAY"，而是"在低频档也无脑套 IDELAY/MMCM，且没意识到是否需要补偿是频率
+> 相关的"**。
+
+## 0. 扫频实测（这是最硬的一张表，推翻了初版"IDELAY 全是弯路"的过度结论）
+
+`phase_sweep.py`（一次性脚本）用 CLI 逐档改 PLL，每档读 CH1(TRACECK)+CH2(TRACED)
+原始模拟波形，统计数据边沿到最近时钟边沿的距离（0=edge-aligned，1=正中眼心）：
+
+| R | pin MHz | UI (ns) | 对齐度 | 判决 |
+|---|--------:|--------:|-------:|------|
+| 2 | 113 | 8.84 | **0.42** | INTERMED（偏 edge）|
+| 3 | 77 | 13.0 | 0.83 | CENTER |
+| 4 | 56 | 17.8 | 0.82 | CENTER |
+| 6 | 37.5 | 26.6 | 0.85 | CENTER |
+| 8 | 28 | 35.4 | 0.83 | CENTER |
+| 12 | 18.5 | 53.9 | 0.94 | CENTER |
+| 16 | 14 | 71.1 | 0.96 | CENTER |
+
+**物理机制**：TPIU 名义 center-aligned，但有一个**固定 ns 级的 clock-vs-data
+传播偏差**（走线 + IO 驱动不对称）。低频 UI 大，固定偏差占比小 → 仍在眼心；
+高频 UI 小（8.84ns），固定偏差占大半 UI → 眼被推向边沿。
+
+**这同时解释了三个历史谜团**：
+1. 早期另一台 LA 看到 "CLK/DATA 一起动" —— 那是高频档（≥112MHz），确实接近 edge。
+2. 28MHz 下 IDDR 直接采就行 —— 低频稳 center。
+3. direct 前端 112MHz 只出 934 FSYNC、56MHz 出 20538 —— 112MHz 相位裕度差（0.42），
+   采集质量掉。
+
+**推论**：
+- **≤77MHz：IDELAY/MMCM 完全不需要**，`trace_capture_direct` 足矣。
+- **≥112MHz：需要相位补偿**（IDELAY 把采样点拉回眼心，或降频）。这是 IDELAY
+  唯一真正有价值的场景。
+- **"拿个 MCU 采集够不够"**：低频 center-aligned 时逻辑上可行，但 MCU 无源同步
+  采样硬件、GPIO/DMA 采样率跟不上 DDR 数据率（56MHz DDR=112Mbps/lane）。FPGA
+  方案的存在意义在**高频段**（200MHz+ 4bit=1.6Gbps 只有 IDDR/ISERDES 扛得住）。
 
 ---
 
@@ -86,10 +120,16 @@ TPIU 并口 DDR：pin 时钟跑内部 bit-clock 的一半，数据双沿。`pll_
 
 - [x] `trace_capture_a7` 加 `USE_IDELAY=0` 旁路（IBUF→IDDR 直连），综合+上板验证
 - [x] `pll_ctrl_traceclk_hz` 修为 /2
-- [ ] **P1 减法**：确认 direct 前端在 112MHz 也 OK 后，删除
-  - `trace_capture_a7.v` 的 IDELAY 分支 + `iddr_tap_sweep.py` / `freq_ceiling_sweep.py`
-  - `trace_capture_mmcm.v` / `trace_mmcm_stream_top.v` / `trace_mmcm_top.v`
-  - `eyescan_top.v` / `trace_pin_la_top.v` 等相位实验 top
+- [ ] **P1 减法（修正为：保留高频补偿能力，删重复实现）**。IDELAY 在 ≥112MHz
+  仍有用，不能全删。但三套并存的相位机制是冗余：
+  - **保留**：`trace_capture_a7.v` 的 IDELAY 分支（高频补偿）+ `USE_IDELAY=0`
+    旁路（低频直采）—— 一个模块两条路径，已经够。
+  - **删**：`trace_capture_mmcm.v` / `trace_mmcm_stream_top.v` / `trace_mmcm_top.v`
+    （MMCM 90° 相移是 IDELAY 的重复方案，且低频锁不上）。
+  - **删**：`eyescan_top.v` / `trace_pin_la_top.v` 等一次性相位实验 top。
+  - **保留但归位**：`iddr_tap_sweep.py`（高频找眼心仍需要，但要标注"仅 ≥100MHz
+    有意义"，加频率 guard）。
+- [ ] **默认策略**：低频（≤77MHz）默认 `USE_IDELAY=0` 直采；高频再开 IDELAY。
 - [ ] 独立战线（与采集无关）：cortrace/libopencsd 在 ~64-196KB 处 fatal，
   deframe 后仍掺 HSYNC `0xf7` 残留——PC 端解码质量问题。
 
