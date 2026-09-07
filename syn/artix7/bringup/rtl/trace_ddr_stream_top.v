@@ -47,6 +47,9 @@ module trace_ddr_stream_top #(
     parameter       CAP_METHOD  = "IDDR",       // "IDDR" | "OVERSAMPLE"
     parameter [4:0] TAP         = 5'd2,         // eye centre from doc 20 Part D
     parameter [4:0] TAP_CLK     = 5'd0,
+    // 1 = IDELAYE2 per-lane deskew (tap sweep, freq-coupled).
+    // 0 = upstream-faithful bypass (IBUF->IDDR direct, freq-independent).
+    parameter       USE_IDELAY  = 1,
     parameter       EYE         = 4,            // OVERSAMPLE mid-eye
     parameter       TRACE_WIDTH = 4,            // power-on TPIU width (4/2/1)
     parameter [31:0] DEST_IP        = {8'd192, 8'd168, 8'd10, 8'd245},
@@ -242,6 +245,7 @@ module trace_ddr_stream_top #(
     trace_capture_a7 #(
         .CLK_BUF   ("BUFR_IO"),
         .CAP_METHOD(CAP_METHOD),
+        .USE_IDELAY(USE_IDELAY),
         .EYE_DELAY (EYE)
     ) u_capture (
         .rst          (rst200),

@@ -67,7 +67,15 @@ module trace_capture_a7 #(
     // TRACECLK<=12.5 MHz is >=40 ns, so a few cycles lands safely inside the
     // eye. For TRACECLK ~1.3 MHz (half-bit ~380 ns) anything 1..~70 works;
     // pick a small value so it also tolerates faster trace clocks.
-    parameter EYE_DELAY = 4
+    parameter EYE_DELAY = 4,
+    // IDELAYE2 on the data lanes. 1 = per-lane VAR_LOAD deskew (the tap-sweep
+    // path, frequency-coupled). 0 = BYPASS: feed data straight IBUF->IDDR, the
+    // faithful port of orbtrace upstream glue.py (DDRInput, no delay element).
+    // Upstream relies purely on IOB routing delay + flip-flop hold time to land
+    // the IDDR sample inside the next half-bit, which is frequency-independent.
+    // When 0, tap_data*/tap_clk/tap_load are ignored. IDDR-mode only (OVERSAMPLE
+    // re-times in the ref domain and never used the delayed data anyway).
+    parameter USE_IDELAY = 1
 ) (
     input  wire        rst,
     input  wire        ref_200m,
@@ -238,42 +246,47 @@ module trace_capture_a7 #(
         for (i = 0; i < 4; i = i + 1) begin : g_lane
             IBUF u_ibuf (.I(trace_data_p[i]), .O(data_ibuf[i]));
 
-            wire [4:0] tap;
-            assign tap = (i == 0) ? tap_data0 :
-                         (i == 1) ? tap_data1 :
-                         (i == 2) ? tap_data2 :
-                                    tap_data3;
+            if (USE_IDELAY) begin : g_idelay
+                wire [4:0] tap;
+                assign tap = (i == 0) ? tap_data0 :
+                             (i == 1) ? tap_data1 :
+                             (i == 2) ? tap_data2 :
+                                        tap_data3;
 
-            (* IODELAY_GROUP = "trace_idelay_grp" *)
-            IDELAYE2 #(
-                .IDELAY_TYPE         ("VAR_LOAD"),
-                .DELAY_SRC           ("IDATAIN"),
-                .HIGH_PERFORMANCE_MODE("TRUE"),
-                // Default sits at mid-tap (16/31). Stage-3 deskew FSM
-                // calibrates per lane; the static value here exists so
-                // OOC/post-impl timing analysis sees a non-zero per-lane
-                // delay and does not flag a -5 ns hold failure on the
-                // bare trace_data_in -> IDDR/D path. ~78 ps/tap *  16 ~
-                // 1.25 ns, aligned to the set_input_delay window in xdc.
-                .IDELAY_VALUE        (16),
-                .SIGNAL_PATTERN      ("DATA"),
-                .REFCLK_FREQUENCY    (200.0),
-                .CINVCTRL_SEL        ("FALSE"),
-                .PIPE_SEL            ("FALSE")
-            ) u_idelay (
-                .C          (ref_200m),
-                .REGRST     (1'b0),
-                .LD         (tap_load),
-                .CE         (1'b0),
-                .INC        (1'b0),
-                .CINVCTRL   (1'b0),
-                .CNTVALUEIN (tap),
-                .IDATAIN    (data_ibuf[i]),
-                .DATAIN     (1'b0),
-                .LDPIPEEN   (1'b0),
-                .DATAOUT    (data_dly[i]),
-                .CNTVALUEOUT()
-            );
+                (* IODELAY_GROUP = "trace_idelay_grp" *)
+                IDELAYE2 #(
+                    .IDELAY_TYPE         ("VAR_LOAD"),
+                    .DELAY_SRC           ("IDATAIN"),
+                    .HIGH_PERFORMANCE_MODE("TRUE"),
+                    // Default sits at mid-tap (16/31). Stage-3 deskew FSM
+                    // calibrates per lane; the static value here exists so
+                    // OOC/post-impl timing analysis sees a non-zero per-lane
+                    // delay and does not flag a -5 ns hold failure on the
+                    // bare trace_data_in -> IDDR/D path. ~78 ps/tap *  16 ~
+                    // 1.25 ns, aligned to the set_input_delay window in xdc.
+                    .IDELAY_VALUE        (16),
+                    .SIGNAL_PATTERN      ("DATA"),
+                    .REFCLK_FREQUENCY    (200.0),
+                    .CINVCTRL_SEL        ("FALSE"),
+                    .PIPE_SEL            ("FALSE")
+                ) u_idelay (
+                    .C          (ref_200m),
+                    .REGRST     (1'b0),
+                    .LD         (tap_load),
+                    .CE         (1'b0),
+                    .INC        (1'b0),
+                    .CINVCTRL   (1'b0),
+                    .CNTVALUEIN (tap),
+                    .IDATAIN    (data_ibuf[i]),
+                    .DATAIN     (1'b0),
+                    .LDPIPEEN   (1'b0),
+                    .DATAOUT    (data_dly[i]),
+                    .CNTVALUEOUT()
+                );
+            end else begin : g_nodelay
+                // Upstream-faithful: no delay element, IBUF straight to IDDR.
+                assign data_dly[i] = data_ibuf[i];
+            end
         end
     endgenerate
 

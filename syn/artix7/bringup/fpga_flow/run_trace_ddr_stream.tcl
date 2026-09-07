@@ -95,7 +95,14 @@ read_xdc $bringup/rtl/trace_ddr_stream.xdc
 
 set build_id [clock seconds]
 puts "BUILD_ID = $build_id ([clock format $build_id])"
-synth_design -top trace_ddr_stream_top -part $part -generic BUILD_ID=$build_id
+# USE_IDELAY=0 builds the upstream-faithful direct IBUF->IDDR capture (no
+# per-lane IDELAYE2 deskew, frequency-independent). Set env USE_IDELAY=0 to
+# build that variant; default 1 keeps the tap-sweep path.
+set use_idelay 1
+if {[info exists ::env(USE_IDELAY)]} { set use_idelay $::env(USE_IDELAY) }
+puts "USE_IDELAY = $use_idelay"
+synth_design -top trace_ddr_stream_top -part $part \
+    -generic BUILD_ID=$build_id -generic USE_IDELAY=$use_idelay
 
 puts "==== CLOCKS ===="
 foreach c [get_clocks] { puts "  clock: $c  period=[get_property PERIOD $c]  src=[get_property SOURCE_PINS $c]" }
