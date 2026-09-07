@@ -26,7 +26,7 @@ set_property IOSTANDARD LVCMOS33 [get_ports {trace_data_in[*]}]
 create_clock -period 12.000 -name trace_clk_in [get_ports trace_clk_in]
 # BUFIO/BUFR mode: allow the dedicated-route demotion (D17 may not be in the
 # BUFR's clock region for all placements).
-set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -of_objects [get_pins u_capture/u_bufr_io.u_bufio/O]]
+set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -of_objects [get_pins u_capture/g_bufr.u_bufio_clk/O]]
 
 # ---- RGMII (RTL8211E), BANK 15 ----
 set_property PACKAGE_PIN K18 [get_ports phy_rx_clk]
