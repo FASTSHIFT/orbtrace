@@ -38,6 +38,22 @@ class Scope:
         self.inst.timeout = timeout_ms
         self.inst.write_termination = "\n"
         self.inst.read_termination = "\n"
+        # CRITICAL: if a previous session ended mid-query (Ctrl-C, timeout,
+        # crash), the USB TMC bulk-IN buffer on the scope side still holds the
+        # tail of the last binary block. The next Scope() opens fine but the
+        # FIRST query returns those stale bytes ("#9001000000..." block header
+        # from a `:WAVeform:DATA?`), which fails to parse. USBTMC has an
+        # explicit clear op for exactly this — flush both directions.
+        try:
+            self.inst.clear()
+        except Exception:
+            pass
+        # Also send *CLS to reset the error queue and any pending event
+        # register bits — cheap belt+braces after a bad prior session.
+        try:
+            self.inst.write("*CLS")
+        except Exception:
+            pass
 
     def q(self, cmd, timeout_ms=None):
         if timeout_ms is not None:
