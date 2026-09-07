@@ -6,16 +6,14 @@ RTL tops and constraints for each bring-up stage, built by the TCL flows in
 
 | Top | XDC | Stage / purpose |
 |-----|-----|-----------------|
+| `trace_ddr_stream_top.v` | `trace_ddr_stream.xdc` | **active**: IDDR capture -> DDR3 ring -> UDP :5555 |
 | `blink.v` | `blink.xdc` | Stage-3 JTAG smoke-test (LED blink) |
 | `net_test_top.v` | `net_test.xdc` | Stage-3 RGMII gigabit loopback |
-| `eyescan_top.v` / `trace_eyescan.v` | `eyescan.xdc` | V1 IDELAY eye-scan |
-| `trace_stream_top.v` | `trace_stream.xdc` | V3 raw traceIF-frame capture |
-| `trace_orbflow_top.v` | `trace_orbflow.xdc` | V3 "A route" native OFLOW egress |
 | `fpga_core_net.v` | — | shared MAC/IP/UDP core wrapper |
 | `ddr3_selftest_top.v` | `ddr3_selftest.xdc` | proposal 32 P1: DDR3 MIG write/readback self-loop (LED) |
 | `trace_ddr_selftest_top.v` | `trace_ddr_selftest.xdc` | proposal 32 P2a: DDR3 MIG + Ethernet :5001 readout coexistence |
+| `ddr_ring_selftest_top.v` | `trace_ddr_selftest.xdc` | DDR-ring drain self-test (ramp / fixed source) |
 | `ddr3/` | — | vendor A7-Lite DDR3 abstraction layer + MIG/clock IP (reused) |
-| `sim/eyescan_pattern_tb.v` | — | eye-scan pattern testbench |
 
 ### DDR3 (MIG) notes — hard-won (proposal 32)
 - **Cold boot required**: an openFPGALoader SRAM load leaves MIG mis-calibrated
