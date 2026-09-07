@@ -1,98 +1,88 @@
-# 24 — Data-path source isolation: the pollution is at the pins, not in the ring
+# 24 — 数据源隔离：污染在采样前端，不在 DDR-ring/UDP 通路
 
-Date: 2026-09-07
-Bitstream under test: `trace_ddr_stream.bit` (BUILD_ID 0x6a9aa5e7, tap2/IDELAY
-build), live on the board. Front-end config is irrelevant for this test — the
-selftest CSRs bypass the trace pins entirely.
+日期：2026-09-07
+被测 bitstream：`trace_ddr_stream.bit`（BUILD_ID 0x6a9aa5e7，tap2/IDELAY 版），
+当时板上在跑。本测试与前端配置无关——selftest CSR 完全旁路了 trace 引脚。
 
-## Question
+## 问题
 
-Earlier work (doc 23 retro, TASK 7 notes) saw periodic pollution in the decoded
-ETM stream: a recurring `0x96`, gap-3 clustering, and only a handful of ETMv4
-A-syncs recovered from megabytes of "real" capture. The open question was
-whether that pollution is injected by:
+之前的工作（doc 23 复盘、TASK 7 记录）在解码出的 ETM 流里看到周期性污染：
+反复出现的 `0x96`、gap=3 聚集、几 MB 的"真实"采集里只能捞出个位数的 ETMv4
+A-sync。悬而未决的问题是：这个污染到底是谁注入的：
 
-* the **capture front-end** (trace_capture_a7 sampling the physical TRACECLK /
-  TRACEDATA pins — an SI / eye problem), or
-* the **data path** (la_ddr_writer packing → DDR3 ring → la_ddr_ring_streamer
-  gearbox → packetiser → UDP — a logic / CDC problem).
+* **采样前端**（trace_capture_a7 采物理 TRACECLK / TRACEDATA 引脚——SI/眼图问题），
+  还是
+* **数据通路**（la_ddr_writer 打包 → DDR3 ring → la_ddr_ring_streamer gearbox
+  → packetiser → UDP——逻辑/CDC 问题）。
 
-These had been conflated before. This is the single-variable test that separates
-them.
+这两者之前一直被混在一起。本测试就是把它们分开的单变量实验。
 
-## Method
+## 方法
 
-`trace_ddr_stream_top` has two FPGA-internal byte sources that feed the *exact
-same* DDR-ring → UDP path as real trace, chosen at runtime with no reflash:
+`trace_ddr_stream_top` 有两个 FPGA 内部字节源，喂给与真实 trace **完全相同**的
+DDR-ring → UDP 通路，运行时切换、无需重烧：
 
-| CSR | value | source |
-|-----|-------|--------|
-| 0x09 | 1 | free-running **ramp** (byte = ++counter) |
-| 0x09=1, 0x0B=1 | | **fixed 0x42** |
-| 0x09=0 | | real trace (capture pins) |
+| CSR | 值 | 数据源 |
+|-----|-----|--------|
+| 0x09 | 1 | 自由跑的 **ramp**（byte = ++计数器） |
+| 0x09=1, 0x0B=1 | | **固定 0x42** |
+| 0x09=0 | | 真实 trace（采样引脚） |
 
-Both internal sources are injected at `src_byte` in the clk200 domain, *upstream
-of* la_ddr_writer, so they traverse the identical packing / DDR3 / gearbox /
-packetiser logic. Any corruption they show is 100% data-path. Any corruption
-that appears **only** with real trace is 100% front-end.
+两个内部源都在 clk200 域的 `src_byte` 处注入，位于 la_ddr_writer **之前**，所以
+它们走的是与真实 trace 完全一致的 打包/DDR3/gearbox/packetiser 逻辑。它们表现出
+的任何污染 100% 是数据通路问题；只在真实 trace 出现、内部源不出现的污染 100% 是
+前端问题。
 
-Capture tool: `stream_grab` (C, zero-loss, decouples recv from disk). 3 s each,
-~335 MB, on `enxc8a36266dcae`.
+采集工具：`stream_grab`（C，零丢包，recv 与磁盘写解耦）。每次 3 秒，约 335 MB，
+走 `enxc8a36266dcae`。
 
-## Results
+## 结果
 
-| source | bytes | corruption | detail |
-|--------|-------|-----------|--------|
-| fixed 0x42 | 335,373,312 | **0** non-0x42 | host-side AND FPGA diag latch (0 bad / 194k pkts) |
-| ramp | 335,373,312 | **0** ramp breaks | every `a[i+1] == a[i]+1 (mod 256)`, across all packet boundaries |
-| real trace | 335,373,312 | heavy | 249 distinct byte values; 0x96 recurs at **gap=1024** (once per payload) |
+| 数据源 | 字节数 | 污染 | 细节 |
+|--------|--------|------|------|
+| 固定 0x42 | 335,373,312 | **0** 个非-0x42 | 主机端 + FPGA diag latch（194k 包 / 0 坏） |
+| ramp | 335,373,312 | **0** 个 ramp 断点 | 每个 `a[i+1] == a[i]+1 (mod 256)`，跨所有包边界 |
+| 真实 trace | 335,373,312 | 严重 | 249 个不同字节值；0x96 在 **gap=1024**（每 payload 一次）复现 |
 
-The fixed and ramp streams are byte-perfect over 335 MB **each**. The ramp is the
-stronger of the two: it is time-varying data that crosses every packet boundary,
-every DDR burst boundary (LENGTH=64 words), and the 128b→8b gearbox, and it
-stayed monotonic with zero breaks. If the writer packing, the DDR ring address
-math, the streamer gearbox, or the CDC FIFOs dropped/duplicated/reordered even a
-single byte, the ramp would show a break there. It did not.
+固定和 ramp 流在**各自** 335 MB 上逐字节完美。ramp 是两者中更强的证据：它是时变
+数据，跨越了每个 packet 边界、每个 DDR burst 边界（LENGTH=64 words）、以及
+128b→8b 的 gearbox，却保持单调、零断点。如果 writer 打包、DDR ring 地址运算、
+streamer gearbox、或 CDC FIFO 丢/重/乱了哪怕一个字节，ramp 就会在那里出现断点。
+它没有。
 
-## Conclusion
+## 结论
 
-**The FPGA→DDR-ring→UDP data path is provably clean.** Packing (big-endian
-16-byte word), the DDR3 ring (+8 app-addr/word, wrap), the concurrent
-writer/streamer sharing the arbiter, the 161-bit {rtx,seq,data} CDC FIFO, the
-clk125 gearbox, and the packetiser all pass both a constant and a time-varying
-payload with zero error at 112 MB/s sustained.
+**FPGA→DDR-ring→UDP 数据通路可证明是干净的。** 打包（大端 16 字节 word）、DDR3
+ring（+8 app-addr/word、wrap）、writer/streamer 并发共用 arbiter、161-bit
+{rtx,seq,data} CDC FIFO、clk125 gearbox、packetiser，在 112 MB/s 持续速率下，对
+常量和时变 payload 都零错。
 
-**The pollution is entirely at the physical-pin capture front-end.** This is the
-same SI / eye-closure story as doc 23: the live bitstream is the tap2/IDELAY
-build and the STM32 is (per committed firmware) booting into the selftrace loop.
-The `0x96`-at-gap-1024 signature is a capture artifact aligned to the packet
-payload length, not a transport bug — transport carried ramp and fixed across
-those very boundaries flawlessly.
+**污染完全来自物理引脚采样前端。** 这与 doc 23 的 SI/眼闭故事一致：当时板上跑的
+是 tap2/IDELAY 版，STM32（按已提交固件）boot 进 selftrace 循环。`0x96`-在-gap-1024
+的特征是与 packet payload 长度对齐的采集伪象，不是传输 bug——传输把 ramp 和 fixed
+跨过那些同样的边界都完好搬运了。
 
-### What this retires
+### 这退役了哪些假设
 
-* "period-3 pollution from la_ddr_writer packing" — **disproven**. Ramp is
-  monotonic through the packer.
-* "DDR-ring / gearbox / CDC drops bytes" — **disproven**. 0 loss, 0 reorder over
-  670 MB combined.
-* Any further data-path debugging is wasted effort. The lever is front-end SI:
-  lower the trace-pin frequency (R=4 → 56 MHz pin, eye open per doc 23) and/or
-  fix board-level SI, exactly as doc 23 concluded.
+* "la_ddr_writer 打包的周期-3 污染" —— **证伪**。ramp 穿过打包器保持单调。
+* "DDR-ring / gearbox / CDC 丢字节" —— **证伪**。合计 670 MB 零丢零乱序。
+* 再查数据通路都是白费功夫。杠杆在前端 SI：降 trace 引脚频率（R=4 → 56MHz 引脚，
+  doc 23 眼张开）和/或改板级 SI，正如 doc 23 的结论。
 
-### Reproduce
+### 复现
 
 ```
-# fixed 0x42
+# 固定 0x42
 python3 -c "...csr write 0x09=1, 0x0B=1..."
 sudo ./stream_grab enxc8a36266dcae 3 captures/fixed42.bin
-python3 read_bad_byte_latch.py --iface enxc8a36266dcae   # expect bad_count=0
+python3 read_bad_byte_latch.py --iface enxc8a36266dcae   # 期望 bad_count=0
 
 # ramp
 python3 trace_ctrl.py stream-selftest 1                   # 0x09=1, 0x0B=0
 sudo ./stream_grab enxc8a36266dcae 3 captures/ramp.bin
-# analyze: every byte delta == 1 mod 256
+# 分析：每个字节 delta == 1 mod 256
 
-# real
+# 真实
 python3 trace_ctrl.py stream-selftest 0 ; python3 trace_ctrl.py rearm
 sudo ./stream_grab enxc8a36266dcae 3 captures/real.bin
 ```
