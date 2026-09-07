@@ -119,6 +119,17 @@ set_clock_groups -asynchronous \
 set_false_path -from [get_pins rst_sync_reg[3]/C] \
                -to [get_pins -hier -filter {NAME =~ *rgmii_phy_if_inst*rx_rst_reg_reg*/PRE}]
 
+# CSR bits (clk125) into their clk200 first-stage synchroniser registers are
+# quasi-static 2-FF crossings -- exclude from timing (else the clk125->clk200
+# 1ns setup fails, e.g. src_fixed_125 -> src_fixed_s0 at WNS -0.854). The s0
+# reg is the metastability catcher; the s0->200 second stage is timed normally.
+set_false_path -to [get_cells -hier -filter {NAME =~ *selftest_s0_reg* || \
+                                              NAME =~ *src_fixed_s0_reg*  || \
+                                              NAME =~ *tap0_s0_reg*  || NAME =~ *tap1_s0_reg* || \
+                                              NAME =~ *tap2_s0_reg*  || NAME =~ *tap3_s0_reg* || \
+                                              NAME =~ *tapc_s0_reg*  || NAME =~ *tap_ld_s0_reg* || \
+                                              NAME =~ *eye_s0_reg*}]
+
 opt_design
 place_design
 route_design
