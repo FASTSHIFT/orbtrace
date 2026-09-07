@@ -160,23 +160,45 @@ def capture_fpga(out_raw: Path, iface: str, seconds: float) -> int:
 
 
 def deframe_fpga(raw: Path, keep_dir: Path) -> Path:
-    """Deframe stream_grab output into clean ETMv4 bytes for cortrace. Direct
-    tpiu_official.deframe path -- MUCH faster and lighter than the full
-    opencsd_etm4_run pipeline (which spawns trc_pkt_lister etc). We only need
-    the ETM byte stream, not a coverage report."""
+    """Deframe stream_grab output into clean ETMv4 bytes for cortrace.
+
+    CRITICAL: the FPGA streams one byte per TRACECLK period packed as
+    {trace_a[k] hi-nibble, trace_b[k-1] lo-nibble}. That is NOT a TPIU byte
+    yet -- the half-bit nibbles must be re-assembled with the correct
+    parity/order BEFORE TPIU deframing. A naive tpiu_official.deframe on the
+    raw bytes sees only HSYNC filler (`f7ff...`, 0 FSYNC) and returns garbage.
+    Use opencsd_etm4_run.recover_assemble which searches parity x order and
+    ranks by post-deframe A-sync count (the only signal that proves the whole
+    nibble->frame->stream chain is aligned)."""
     keep_dir.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(BRINGUP / "decode"))
-    import etm35lib as L
+    import opencsd_etm4_run as OC
     import tpiu_official as T
+    import etm35lib as L
     data = raw.read_bytes()
-    print(f"[deframe] {len(data)}B raw -> ", end="", flush=True)
-    if L.has_tpiu_sync(data):
-        etm, _ = T.deframe(data, want_stream=2)
+    # recover_assemble runs 4 full deframes (parity x order); cap the search
+    # to the first few MB so it stays fast, then apply the winning phase to
+    # the whole capture.
+    head = data[:4_000_000]
+    print(f"[deframe] {len(data)}B raw -> recover_assemble on {len(head)}B ...",
+          flush=True)
+    score, parity, order, _, fl, v4a, fsync = OC.recover_assemble(head)
+    # Re-assemble the FULL capture with the winning parity/order.
+    sys.path.insert(0, str(BRINGUP / "decode"))
+    import dsl_parse as D  # provides assemble()
+    nibs = bytearray()
+    for k in range(len(data) - 1):
+        nibs.append((data[k] >> 4) & 0xF)
+        nibs.append(data[k + 1] & 0xF)
+    assembled = D.assemble(nibs, parity, order)
+    if L.has_tpiu_sync(assembled):
+        etm, _ = T.deframe(assembled, want_stream=2)
     else:
-        etm = data
+        etm = assembled
     out = keep_dir / "etm.bin"
     out.write_bytes(etm)
-    print(f"{len(etm)}B ETM (stream 2)  -> {out}", flush=True)
+    print(f"[deframe] parity={parity} order={order} fsync={fsync} "
+          f"pre-async={v4a} -> {len(etm)}B ETM (stream 2) -> {out}", flush=True)
     return out
 
 
