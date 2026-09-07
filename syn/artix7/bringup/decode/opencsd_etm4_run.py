@@ -341,49 +341,51 @@ def main():
     #   (b) Legacy raw {a,b} stream (old bit): 2 bytes / TRACECLK. Detected
     #       when has_tpiu_sync returns false on the raw bytes but true on the
     #       parity=1 assembled bytes.
-    if L.has_tpiu_sync(raw):
+    # Path selection by RESULT, not by a has_tpiu_sync() guess on the raw.
+    # The old code branched on has_tpiu_sync(raw): if the raw CAP_RAW bytes
+    # happened to contain FF FF FF 7F (all-1 lanes are common), it assumed the
+    # stream was already 16-byte-frame-aligned TPIU and deframed it directly --
+    # skipping the {trace_b,trace_a} nibble reassembly the raw actually needs.
+    # On the direct-capture bit this false-positives and yields 0 ETM, while
+    # the nibble path yields hundreds of A-syncs (2026-09-07). Fix: compute
+    # BOTH candidate ETM streams and keep whichever has more ETMv4 A-syncs.
+    def _direct_deframe(src):
+        if not L.has_tpiu_sync(src):
+            return b""
         if a.deframer == "official":
-            # Faithful port of orbuculum Src/tpiuDecoder.c: 16-bit-aligned
-            # HSYNC filtering + padding/stream handling. Our home-grown
-            # tpiu_deframe_walk scans HSYNC byte-by-byte and mis-aligns when
-            # HSYNC lands on an odd offset -- fatal at this stream's ~30% HSYNC
-            # density (A-sync trace-info-after: walk=0 vs official=57; decoded
-            # PCs: walk=6 vs official=781). Default to official.
-            print("[2] TPIU-framed; official (orbuculum) deframer, stream=%d"
-                  % a.stream)
-            etm, st = T.deframe(raw, want_stream=a.stream)
-            print(f"[3] deframed ETM: {len(etm)} bytes "
-                  f"(frames={st['packets']} fsync={st['syncs']})")
+            e, _ = T.deframe(src, want_stream=a.stream)
         else:
-            print("[2] TPIU-framed byte stream; legacy tpiu_deframe_walk")
-            etm = L.tpiu_deframe_walk(raw)
-            print(f"[3] deframed ETM: {len(etm)} bytes")
+            e = L.tpiu_deframe_walk(src)
+        return e
+
+    # Candidate 1: treat raw as already-framed TPIU.
+    etm_direct = _direct_deframe(raw)
+    a_direct, _ = count_v4_syncs(etm_direct) if etm_direct else (0, 0)
+
+    # Candidate 2: nibble-reassemble ({trace_b,trace_a} per period) then deframe.
+    if a.width == 4:
+        score, parity, order, data, fl, v4a, fsync = recover_assemble(
+            raw, stream=a.stream)
+        what = f"parity={parity} order={order}"
     else:
-        # Try the legacy 2-byte-per-period nibble path.
-        if a.width == 4:
-            score, parity, order, data, fl, v4a, fsync = recover_assemble(
-                raw, stream=a.stream)
-            what = f"parity={parity} order={order}"
-        else:
-            score, parity, order, data, fl, v4a, fsync = recover_assemble_width(
-                raw, a.width, stream=a.stream)
-            what = f"{a.width}-bit phase={parity} order={'lsb' if not order else 'msb'}"
-        if L.has_tpiu_sync(data):
-            print(f"[2] legacy raw {{a,b}}: {what} "
-                  f"assembled={len(data)}B  TPIU-fsync={fsync} "
-                  f"A-syncs(v4)={v4a} flash-Isync={fl}")
-            if a.deframer == "official":
-                etm, st = T.deframe(data, want_stream=a.stream)
-                print(f"[3] deframed ETM (official): {len(etm)} bytes "
-                      f"(frames={st['packets']} fsync={st['syncs']})")
-            else:
-                etm = L.tpiu_deframe_walk(data)
-                print(f"[3] deframed ETM (walk): {len(etm)} bytes")
-        else:
-            print("[2] no TPIU sync detected in either raw or assembled forms;"
-                  " passing bytes through as-is")
-            etm = raw
-            print(f"[3] {len(etm)} bytes")
+        score, parity, order, data, fl, v4a, fsync = recover_assemble_width(
+            raw, a.width, stream=a.stream)
+        what = f"{a.width}-bit phase={parity} order={'lsb' if not order else 'msb'}"
+    etm_asm = _direct_deframe(data)
+    a_asm, _ = count_v4_syncs(etm_asm) if etm_asm else (0, 0)
+
+    print(f"[2] candidate A-syncs: direct-deframe={a_direct}  "
+          f"nibble-reassemble({what})={a_asm}  fsync={fsync}")
+    if a_asm >= a_direct:
+        etm = etm_asm
+        print(f"[2] chose NIBBLE-REASSEMBLE ({what}); "
+              f"assembled={len(data)}B -> ETM {len(etm)}B")
+    else:
+        etm = etm_direct
+        print(f"[2] chose DIRECT-DEFRAME; ETM {len(etm)}B")
+    if not etm:
+        print("[2] neither path found TPIU sync; passing bytes through as-is")
+        etm = raw
 
     asyncs, trinfo = count_v4_syncs(etm)
     print(f"    ETMv4 A-syncs={asyncs}, Trace-Info(0x01) after A-sync={trinfo}")

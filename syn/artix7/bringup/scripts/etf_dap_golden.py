@@ -110,6 +110,14 @@ def main():
     ap.add_argument("--out", required=True, help="write golden bytes here")
     ap.add_argument("--words", type=int, default=1024,
                     help="how many RRD reads (each = 4 bytes; ETF is 4KB total)")
+    ap.add_argument("--no-restore", action="store_true",
+                    help="do NOT restore ETF to HW-FIFO after the dump "
+                         "(default restores it). The dump sequence freezes the "
+                         "ETF in circular mode with TraceCaptEn=0, which STOPS "
+                         "data flowing to the TPIU pins -- so the FPGA/LA then "
+                         "see only HSYNC filler until HW-FIFO is restored. "
+                         "Auto-restoring here prevents the recurring 'only "
+                         "HSYNC / only CLK+D3 moving' confusion.")
     a = ap.parse_args()
 
     cfg = BRINGUP / "target" / "etf_dump_h743.cfg"
@@ -125,6 +133,16 @@ def main():
           f"RRP={state['RRP']}  RWP={state['RWP']}  MODE={state['MODE']}")
     if state.get("RSZ"):
         print(f"  (RSZ*4 = {state['RSZ']*4} bytes of ETF RAM)")
+
+    if not a.no_restore:
+        restore = BRINGUP / "target" / "etf_hw_fifo_restore.cfg"
+        if restore.exists():
+            run_openocd({}, restore, timeout=20)
+            print("ETF restored to HW-FIFO (TPIU pins live again). "
+                  "Use --no-restore to skip.")
+        else:
+            print(f"WARNING: {restore} missing; ETF left frozen -- FPGA/LA "
+                  f"will see only HSYNC until you restore HW-FIFO manually.")
 
 
 if __name__ == "__main__":
