@@ -52,7 +52,23 @@ module trace_capture_a7 #(
     // Upstream relies purely on IOB routing delay + flip-flop hold time to land
     // the IDDR sample inside the next half-bit, which is frequency-independent.
     // When 0, tap_data*/tap_clk/tap_load are ignored.
-    parameter USE_IDELAY = 1
+    parameter USE_IDELAY = 1,
+    // Data-lane IDELAY mode:
+    //   0 = VAR_LOAD: delay loaded at runtime from tap_data* (tap sweep). NOTE
+    //       STA analyses the STATIC IDELAY_VALUE below, NOT the runtime tap, so
+    //       timing closure and hardware can DISAGREE if they differ. Use only
+    //       for interactive tap experiments.
+    //   1 = FIXED: delay is the compile-time IDELAY_FIXED_VAL; STA and hardware
+    //       use the SAME value, so a hold-closing tap found in STA is exactly
+    //       what runs. This is the shipped, deterministic choice — one fixed
+    //       tap compensates the (frequency-independent) clock-tree-vs-data hold
+    //       skew. tap_data*/tap_load are ignored in this mode.
+    parameter IDELAY_FIXED    = 1,
+    // tap 24: STA hold WHS +0.079 ns (closes the IDDR input-hold violation with
+    // margin over the tap-18 knife-edge; saturates by 24, tap 30 adds nothing).
+    // See sweep_trace_hold.tcl / doc 25. ~78 ps/tap * 24 ~ 1.87 ns of data delay
+    // to compensate the clock-tree-vs-data-direct skew (frequency-independent).
+    parameter [4:0] IDELAY_FIXED_VAL = 5'd24
 ) (
     input  wire        rst,
     input  wire        ref_200m,
@@ -179,7 +195,38 @@ module trace_capture_a7 #(
         for (i = 0; i < 4; i = i + 1) begin : g_lane
             IBUF u_ibuf (.I(trace_data_p[i]), .O(data_ibuf[i]));
 
-            if (USE_IDELAY) begin : g_idelay
+            if (USE_IDELAY && IDELAY_FIXED) begin : g_idelay_fixed
+                // FIXED delay: STA and hardware use IDELAY_FIXED_VAL — no
+                // runtime VAR_LOAD, so a hold-closing tap found in the timing
+                // report is exactly what the silicon runs. This is the fix for
+                // the IDDR input-hold violation on the direct path (clock tree
+                // insertion delay >> data IBUF delay -> data arrives too early
+                // -> hold fail). One fixed tap; frequency-independent.
+                (* IODELAY_GROUP = "trace_idelay_grp" *)
+                IDELAYE2 #(
+                    .IDELAY_TYPE         ("FIXED"),
+                    .DELAY_SRC           ("IDATAIN"),
+                    .HIGH_PERFORMANCE_MODE("TRUE"),
+                    .IDELAY_VALUE        (IDELAY_FIXED_VAL),
+                    .SIGNAL_PATTERN      ("DATA"),
+                    .REFCLK_FREQUENCY    (200.0),
+                    .CINVCTRL_SEL        ("FALSE"),
+                    .PIPE_SEL            ("FALSE")
+                ) u_idelay (
+                    .C          (1'b0),
+                    .REGRST     (1'b0),
+                    .LD         (1'b0),
+                    .CE         (1'b0),
+                    .INC        (1'b0),
+                    .CINVCTRL   (1'b0),
+                    .CNTVALUEIN (5'd0),
+                    .IDATAIN    (data_ibuf[i]),
+                    .DATAIN     (1'b0),
+                    .LDPIPEEN   (1'b0),
+                    .DATAOUT    (data_dly[i]),
+                    .CNTVALUEOUT()
+                );
+            end else if (USE_IDELAY) begin : g_idelay
                 wire [4:0] tap;
                 assign tap = (i == 0) ? tap_data0 :
                              (i == 1) ? tap_data1 :
@@ -191,12 +238,6 @@ module trace_capture_a7 #(
                     .IDELAY_TYPE         ("VAR_LOAD"),
                     .DELAY_SRC           ("IDATAIN"),
                     .HIGH_PERFORMANCE_MODE("TRUE"),
-                    // Default sits at mid-tap (16/31). Stage-3 deskew FSM
-                    // calibrates per lane; the static value here exists so
-                    // OOC/post-impl timing analysis sees a non-zero per-lane
-                    // delay and does not flag a -5 ns hold failure on the
-                    // bare trace_data_in -> IDDR/D path. ~78 ps/tap *  16 ~
-                    // 1.25 ns, aligned to the set_input_delay window in xdc.
                     .IDELAY_VALUE        (16),
                     .SIGNAL_PATTERN      ("DATA"),
                     .REFCLK_FREQUENCY    (200.0),

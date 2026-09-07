@@ -45,9 +45,12 @@
 module trace_ddr_stream_top #(
     parameter [4:0] TAP         = 5'd2,         // eye centre from doc 20 Part D
     parameter [4:0] TAP_CLK     = 5'd0,
-    // 1 = IDELAYE2 per-lane deskew (tap sweep, freq-coupled).
-    // 0 = upstream-faithful bypass (IBUF->IDDR direct, freq-independent).
+    // 1 = IDELAYE2 on the data lanes (needed to meet IDDR input hold).
+    // 0 = bare IBUF->IDDR (violates IDDR hold on 7-series; diagnostic only).
     parameter       USE_IDELAY  = 1,
+    // Data IDELAY as FIXED (STA==hardware) with this tap; see trace_capture_a7.
+    parameter       CAP_IDELAY_FIXED     = 1,
+    parameter [4:0] CAP_IDELAY_FIXED_VAL = 5'd24,
     parameter       TRACE_WIDTH = 4,            // power-on TPIU width (4/2/1)
     parameter [31:0] DEST_IP        = {8'd192, 8'd168, 8'd10, 8'd245},
     parameter [15:0] DEST_PORT      = 16'd5555,
@@ -237,7 +240,9 @@ module trace_ddr_stream_top #(
 
     trace_capture_a7 #(
         .CLK_BUF   ("BUFR_IO"),
-        .USE_IDELAY(USE_IDELAY)
+        .USE_IDELAY(USE_IDELAY),
+        .IDELAY_FIXED(CAP_IDELAY_FIXED),
+        .IDELAY_FIXED_VAL(CAP_IDELAY_FIXED_VAL)
     ) u_capture (
         .rst          (rst200),
         .ref_200m     (clk200),
