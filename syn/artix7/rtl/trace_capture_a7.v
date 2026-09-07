@@ -46,52 +46,16 @@ module trace_capture_a7 #(
     //                TRACECLK and the IDDR C pins — the proper source-
     //                synchronous choice (r11 HG-2 sensitivity study).
     parameter CLK_BUF = "BUFG",
-    // Capture method:
-    //   "IDDR"       : sample data on the TRACECLK edges via IDDR. Correct
-    //                  only if data is CENTRE-aligned. The STM32 TPIU is
-    //                  EDGE-aligned (ARM CoreSight TRM: traceclk edges are not
-    //                  offset from data edges), so IDDR samples right on the
-    //                  data transition -> wrong (esp. the falling edge). Kept
-    //                  for reference / centre-aligned sources.
-    //   "OVERSAMPLE" : oversample TRACECLK + the 4 data lines on the fast
-    //                  ref_200m clock, detect TRACECLK edges, and latch data
-    //                  EYE_DELAY ref cycles after each edge — i.e. in the
-    //                  centre of the half-bit. This mirrors exactly what the
-    //                  logic analyser does in software (sample mid-eye, not on
-    //                  the edge), which the LA-sim proved recovers the full
-    //                  anchor set. The correct choice for edge-aligned TPIU at
-    //                  the slow (~1.3 MHz) trace rates we run.  DEFAULT.
-    parameter CAP_METHOD = "OVERSAMPLE",
-    // ref_200m cycles to wait after a detected TRACECLK edge before latching
-    // the data (mid-eye). At 200 MHz one cycle = 5 ns; the half-bit at
-    // TRACECLK<=12.5 MHz is >=40 ns, so a few cycles lands safely inside the
-    // eye. For TRACECLK ~1.3 MHz (half-bit ~380 ns) anything 1..~70 works;
-    // pick a small value so it also tolerates faster trace clocks.
-    parameter EYE_DELAY = 4,
     // IDELAYE2 on the data lanes. 1 = per-lane VAR_LOAD deskew (the tap-sweep
     // path, frequency-coupled). 0 = BYPASS: feed data straight IBUF->IDDR, the
     // faithful port of orbtrace upstream glue.py (DDRInput, no delay element).
     // Upstream relies purely on IOB routing delay + flip-flop hold time to land
     // the IDDR sample inside the next half-bit, which is frequency-independent.
-    // When 0, tap_data*/tap_clk/tap_load are ignored. IDDR-mode only (OVERSAMPLE
-    // re-times in the ref domain and never used the delayed data anyway).
+    // When 0, tap_data*/tap_clk/tap_load are ignored.
     parameter USE_IDELAY = 1
 ) (
     input  wire        rst,
     input  wire        ref_200m,
-
-    // Runtime EYE delay override (OVERSAMPLE). When nonzero, replaces the
-    // EYE_DELAY parameter at run time so the mid-eye sample point can be swept
-    // over UDP without re-synthesising (frequency-sweep, doc 15). 0 => use the
-    // EYE_DELAY parameter default. Tie 0 if unused.
-    input  wire [7:0]  eye_delay_rt,
-
-    // Per-capture clear (pulse on each soft re-arm). Resets the sampler's
-    // clean-start state (seen_rise) so EVERY capture begins on a fresh rising
-    // edge, decoupling capture-start from whatever sampler/TRACECLK phase
-    // happened to be latched at re-arm. Tests + fixes the re-arm phase race
-    // (red-team r16 §5/E1). Tie 0 if unused.
-    input  wire        cap_clear,
 
     // Trace pins from target
     input  wire        trace_clk_p,
@@ -109,48 +73,17 @@ module trace_capture_a7 #(
     input  wire [4:0]  tap_clk,
     input  wire        tap_load,
 
-    // --- Self-test injection (red-team E1, doc r15) ---------------------
-    // When test_en=1, the OVERSAMPLE sampler takes its clock + data from
-    // test_clk/test_data (driven by an FPGA-internal generator in a DIFFERENT,
-    // asynchronous clock domain) instead of the physical trace pins. This
-    // exercises the full async oversampling architecture with CLEAN edges and
-    // NO signal-integrity / IDELAY effects, isolating "async sampling
-    // architecture" faults from physical SI. Tied to 0 in normal capture.
-    input  wire        test_en,
-    input  wire        test_clk,
-    input  wire [3:0]  test_data,
-
     // Captured outputs to traceIF
     output wire        trace_clk,
     output wire [3:0]  trace_a,      // rising-edge sample
     output wire [3:0]  trace_b,      // falling-edge sample
     output wire        idelayctrl_rdy,
 
-    // Glitch-free, ref_200m-domain raw byte capture (OVERSAMPLE only).
-    // cap_byte = {falling nibble, rising nibble} for one TRACECLK period;
-    // cap_valid pulses one ref_200m cycle when cap_byte is freshly complete.
-    // Capturing on (clk200, cap_valid) avoids the async trace_clk->fabric CDC
-    // that tears bytes when BUFR_IO trace_clk races the ref-domain a/b
-    // registers (doc 14 §27). For BUFG/IDDR modes cap_valid stays 0.
+    // Raw byte capture in the ref_200m domain (one byte per TRACECLK period,
+    // {falling nibble, rising nibble}) crossed atomically via the gray-code
+    // async FIFO. cap_valid pulses when cap_byte is freshly popped.
     output wire [7:0]  cap_byte,
-    output wire        cap_valid,
-
-    // E3: real TRACECLK duty stats measured at the synchronised clock (FPGA
-    // side), in ref_200m cycles. High/low half-period dwell min/max/sum/cnt;
-    // the PC computes duty = hi_avg/(hi_avg+lo_avg). Cleared by cap_clear.
-    output reg [15:0]  duty_hi_min,
-    output reg [15:0]  duty_hi_max,
-    output reg [15:0]  duty_lo_min,
-    output reg [15:0]  duty_lo_max,
-    output reg [31:0]  duty_hi_sum,
-    output reg [15:0]  duty_hi_cnt,
-    output reg [31:0]  duty_lo_sum,
-    output reg [15:0]  duty_lo_cnt,
-    // E3b: count of "mid-glitch" half-periods whose dwell is > LOCKOUT but
-    // shorter than a real half-bit (a glitch/runt that slipped past the edge
-    // lockout). A bad capture should show many more of these than a good one,
-    // pinning the root cause. Cleared by cap_clear.
-    output reg [15:0]  glitch_cnt
+    output wire        cap_valid
 );
 
     // ------------------------------------------------------------------
@@ -291,206 +224,17 @@ module trace_capture_a7 #(
     endgenerate
 
     // ------------------------------------------------------------------
-    // Capture method.
+    // Capture method: IDDR edge-sampling (the shipped path). The former
+    // OVERSAMPLE mid-eye sampler was removed 2026-09-07 — it had no consumer
+    // (all OVERSAMPLE tops retired) and the flat eye-sweep confirmed it was
+    // dead code. See docs/artix7-port/stage4-datapath/25-*.md.
+    //
+    // IDDR: DDR input register sampled on the TRACECLK edges (Q1 rising, Q2
+    // falling). The STM32 data is centre-aligned at the rates we run (doc 23),
+    // so sampling on the edge lands in the eye. One byte per TRACECLK period
+    // crosses to ref_200m through a gray-code async FIFO (atomic, gap-tolerant).
     // ------------------------------------------------------------------
-    generate
-    if (CAP_METHOD == "OVERSAMPLE") begin : g_oversample
-        // ----------------------------------------------------------------
-        // Oversampled, mid-eye capture (mirrors the logic-analyser method).
-        //
-        // The STM32 TPIU drives TRACECLK *edge-aligned* with the data: data
-        // transitions land on TRACECLK edges, so the centre of each half-bit
-        // (the safe sampling point) is ~a quarter-period AFTER an edge. We
-        // oversample TRACECLK and the 4 data lanes on the fast ref_200m clock,
-        // detect each TRACECLK edge, then latch the data EYE_DELAY ref cycles
-        // later — i.e. inside the eye, exactly like the LA samples at edge+N.
-        //
-        //   rising  TRACECLK edge -> (after EYE_DELAY) latch into a_reg
-        //   falling TRACECLK edge -> (after EYE_DELAY) latch into b_reg
-        //
-        // a_reg/b_reg are held until the next same-direction edge (~one full
-        // TRACECLK period, ~760 ns @1.3 MHz). traceIF reads them on the
-        // recovered trace_clk; since they are stable for ~the whole period and
-        // updated only ~EYE_DELAY*5 ns after an edge (far from the trace_clk
-        // sampling instant), the CDC is safe at the low trace rates we run.
-        // (At much higher TRACECLK this would need an explicit handshake;
-        // out of scope for the low-speed 100%-correct milestone.)
-        // ----------------------------------------------------------------
-
-        // Synchronise TRACECLK (raw IBUF) and the 4 data lanes into ref_200m.
-        // Self-test (test_en) swaps in an FPGA-internal async clean source
-        // BEFORE the synchroniser, so the full async oversampling path is
-        // exercised with no physical-pin / IDELAY / SI effects (doc r15 E1).
-        wire       os_clk_src  = test_en ? test_clk  : trace_clk_ibuf;
-        wire [3:0] os_data_src = test_en ? test_data : data_dly;
-        reg [2:0] tck_sync = 3'b0;        // 3-FF async synchroniser
-        reg [3:0] d_s0 = 4'b0, d_s1 = 4'b0;
-        always @(posedge ref_200m) begin
-            tck_sync <= {tck_sync[1:0], os_clk_src};
-            d_s0 <= os_data_src;
-            d_s1 <= d_s0;
-        end
-
-        // ----------------------------------------------------------------
-        // Spurious-edge lockout (doc 15 §9 fix). The intermittent ~20%
-        // bad-capture rate came from occasional SPURIOUS extra TRACECLK edges
-        // (metastability / ringing crossing the synchroniser): one extra edge
-        // inserts a nibble and permanently shifts the DDR pairing + byte
-        // boundary, corrupting the rest of the capture ("clean region then
-        // dirty to end" signature). Fix: after accepting an edge, ignore any
-        // further edge for LOCKOUT ref cycles. Real TRACECLK edges are a
-        // half-bit apart (76 ref cycles @1.3MHz), far longer than any glitch,
-        // so a short lockout rejects glitches WITHOUT dropping real edges.
-        // (Unlike a hold-based de-bounce, a lockout cannot delay/drop a real
-        // edge — it only suppresses a too-soon second one.)
-        // ----------------------------------------------------------------
-        wire tck_s    = tck_sync[2];
-        wire tck_prev = tck_sync[1];
-        wire raw_rise = tck_s & ~tck_prev;
-        wire raw_fall = ~tck_s & tck_prev;
-        localparam [4:0] LOCKOUT = 5'd4;   // 4 ref cycles = 20ns min edge spacing
-        reg [4:0] lock_cnt = 5'd0;
-        wire locked = (lock_cnt != 0);
-        always @(posedge ref_200m) begin
-            if (rst) lock_cnt <= 0;
-            else if ((raw_rise | raw_fall) & ~locked) lock_cnt <= LOCKOUT;
-            else if (locked) lock_cnt <= lock_cnt - 1'b1;
-        end
-        wire rise_evt = raw_rise & ~locked;
-        wire fall_evt = raw_fall & ~locked;
-
-        // EYE delay actually used: runtime override if nonzero, else the
-        // EYE_DELAY parameter default. 8-bit counters cover up to 255 ref
-        // cycles (~1.275 us), enough for the half-bit even at /512.
-        wire [7:0] eye_use = (eye_delay_rt != 8'd0) ? eye_delay_rt
-                                                    : EYE_DELAY[7:0];
-
-        // EYE_DELAY countdown timers, one per edge direction.
-        reg [7:0] r_cnt = 0, f_cnt = 0;
-        reg          r_arm = 1'b0, f_arm = 1'b0;
-        reg [3:0]    a_reg = 4'b0, b_reg = 4'b0;
-
-        always @(posedge ref_200m) begin
-            if (rst) begin
-                r_arm <= 1'b0; f_arm <= 1'b0;
-                a_reg <= 4'b0; b_reg <= 4'b0;
-            end else begin
-                // rising-edge sample
-                if (rise_evt) begin
-                    r_arm <= 1'b1;
-                    r_cnt <= eye_use;
-                end else if (r_arm) begin
-                    if (r_cnt == 0) begin
-                        a_reg <= d_s1;
-                        r_arm <= 1'b0;
-                    end else begin
-                        r_cnt <= r_cnt - 1'b1;
-                    end
-                end
-                // falling-edge sample
-                if (fall_evt) begin
-                    f_arm <= 1'b1;
-                    f_cnt <= eye_use;
-                end else if (f_arm) begin
-                    if (f_cnt == 0) begin
-                        b_reg <= d_s1;
-                        f_arm <= 1'b0;
-                    end else begin
-                        f_cnt <= f_cnt - 1'b1;
-                    end
-                end
-            end
-        end
-
-        assign trace_a = a_reg;   // rising-edge nibble (mid-eye)
-        assign trace_b = b_reg;   // falling-edge nibble (mid-eye)
-
-        // --------------------------------------------------------------
-        // Glitch-free capture strobe, all in ref_200m.
-        // A DDR byte = (rising nibble, falling nibble) of one TRACECLK
-        // period. We emit the byte one ref cycle AFTER b_reg is latched
-        // (falling nibble is the second of the pair), pairing it with the
-        // a_reg already latched earlier the same period. Both registers are
-        // long-settled in the ref domain, so the captured byte cannot tear.
-        // --------------------------------------------------------------
-        // Clean start: suppress cap_valid until at least one rising-edge
-        // sample has been latched, so every capture's first emitted byte is a
-        // proper (rising, falling) pair. Without this, a capture (re-)armed
-        // mid-period could emit a first byte pairing a falling nibble with a
-        // stale rising nibble, offsetting the whole stream by half a period
-        // and corrupting the capture from byte 0 (the uniform-dirty ~7% bad
-        // captures seen after the glitch lockout, doc 15 §9/§12).
-        reg        seen_rise = 1'b0;
-        reg        b_latched = 1'b0;
-        reg [7:0]  cap_byte_r = 8'b0;
-        reg        cap_valid_r = 1'b0;
-        always @(posedge ref_200m) begin
-            if (rst) begin
-                b_latched   <= 1'b0;
-                cap_valid_r <= 1'b0;
-                cap_byte_r  <= 8'b0;
-                seen_rise   <= 1'b0;
-            end else begin
-                // Per-capture clear: re-arm forces a fresh rising-edge start so
-                // capture-start is decoupled from the latched sampler/TRACECLK
-                // phase (r16 E1). Also gate cap_valid off this cycle.
-                if (cap_clear) seen_rise <= 1'b0;
-                else if (r_arm && r_cnt == 0) seen_rise <= 1'b1;
-                // detect the cycle b_reg gets latched (f_arm falling with cnt 0)
-                b_latched <= (f_arm && f_cnt == 0);
-                if (b_latched && seen_rise && !cap_clear) begin
-                    cap_byte_r  <= {b_reg, a_reg};
-                    cap_valid_r <= 1'b1;
-                end else begin
-                    cap_valid_r <= 1'b0;
-                end
-            end
-        end
-        assign cap_byte  = cap_byte_r;
-        assign cap_valid = cap_valid_r;
-
-        // E3 duty measurement: count high vs low half-period dwell of the
-        // synchronised TRACECLK (tck_sync[2]) in ref_200m cycles. Cleared on
-        // cap_clear so each capture reports its own window's duty (doc 15 §12).
-        reg [15:0] dwell = 0;
-        always @(posedge ref_200m) begin
-            if (rst || cap_clear) begin
-                dwell <= 0;
-                duty_hi_min <= 16'hFFFF; duty_hi_max <= 0;
-                duty_lo_min <= 16'hFFFF; duty_lo_max <= 0;
-                duty_hi_sum <= 0; duty_lo_sum <= 0;
-                duty_hi_cnt <= 0; duty_lo_cnt <= 0;
-                glitch_cnt <= 0;
-            end else if (tck_s != tck_prev) begin
-                // a half-period (level tck_prev) just ended after `dwell` cycles
-                if (tck_prev) begin
-                    if (dwell < duty_hi_min) duty_hi_min <= dwell;
-                    if (dwell > duty_hi_max) duty_hi_max <= dwell;
-                    duty_hi_sum <= duty_hi_sum + dwell;
-                    duty_hi_cnt <= duty_hi_cnt + 1'b1;
-                end else begin
-                    if (dwell < duty_lo_min) duty_lo_min <= dwell;
-                    if (dwell > duty_lo_max) duty_lo_max <= dwell;
-                    duty_lo_sum <= duty_lo_sum + dwell;
-                    duty_lo_cnt <= duty_lo_cnt + 1'b1;
-                end
-                // mid-glitch: a half-period far shorter than a real half-bit
-                // (real /64 half-bit = ~76 cyc; <32 cyc = a glitch that slipped
-                // past the LOCKOUT=4 window). Count them per capture.
-                if (dwell >= 2 && dwell < 32) glitch_cnt <= glitch_cnt + 1'b1;
-                dwell <= 1;
-            end else begin
-                dwell <= dwell + 1'b1;
-            end
-        end
-
-    end else begin : g_iddr
-        // ----------------------------------------------------------------
-        // IDDR: DDR input register sampled on the TRACECLK edges. Correct
-        // only for CENTRE-aligned sources; the STM32 TPIU is edge-aligned so
-        // this samples on the data transition (doc 14 §21 regression). Kept
-        // for reference and for centre-aligned parts.
-        // ----------------------------------------------------------------
+    generate begin : g_iddr
         wire [3:0] iddr_a, iddr_b;
         genvar j;
         for (j = 0; j < 4; j = j + 1) begin : g_iddr_lane
@@ -561,13 +305,6 @@ module trace_capture_a7 #(
         );
         assign cap_valid = fifo_m_valid & fifo_m_ready;
         assign cap_byte  = fifo_m_data;
-
-        // IDDR mode does not measure duty; hold the stats at 0.
-        always @(posedge ref_200m) begin
-            duty_hi_min <= 0; duty_hi_max <= 0; duty_lo_min <= 0;
-            duty_lo_max <= 0; duty_hi_sum <= 0; duty_hi_cnt <= 0;
-            duty_lo_sum <= 0; duty_lo_cnt <= 0; glitch_cnt <= 0;
-        end
     end
     endgenerate
 

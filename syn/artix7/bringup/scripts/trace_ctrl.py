@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""trace_ctrl — write runtime CSRs to trace_stream_top over UDP :5002.
+"""trace_ctrl — write runtime CSRs to trace_ddr_stream_top over UDP :5002.
 
 CSR map (fpga_core_net control port, doc 15):
-  0x01  EYE delay   : ref_200m cycles for OVERSAMPLE mid-eye sampling (0=default)
   0x02  soft re-arm : any write re-arms the one-shot capture (no reflash)
   0x03/04 SWO bit length lo/hi
   0x05  IDELAY tap, all data lanes      0x06  per-lane tap {lane[6:5],tap[4:0]}
   0x07  clock-lane IDELAY tap
   0x08  TPIU port width: 4, 2 or 1 bit -- runtime, so ONE bitstream serves all
         three widths (readback at DEPTH+33)
+  0x09  stream selftest ramp   0x0B  fixed 0x42 source
+
+Note: the capture front-end is IDDR edge-sampling; there is no eye-delay CSR
+(the OVERSAMPLE mid-eye path was removed 2026-09-07, see docs 24/25).
 
 Request payload = {reg_addr(1B), reg_value(1B)} (+pad); the FPGA latches both
 and pulses csr_we at end-of-frame.
 
 Usage:
-  python3 trace_ctrl.py --ip 192.168.10.42 set-eye 38
+  python3 trace_ctrl.py --ip 192.168.10.42 set-tap 2
   python3 trace_ctrl.py --ip 192.168.10.42 rearm
 """
 import argparse
@@ -28,7 +31,6 @@ except ImportError:
 
 CTRL_PORT = 5002
 _IFACE = None      # set by main() from discovery; write_csr binds to it
-REG_EYE = 0x01
 REG_REARM = 0x02
 REG_BITLEN_LO = 0x03
 REG_BITLEN_HI = 0x04
@@ -70,8 +72,6 @@ def main():
                     help="bind CSR writes to this NIC (default: auto-discover)")
     ap.add_argument("--no-discover", action="store_true")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    pe = sub.add_parser("set-eye")
-    pe.add_argument("value", type=int)
     pb = sub.add_parser("set-bitlen",
                         help="SWO NRZ bit length in ref_200m cycles (=200e6/baud)")
     pb.add_argument("value", type=int)
@@ -108,10 +108,7 @@ def main():
             pass
     a.ip = ip or (fpga_net.DEFAULT_FPGA_IP if fpga_net else "192.168.10.42")
 
-    if a.cmd == "set-eye":
-        write_csr(a.ip, REG_EYE, a.value)
-        print(f"set EYE delay = {a.value}")
-    elif a.cmd == "set-bitlen":
+    if a.cmd == "set-bitlen":
         write_csr(a.ip, REG_BITLEN_LO, a.value & 0xFF)
         write_csr(a.ip, REG_BITLEN_HI, (a.value >> 8) & 0xFF)
         print(f"set SWO bitlen = {a.value} ref cycles (~{200e6/a.value/1e6:.3f} Mbaud)")

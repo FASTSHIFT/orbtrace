@@ -21,7 +21,6 @@
 //     0x0B bit as ddr_ring_selftest_top, so S1b results transfer directly
 //
 // Config CSRs (:5002, same map as trace_stream_top for tool reuse):
-//   0x01  EYE delay  (OVERSAMPLE mid-eye sample offset)
 //   0x05  IDELAY tap (all data lanes)
 //   0x06  IDELAY tap per-lane {lane[6:5], tap[4:0]}
 //   0x07  IDELAY tap on clock lane
@@ -44,13 +43,11 @@
 `default_nettype none
 
 module trace_ddr_stream_top #(
-    parameter       CAP_METHOD  = "IDDR",       // "IDDR" | "OVERSAMPLE"
     parameter [4:0] TAP         = 5'd2,         // eye centre from doc 20 Part D
     parameter [4:0] TAP_CLK     = 5'd0,
     // 1 = IDELAYE2 per-lane deskew (tap sweep, freq-coupled).
     // 0 = upstream-faithful bypass (IBUF->IDDR direct, freq-independent).
     parameter       USE_IDELAY  = 1,
-    parameter       EYE         = 4,            // OVERSAMPLE mid-eye
     parameter       TRACE_WIDTH = 4,            // power-on TPIU width (4/2/1)
     parameter [31:0] DEST_IP        = {8'd192, 8'd168, 8'd10, 8'd245},
     parameter [15:0] DEST_PORT      = 16'd5555,
@@ -187,7 +184,6 @@ module trace_ddr_stream_top #(
     wire [7:0]  csr_addr_w, csr_data_w;
     wire        csr_we_w;
 
-    reg  [7:0]  eye_csr = EYE;
     reg  [4:0]  tap_csr = TAP;
     reg         tap_ld = 0;
     reg  [4:0]  tap_clk_csr = TAP_CLK;
@@ -203,11 +199,10 @@ module trace_ddr_stream_top #(
     always @(posedge clk125) begin
         tap_ld <= 1'b0;               // one-shot pulse
         if (sys_rst) begin
-            eye_csr <= EYE; tap_csr <= TAP; tap_clk_csr <= TAP_CLK;
+            tap_csr <= TAP; tap_clk_csr <= TAP_CLK;
             selftest_csr <= 0; stream_pause_125 <= 0; src_fixed_125 <= 0;
             diag_clr_125 <= 0;
         end else if (csr_we_w) case (csr_addr_w)
-            8'h01: eye_csr        <= csr_data_w;
             8'h05: begin tap_csr <= csr_data_w[4:0]; tap_ld <= 1'b1; end
             8'h06: tap_lane_csr[csr_data_w[6:5]] <= csr_data_w[4:0];
             8'h07: begin tap_clk_csr <= csr_data_w[4:0]; tap_ld <= 1'b1; end
@@ -221,13 +216,11 @@ module trace_ddr_stream_top #(
         endcase
     end
 
-    // eye_csr / tap_csr into clk200 for trace_capture_a7
-    reg [7:0] eye_s0 = 0, eye_rt = 0;
+    // tap_csr into clk200 for trace_capture_a7
     reg [4:0] tap0_s0=0, tap1_s0=0, tap2_s0=0, tap3_s0=0, tapc_s0=0;
     reg [4:0] tap0_200=0, tap1_200=0, tap2_200=0, tap3_200=0, tapc_200=0;
     reg       tap_ld_s0=0, tap_ld_200=0, tap_ld_200_q=0;
     always @(posedge clk200) begin
-        eye_s0 <= eye_csr;   eye_rt <= eye_s0;
         tap0_s0<=tap_lane_csr[0]; tap0_200<=tap0_s0;
         tap1_s0<=tap_lane_csr[1]; tap1_200<=tap1_s0;
         tap2_s0<=tap_lane_csr[2]; tap2_200<=tap2_s0;
@@ -244,14 +237,10 @@ module trace_ddr_stream_top #(
 
     trace_capture_a7 #(
         .CLK_BUF   ("BUFR_IO"),
-        .CAP_METHOD(CAP_METHOD),
-        .USE_IDELAY(USE_IDELAY),
-        .EYE_DELAY (EYE)
+        .USE_IDELAY(USE_IDELAY)
     ) u_capture (
         .rst          (rst200),
         .ref_200m     (clk200),
-        .eye_delay_rt (eye_rt),
-        .cap_clear    (1'b0),
         .trace_clk_p  (trace_clk_in),
         .trace_data_p (trace_data_in),
         .tap_data0    (tap0_200),
@@ -260,18 +249,12 @@ module trace_ddr_stream_top #(
         .tap_data3    (tap3_200),
         .tap_clk      (tapc_200),
         .tap_load     (tap_load_200),
-        .test_en      (1'b0),
-        .test_clk     (1'b0),
-        .test_data    (4'b0),
         .trace_clk    (),
         .trace_a      (),
         .trace_b      (),
         .idelayctrl_rdy(idelayctrl_rdy),
         .cap_byte     (cap_byte),
-        .cap_valid    (cap_valid),
-        .duty_hi_min(), .duty_hi_max(), .duty_lo_min(), .duty_lo_max(),
-        .duty_hi_sum(), .duty_hi_cnt(), .duty_lo_sum(), .duty_lo_cnt(),
-        .glitch_cnt ()
+        .cap_valid    (cap_valid)
     );
 
     // ============ Source select: selftest ramp / fixed 0x42 / real trace ============
