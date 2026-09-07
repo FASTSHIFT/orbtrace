@@ -111,3 +111,61 @@ python3 -c "import opencsd_etm4_run as R; raw=open('cap.bin','rb').read()[:2<<20
   _,p,o,d,_,_,_=R.recover_assemble(raw,2); e,_=R.T.deframe(d,want_stream=2); \
   print(R.diagnose_bitflip(e))"
 ```
+
+---
+
+## 更新（2026-09-07 晚）：修 I/O 补偿单元 + 纠正机理
+
+### 修复：SYSCFG I/O 补偿单元没使能（真固件 bug）
+
+`etm_selftrace.c` 把 PE2..PE6 的 OSPEEDR 设成了 very-high（0b11），但 H7 上
+very-high pad 只有在 **SYSCFG_CCCSR.EN** 使能后才达到额定压摆率；否则退回慢速默认
+驱动。固件从来没开这个补偿单元。加上：clock SYSCFG（RCC_APB4ENR.SYSCFGEN）→ 置
+`SYSCFG_CCCSR.EN` → 等 READY。
+
+示波器实测（56 MHz pin，半 UI = 8.8 ns，CH2=PE5）：
+
+| | 修前 | 修后 |
+|---|---|---|
+| PE5 上升 | 5.47 ns | **2.8 ns** |
+| PE5 下降 | 3.25 ns | **2.4 ns** |
+
+边沿几乎砍半，上升/下降也对称了。**这是个真 bug，值得修**（对 PE2..PE6 全部生效）。
+
+### 但：解码错误率几乎没变 —— 上面的"慢边沿眼闭"假设被推翻
+
+补偿单元开启后重抓 56M：
+
+| | reserved% | 可恢复 |
+|---|---|---|
+| 修前 56M | 18.1% | 100% bit6 |
+| 修后 56M | **17.5%** | 100% bit6 |
+| IDELAY(tap2) 56M | 18.8% | 100% bit6 |
+
+边沿砍半、错误率纹丝不动（3 个窗口 17.3–17.6% 稳定）。per-lane 数据 IDELAY 也无效。
+**如果是压摆率导致的眼闭，边沿砍半应该大幅开眼——没有。所以不是 SI 压摆问题。**
+
+### 纠正后的机理：TRACED2 下降沿采样 stuck-at-0
+
+对每一个候选单 bit 翻转统计"reserved-after-atom 变合法"的数量：**只有 0x40 有效**
+（10418 个），其余 bit 全 0。再看方向：
+
+* 坏字节 bit6=1 应为 0：**0 个**
+* 坏字节 bit6=0 应为 1：**10418 个（100%）**
+
+**单向 stuck-at-0**，不是随机翻转（随机翻转/慢边沿会双向大致均匀）。
+
+bit6 = 下降沿 nibble 的 bit2 = **lane2（TRACED2）的下降沿（IDDR Q2）采样**。同一
+lane 的上升沿采样（bit2 / 0x04）完全干净。也就是：
+
+> TRACED2 的**下降沿** DDR 采样约 17% 概率把真值 1 读成 0；上升沿采样正常。
+
+STM32 引脚两个相位是同一个驱动、示波器边沿也干净（2.8 ns），所以问题在 **FPGA 侧
+lane2 的下降沿捕获路径（IDDR Q2 的 hold/相位）**，不是 STM32、不是压摆、不是数据
+IDELAY。已测两个杠杆（补偿单元压摆、per-lane IDELAY）都无效，停止试错。
+
+### 下一步候选（未验证）
+* clock-lane IDELAY（tap_clk）移动采样时钟相位——下降沿 hold 问题可能对时钟相位敏感，
+  而对数据 IDELAY 不敏感（数据两相位一起动，时钟只动一边的相对关系）。
+* 检查 lane2 IOB 的布局/约束是否与其它三条不对称（set_input_delay / IDELAY_GROUP）。
+* 直接示波器测 PE5 下降沿相对 TRACECLK 的 hold 窗口 vs 其它 lane。
