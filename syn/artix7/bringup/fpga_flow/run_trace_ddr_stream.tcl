@@ -127,8 +127,7 @@ set_false_path -to [get_cells -hier -filter {NAME =~ *selftest_s0_reg* || \
                                               NAME =~ *src_fixed_s0_reg*  || \
                                               NAME =~ *tap0_s0_reg*  || NAME =~ *tap1_s0_reg* || \
                                               NAME =~ *tap2_s0_reg*  || NAME =~ *tap3_s0_reg* || \
-                                              NAME =~ *tapc_s0_reg*  || NAME =~ *tap_ld_s0_reg* || \
-                                              NAME =~ *eye_s0_reg*}]
+                                              NAME =~ *tapc_s0_reg*  || NAME =~ *tap_ld_s0_reg*}]
 
 opt_design
 place_design
