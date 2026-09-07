@@ -28,6 +28,30 @@ create_clock -period 12.000 -name trace_clk_in [get_ports trace_clk_in]
 # BUFR's clock region for all placements).
 set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -of_objects [get_pins u_capture/g_bufr.u_bufio_clk/O]]
 
+# ---- Source-synchronous input timing for the DDR trace capture ----
+# WHY: without set_input_delay on trace_data_in[*] vs trace_clk_in, the IDDR
+# data capture is UNCONSTRAINED — Vivado's timing report flagged it as
+# "no_input_delay (HIGH)". Each data pin then routes to its IDDR with an
+# arbitrary, unequal delay and setup/hold at the sampling edge is never
+# analysed. On the flying-wire rig this let per-lane / per-DDR-phase margin
+# drift enough that some lanes (measured: TRACED0/PE3 and TRACED3/PE6) sampled
+# the wrong value on one edge while others were fine — a silent, per-lane
+# capture fault invisible to STA. Constraining the interface forces the tool to
+# (a) analyse setup/hold and (b) balance the lane routing to a defined window.
+#
+# The STM32 TPIU is centre-aligned DDR: the data eye is centred on each
+# TRACECLK edge (LA-measured: data transitions land ~mid-UI, ~4 ns from either
+# sampling edge). Model a symmetric valid window around both clock edges.
+# Half-UI @ the constrained 12 ns period = 6 ns; with ~3 ns edges the stable
+# eye is ~±2.5 ns about the clock edge. Use max/min delays that describe a
+# data-valid window of [1.0, 5.0] ns after the launching clock edge for both
+# rising and falling (DDR), i.e. sample point near the eye centre.
+set _td [get_ports {trace_data_in[*]}]
+set_input_delay -clock trace_clk_in -max 5.0 $_td
+set_input_delay -clock trace_clk_in -min 1.0 $_td
+set_input_delay -clock trace_clk_in -max 5.0 $_td -clock_fall -add_delay
+set_input_delay -clock trace_clk_in -min 1.0 $_td -clock_fall -add_delay
+
 # ---- RGMII (RTL8211E), BANK 15 ----
 set_property PACKAGE_PIN K18 [get_ports phy_rx_clk]
 set_property PACKAGE_PIN K19 [get_ports phy_rx_ctl]

@@ -169,3 +169,70 @@ IDELAY。已测两个杠杆（补偿单元压摆、per-lane IDELAY）都无效�
   而对数据 IDELAY 不敏感（数据两相位一起动，时钟只动一边的相对关系）。
 * 检查 lane2 IOB 的布局/约束是否与其它三条不对称（set_input_delay / IDELAY_GROUP）。
 * 直接示波器测 PE5 下降沿相对 TRACECLK 的 hold 窗口 vs 其它 lane。
+
+---
+
+## 根因确认（2026-09-07 深夜）：IDDR 输入 hold 违例，被"缺约束"掩盖
+
+### 问题藏在没写的约束里，不是编译警告里
+
+过了一遍综合日志的 172 个 warning，绝大多数是 MIG 内部 / unconnected port /
+unused，无关。真正的线索在 timing checker：
+
+```
+5. checking no_input_delay (10)
+   There are 9 input ports with no input delay specified. (HIGH)
+```
+
+**`trace_data_in[*]` 和 `trace_clk_in` 都没有 `set_input_delay`。** 也就是说 IDDR
+对 4 条数据线的采样是**完全没有时序约束**的——Vivado 不知道 pin 到 IDDR 的数据/时钟
+关系，从不检查 IDDR 的 setup/hold，每条线随便布线、各自延时不等。这正好能产生"某些
+lane / 某个相位系统性采错"的现象（实测 PE3/PE6），而且 STA 完全看不到。
+
+### 加上源同步输入约束后，hold 违例现形
+
+给 `trace_data_in[*]` 加 `set_input_delay`（相对 trace_clk_in，双沿 DDR）后重跑：
+
+```
+trace_clk_in   WHS = -1.874ns   THS = -7.464ns   4 failing endpoints
+```
+
+定点报告，tool 原话：
+
+```
+Slack (VIOLATED): -1.874ns
+  Source:      trace_data_in[0]
+  Destination: u_capture/g_iddr.g_iddr_lane[0].u_iddr/D
+  Data Path Delay: 1.330ns (route 0.000ns)
+  IDDR (Hold_iddr_C_D) 0.155 ...
+```
+
+**USE_IDELAY=0（direct）时数据 IBUF 直连 IDDR/D，零延时，满足不了 IDDR 的输入
+hold（需要数据在时钟沿后保持 0.155ns），hold 违例 1.874ns。** 4 个 failing endpoint
+就是这些 IDDR 数据采样。这就是 PE3/PE6 掉位的物理机理——不是 SI、不是竞争、不是飞线
+（LA 在同一点抓是干净的），是 **FPGA 片内 IDDR 的输入 hold 违例，此前因为接口没约束
+而对 STA 隐形**。
+
+### IDELAY 是正解，不是历史包袱 —— 推翻之前的结论
+
+`USE_IDELAY=1` 在数据线插 IDELAYE2，等于给数据加延时来满足 hold：
+
+| build | trace_clk_in WHS | 数据路径延时 |
+|---|---|---|
+| USE_IDELAY=0 (direct) | **-1.874 ns**（违例）| 1.330 ns（IBUF 直连）|
+| USE_IDELAY=1 (tap=16) | **-0.124 ns**（几乎满足）| 3.080 ns（IBUF+IDELAYE2）|
+
+tap=16 把 hold 从 -1.87ns 拉到 -0.124ns，再稍微加大 tap 就能彻底清零。
+
+**结论修正**：之前 doc23/24 "112M+IDELAY 退役、direct 更好、IDELAY 是冗余" 是错的。
+真相是 **direct 违反 IDDR 输入 hold、会采错**；**IDELAYE2 正是满足 hold 的必要手段**。
+上游 orbtrace 用 bare IDDR 能工作，是因为它的板子/布局把 pin→IDDR 的延时天然凑进了
+hold 窗口；我们这块（飞线 + 未约束布线）凑不进去，必须用 IDELAY + `set_input_delay`
+约束显式收敛。
+
+### 下一步
+1. 默认改回 `USE_IDELAY=1`，并把数据 IDELAY tap 调到 hold 转正（tap 16→~20 扫一下，
+   或直接看 report_timing 的 hold slack 收敛点）。
+2. `set_input_delay` 约束保留（本次已加进 trace_ddr_stream.xdc）——它是让 hold 可被
+   分析、可被收敛的前提。
+3. 重烧后再抓 trace，看 PE3/PE6 掉位是否消失、解码错误率是否降下来。
