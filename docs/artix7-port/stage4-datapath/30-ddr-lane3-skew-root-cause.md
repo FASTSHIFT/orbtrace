@@ -52,11 +52,37 @@ lane 3 的字节 = `ref[i-32]`，即它输出的是 **2 个 128-bit 字之前**�
   错 1 个，正是"变化数据坏、静态数据好"的精确特征。
 - **A-sync 长零游程**：对单 lane 错位最敏感，所以最先崩。
 
-## 下一步：修 RTL
+## 根因（仿真确认）：la_ddr_writer 打包器 late-sample 组合字
 
-在 128-bit DDR 写/读通路里找 lane 3（byte 3）比其它 lane 多一级/两级寄存器的
-地方（la_ddr_writer 的 byte→128b 打包，或 ring streamer 的 128b→8b gearbox，
-或 MIG 用户接口的某个 byte lane 接线）。定位后对齐该 lane 的流水级数。
+用 `tb_prbs_cdc.v`（真实 axis_async_fifo + 真实打包器，纯功能仿真、零时序/零
+亚稳态）**在仿真里 1:1 复现了硬件症状**：FIFO 裸弹出的字节流完全正确，但打包成
+128-bit 字后，**每个字里 cap_bidx==9 那个字节被延迟 2 个字（32 字节），got=ref[i-32]**，
+mod16 恒为同一位置。→ 故障不是时序、不是 CDC 亚稳态，是**打包器纯逻辑 bug**。
+
+bug 在 `la_ddr_writer.v`：
+```
+wire [127:0] cap_word_full = cap_word_next;   // 组合
+// FIFO 用 cap_word_valid（寄存器，晚一拍）当 tvalid 采样 cap_word_full
+```
+`cap_word_valid` 是寄存器，比第 16 个字节晚一拍拉高。在它拉高那一拍，如果又来了
+第 17 个字节（`cap_valid_in` 高——正是数据经 trace_clk→cap_clk CDC FIFO 连续
+背靠背流入的稳态），`cap_word` 已经把第 17 字节移入，`cap_word_next` 变成
+bytes[1..16]+byte17，而不是 bytes[0..15]。存进 FIFO 的 128-bit 字因此错位，
+一个字节位置带着 2 个字之前的旧值。
+
+**为什么 ramp 测不出**：ramp 在 clk200 域注入，受 DDR 背压/间隙节流，`cap_valid_in`
+不是连续高，几乎不触发"完成拍又来一字节"的碰撞；PRBS 经 CDC FIFO 以 200M 连续
+背靠背弹出，每个字都碰撞。
+
+## 修复
+
+在完成拍（`cap_bidx==WORDS_PER-1`）把整字锁进 `cap_word_latched` 寄存器，
+`cap_word_full` 改接这个寄存器而非组合的 `cap_word_next`。仿真验证：
+`FIX_LATCH` 版 packed 流 0 错。
+
+改动：`la_ddr_writer.v`（+ `tb_prbs_cdc.v` 复现/回归仿真）。硬件回归：烧
+`trace_ddr_stream_fix.bit`，`iddr-prbs 1` → `prbs_check.py` 应 BYTE-PERFECT，
+且真实 trace 应大幅改善。
 
 ## 现存改动（未 commit）
 - `trace_capture_a7.v`：加 `test_src_en` + 帧化 xorshift32 PRBS 源（诊断用，
