@@ -61,10 +61,13 @@ foreach v $taps {
     opt_design
     place_design
     route_design
-    set p [get_timing_paths -hold \
+    set ph [get_timing_paths -hold \
             -from [get_clocks trace_clk_in] -to [get_clocks trace_clk_in]]
-    set whs [get_property SLACK $p]
-    puts "HOLD-RESULT tap=$v  trace_clk_in_WHS=$whs ns"
+    set whs [get_property SLACK $ph]
+    set ps [get_timing_paths -setup \
+            -from [get_clocks trace_clk_in] -to [get_clocks trace_clk_in]]
+    set wns [get_property SLACK $ps]
+    puts "HOLD-RESULT tap=$v  WNS(setup)=$wns  WHS(hold)=$whs ns"
     close_design
 }
 puts "======== SWEEP DONE ========"
