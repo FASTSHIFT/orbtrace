@@ -77,6 +77,17 @@ module trace_capture_a7 #(
     input  wire        trace_clk_p,
     input  wire [3:0]  trace_data_p,
 
+    // Link stress test: when 1, the byte pushed into the trace_clk->ref_200m
+    // CDC FIFO is a trace_clk-domain xorshift32 PRBS (low 8 bits) instead of
+    // the IDDR sample {iddr_b,iddr_a}. This exercises EXACTLY the same CDC
+    // FIFO + downstream DDR/UDP path the real capture uses, but with a
+    // violently-changing, host-reproducible pattern -- so a byte drop/dup in
+    // the FIFO shows up as a PRBS break. It bypasses ONLY the IDDR primitive
+    // itself, so: PRBS clean + real corrupt => fault is the IDDR sampling;
+    // PRBS also broken => fault is the CDC FIFO handshake. Synchronised to
+    // trace_clk inside this module (see g_iddr block).
+    input  wire        test_src_en,
+
     // IDELAY control (static for OOC; runtime-calibrated on real HW)
     input  wire [4:0]  tap_data0,
     input  wire [4:0]  tap_data1,
@@ -311,10 +322,75 @@ module trace_capture_a7 #(
         // stopped TRACECLK simply stops pushing (no garbage). No PLL/MMCM lock
         // to lose. Depth 32 is ample: write rate <= TRACECLK (<=200M), read rate
         // = ref_200m (200M), so it never backs up in steady state.
+        // trace_clk-domain xorshift32 PRBS for the link stress test. Advances
+        // one step per TRACECLK edge, exactly like the real byte cadence, and
+        // is pushed through the SAME CDC FIFO. The byte pushed each edge is the
+        // PRBS state BEFORE that edge's update (non-blocking sample below), so
+        // the emitted stream is s0, s1=f(s0), s2=f(s1), ... with s0=seed=0x1.
+        // Host reproduces bit-for-bit (emit-then-advance):
+        //   s = 0x1
+        //   repeat: emit (s & 0xFF); s ^= (s<<13); s ^= (s>>17); s ^= (s<<5)
+        // all ops masked to 32 bits.
+        // Sync the (slow, level) test-enable into trace_clk. It is a static
+        // mode bit toggled by a CSR long before capture, so a 2-FF sync is
+        // ample; no glitch concern.
+        reg test_en_s0 = 1'b0, test_en_tclk = 1'b0;
+        always @(posedge trace_clk) begin
+            test_en_s0   <= test_src_en;
+            test_en_tclk <= test_en_s0;
+        end
+
+        // FRAMED xorshift32 PRBS. A free-running PRBS is unlockable once the
+        // link drops a byte (a dropped byte skips a state, desyncing the whole
+        // stream forever). So we FRAME it: every 8192-byte block starts with an
+        // 8-byte fixed marker and RESEEDS the PRBS to 0x1. The host locks on
+        // the marker, then knows the exact byte sequence for the block; the
+        // marker-to-marker spacing measures dropped bytes directly (8192 = no
+        // loss; each drop shortens the gap by one).
+        //
+        //   block[0..7]    = marker A5 5A C3 3C F0 0F 99 66   (prbs held at seed)
+        //   block[8..8191] = xorshift32 low-byte stream from seed 0x1:
+        //                    emit 0x01, then s^=s<<13; s^=s>>17; s^=s<<5; emit ...
+        //
+        // Emitted byte at clock t is a function of the state BEFORE t's update
+        // (non-blocking), so the host replicates it by simulating the same FSM
+        // from blkpos=0, prbs=1.
+        localparam [12:0] BLK_LEN = 13'd8192;
+        reg  [12:0] blkpos = 13'd0;
+        reg  [31:0] prbs   = 32'h1;
+        wire [31:0] prbs_x1  = prbs    ^ (prbs    << 13);
+        wire [31:0] prbs_x2  = prbs_x1 ^ (prbs_x1 >> 17);
+        wire [31:0] prbs_nxt = prbs_x2 ^ (prbs_x2 << 5);
+
+        // 8-byte marker, indexed by blkpos[2:0] while blkpos < 8.
+        reg [7:0] marker;
+        always @(*) case (blkpos[2:0])
+            3'd0: marker = 8'hA5;  3'd1: marker = 8'h5A;
+            3'd2: marker = 8'hC3;  3'd3: marker = 8'h3C;
+            3'd4: marker = 8'hF0;  3'd5: marker = 8'h0F;
+            3'd6: marker = 8'h99;  default: marker = 8'h66;
+        endcase
+        wire        in_marker = (blkpos < 13'd8);
+        wire [7:0]  test_byte = in_marker ? marker : prbs[7:0];
+
+        always @(posedge trace_clk) begin
+            if (test_en_tclk) begin
+                blkpos <= (blkpos == BLK_LEN - 1) ? 13'd0 : (blkpos + 13'd1);
+                // Hold prbs at the seed through the whole marker (blkpos 0..7);
+                // advance it once payload starts. So the first payload byte is
+                // 0x01 (seed low byte), then the xorshift sequence.
+                prbs   <= (blkpos < 13'd8) ? 32'h1 : prbs_nxt;
+            end else begin
+                blkpos <= 13'd0;
+                prbs   <= 32'h1;
+            end
+        end
+
         reg [7:0] tclk_byte = 8'b0;
         reg       tclk_push = 1'b0;
         always @(posedge trace_clk) begin
-            tclk_byte <= {iddr_b, iddr_a};   // big-endian: falling nibble MS
+            // In test mode push the framed PRBS byte; else the IDDR sample.
+            tclk_byte <= test_en_tclk ? test_byte : {iddr_b, iddr_a};
             tclk_push <= 1'b1;               // push one byte per TRACECLK period
         end
 
