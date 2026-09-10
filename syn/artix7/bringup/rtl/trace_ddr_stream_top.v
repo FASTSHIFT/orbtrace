@@ -196,6 +196,8 @@ module trace_ddr_stream_top #(
     reg         stream_pause_125 = 0;// 0x0A
     reg         src_fixed_125 = 0;   // 0x0B (S1b fixed 0x42)
     reg         diag_clr_125 = 0;    // 0x0C (r38 P0-4 latch clear pulse)
+    reg         iddr_prbs_125 = 0;   // 0x0D (trace_clk PRBS into the CDC FIFO,
+                                     //       stresses IDDR->CDC->DDR->UDP path)
 
     integer li0;
     initial for (li0=0; li0<4; li0=li0+1) tap_lane_csr[li0] = TAP;
@@ -204,7 +206,7 @@ module trace_ddr_stream_top #(
         if (sys_rst) begin
             tap_csr <= TAP; tap_clk_csr <= TAP_CLK;
             selftest_csr <= 0; stream_pause_125 <= 0; src_fixed_125 <= 0;
-            diag_clr_125 <= 0;
+            diag_clr_125 <= 0; iddr_prbs_125 <= 0;
         end else if (csr_we_w) case (csr_addr_w)
             8'h05: begin tap_csr <= csr_data_w[4:0]; tap_ld <= 1'b1; end
             8'h06: tap_lane_csr[csr_data_w[6:5]] <= csr_data_w[4:0];
@@ -215,6 +217,7 @@ module trace_ddr_stream_top #(
             8'h0A: stream_pause_125 <= csr_data_w[0];
             8'h0B: src_fixed_125    <= csr_data_w[0];
             8'h0C: diag_clr_125     <= csr_data_w[0];
+            8'h0D: iddr_prbs_125    <= csr_data_w[0];
             default: ;
         endcase
     end
@@ -254,6 +257,7 @@ module trace_ddr_stream_top #(
         .tap_data3    (tap3_200),
         .tap_clk      (tapc_200),
         .tap_load     (tap_load_200),
+        .test_src_en  (iddr_prbs_125),   // synced to trace_clk inside
         .trace_clk    (),
         .trace_a      (),
         .trace_b      (),

@@ -39,6 +39,8 @@ REG_TAP_LANE = 0x06  # per-lane tap: value = {lane[6:5], tap[4:0]}
 REG_TAP_CLK = 0x07   # clock-lane IDELAY tap (0..31); >100MHz eye reach
 REG_WIDTH = 0x08     # TPIU parallel port width: 4, 2 or 1 (runtime, no reflash)
 REG_STREAM_SELFTEST = 0x09  # 1=stream FPGA-side byte ramp instead of real trace
+REG_IDDR_PRBS = 0x0D  # 1=push a trace_clk-domain xorshift32 PRBS through the
+                      # SAME IDDR-side CDC FIFO (stresses IDDR->CDC->DDR->UDP)
 
 
 def write_csr(ip, addr, value, timeout=1.0, iface=None):
@@ -92,6 +94,13 @@ def main():
                         help="stream an FPGA-side byte ramp instead of real "
                              "trace (isolates the UDP path from ETM)")
     ps.add_argument("value", type=int, choices=(0, 1))
+    pp = sub.add_parser("iddr-prbs",
+                        help="push a trace_clk-domain xorshift32 PRBS through "
+                             "the SAME CDC FIFO as the IDDR sample (stresses "
+                             "IDDR->CDC->DDR->UDP with a host-reproducible, "
+                             "violently-changing pattern; bypasses only the "
+                             "IDDR primitive)")
+    pp.add_argument("value", type=int, choices=(0, 1))
     sub.add_parser("rearm")
     a = ap.parse_args()
 
@@ -134,6 +143,10 @@ def main():
         write_csr(a.ip, REG_STREAM_SELFTEST, a.value)
         print(f"STREAM data source = "
               f"{'FPGA byte ramp (selftest)' if a.value else 'real trace'}")
+    elif a.cmd == "iddr-prbs":
+        write_csr(a.ip, REG_IDDR_PRBS, a.value)
+        print(f"IDDR-side CDC source = "
+              f"{'trace_clk xorshift32 PRBS' if a.value else 'real IDDR sample'}")
     elif a.cmd == "rearm":
         write_csr(a.ip, REG_REARM, 1)
         print("soft re-arm pulsed")
