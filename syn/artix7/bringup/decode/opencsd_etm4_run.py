@@ -39,6 +39,27 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 PACKER = os.path.join(HERE, "make_opencsd_snapshot.py")
 LISTER = os.environ.get("TRC_PKT_LISTER", "trc_pkt_lister")
 
+# libopencsd 1.8.3 has a pathological allocation on some input patterns: RSS
+# can jump from ~40 MB to 22+ GB across a small input-size increase (same bug
+# cortrace_decode.cpp caps with RLIMIT_AS). trc_pkt_lister is that same
+# libopencsd, so cap its address space too or it OOMs the host. Override with
+# env LISTER_MEM_MB (0 = no cap).
+LISTER_MEM_MB = int(os.environ.get("LISTER_MEM_MB", "4096"))
+
+
+def _mem_limit_preexec(mb):
+    """Return a preexec_fn that caps the child's virtual address space to `mb`
+    MB via RLIMIT_AS, so a libopencsd allocation blowup fails malloc (handled
+    as a normal decode error) instead of OOM-killing the machine."""
+    if not mb or mb <= 0:
+        return None
+    import resource
+
+    def _apply():
+        nbytes = mb * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (nbytes, nbytes))
+    return _apply
+
 # The expected user functions in func_test.c (see verify_func_test.py).
 EXPECTED = {
     "main_loop", "level_a", "level_b", "level_c", "frame_func",
@@ -413,11 +434,20 @@ def main():
     for line in r.stdout.splitlines()[:6]:
         print("   ", line)
 
-    print("[5] running trc_pkt_lister -decode ...")
-    r = subprocess.run(
-        [LISTER, "-ss_dir", snapdir, "-decode", "-logstdout"],
-        capture_output=True, text=True,
-    )
+    print(f"[5] running trc_pkt_lister -decode (RLIMIT_AS={LISTER_MEM_MB} MB) ...")
+    try:
+        r = subprocess.run(
+            [LISTER, "-ss_dir", snapdir, "-decode", "-logstdout"],
+            capture_output=True, text=True,
+            preexec_fn=_mem_limit_preexec(LISTER_MEM_MB),
+        )
+    except MemoryError:
+        print("[5] lister hit the RLIMIT_AS cap (libopencsd allocation blowup); "
+              "treat as a decode failure, not an OOM. Raise LISTER_MEM_MB to "
+              "retry.", file=sys.stderr)
+        if tmpctx:
+            tmpctx.cleanup()
+        return 3
     if a.dump_lister:
         open(a.dump_lister, "w").write(r.stdout)
 
