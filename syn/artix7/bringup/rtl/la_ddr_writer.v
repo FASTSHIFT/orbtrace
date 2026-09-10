@@ -90,6 +90,8 @@ module la_ddr_writer #(
     reg [127:0] cap_word = 0;
     reg [4:0]   cap_bidx = 0;      // counts 0..WORDS_PER-1
     reg         cap_word_valid = 0;   // 1-cycle strobe when a word completes
+    reg [127:0] cap_word_latched = 0; // the completed word, latched on the
+                                      // completing cycle (see fix below)
     // combinational "shift-in this cycle's bytes" result
     wire [127:0] cap_word_next = {cap_word[127-IN_BITS:0], cap_byte};
     always @(posedge cap_clk) begin
@@ -101,13 +103,25 @@ module la_ddr_writer #(
             if (cap_bidx == WORDS_PER-1) begin
                 cap_bidx <= 0;
                 cap_word_valid <= 1'b1;   // cap_word_next is a complete word
+                // LATCH the completed word THIS cycle. Must NOT expose the
+                // combinational cap_word_next to the FIFO on the (registered,
+                // one-cycle-late) cap_word_valid strobe: if a further byte
+                // arrives on that strobe cycle (cap_valid_in high, i.e. bytes
+                // flowing back-to-back -- the steady state when the source
+                // drains through the trace_clk->cap_clk CDC FIFO), cap_word
+                // has already shifted that next byte in and cap_word_next then
+                // holds bytes[1..16]+byte17 instead of bytes[0..15]. That
+                // mis-composed word put one byte position 2 words stale in the
+                // readback (framed-PRBS diag, doc 30). Latching here freezes
+                // the correct 16 bytes at completion.
+                cap_word_latched <= cap_word_next;
             end else begin
                 cap_bidx <= cap_bidx + 1'b1;
             end
         end
     end
-    // the completed word value (combinational, valid when cap_word_valid=1)
-    wire [127:0] cap_word_full = cap_word_next;
+    // the completed word value (registered, stable when cap_word_valid=1)
+    wire [127:0] cap_word_full = cap_word_latched;
 
     wire        fifo_s_ready;
     wire [127:0]fifo_out_data;
