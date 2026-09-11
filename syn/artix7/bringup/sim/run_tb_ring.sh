@@ -18,6 +18,8 @@ SRC=(
     $BRINGUP/rtl/ddr3/ddr3_rd_ctrl.v
     $BRINGUP/rtl/ddr3/ddr3_arbit.v
     $VE/lib/axis/rtl/axis_async_fifo.v
+    $VE/lib/axis/rtl/axis_async_fifo_adapter.v
+    $VE/lib/axis/rtl/axis_adapter.v
 )
 
 echo "== iverilog compile =="
