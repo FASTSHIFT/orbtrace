@@ -153,10 +153,32 @@ burst 的头"，然后回跳重读——正是 HW 上"包头 32 字节（2 word�
 计 words_drained。两个计数口径（valid vs valid&end）不一致，在 burst 边界让 streamer
 多捕获/错位 2 个 beat。这是"每 burst 多 2 word"的最可能来源。
 
-## 下一步（聚焦修复）
-对齐 streamer 与 rd_ctrl 的 word 计数口径：让 streamer 按精确的 per-burst
-LENGTH 计数收数据（或让 rd_ctrl 的 data_vld 严格每 burst 恰好 64 拍），用 TEST F
-作回归（backward-word-steps 必须 = 0）。
+## 真正根因（TEST F 探针定位）：writer 单缓冲 wbuf 生产/消费竞争
+
+TEST F 加探针后排除了读侧（读地址严格 +512 连续、读字数恰好 64）和字数（写/读每
+burst 都恰好 LENGTH）。写侧探针一击命中：偶数 burst 正确，**奇数 burst 只有头 2 个
+word 是新数据，其余是上一个 burst 的残留**（如 burst#1 写 64,65 后是 2 而非 66）。
+
+根因：`la_ddr_writer` 的 **单个 `wbuf[]` 数组** + `burst_ready`/`burst_done`
+握手有生产/消费竞争——在低填充率下，一个 burst 在其缓冲只刷新了头几个 word 时就被
+提交，复用了上一 burst 的尾部。这正是 HW 上"包头 2 word + −1024 回跳"的来源。
+
+## 修复：ping-pong 双缓冲（标准方案）
+
+用两个 bank（`wbuf0/wbuf1`）+ 两个 1-bit 序列指针（`fill_seq`/`commit_seq`，
+差值 = 占用 bank 数 0/1/2）。生产者填一个 bank 时，写 FSM 提交另一个 bank，二者
+**永不索引同一数组**，从根上杜绝半刷新提交。占用满(=2)时反压。
+
+验证：
+- 仿真 `tb_la_ddr_ring` **TEST F backward-word-steps = 0**（已转为 gating），A–E 全过。
+- **硬件 56M PRBS：per-packet 校验 54907/54907 逐字节完美，0 坏包。**
+- **真实 trace A-sync 坏率 87.7% → 27.1% → 0.0%**；cortrace 从 786KB 处 fatal →
+  **完整解完 19.8MB 零 fatal**，2,666,520 对 begin/end 平衡，mismatched=3、dropped=0。
+
+## 三个 bug 全部解决（回顾）
+1. lane-3 skew（打包器 late-sample）→ 换标准 IP `axis_async_fifo_adapter`。
+2. 低速整-burst 重复（ring 饥饿）→ 与 #3 同源，双缓冲后消失。
+3. −1024 burst 重排（writer 单缓冲竞争）→ ping-pong 双缓冲。
 
 ## 现存改动（未 commit）
 - `trace_capture_a7.v`：加 `test_src_en` + 帧化 xorshift32 PRBS 源（诊断用，

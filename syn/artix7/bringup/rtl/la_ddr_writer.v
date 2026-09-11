@@ -144,29 +144,45 @@ module la_ddr_writer #(
     // since the ring streamer's ring_overrun is the real coverage-gap signal.
     always @(posedge ui_clk) wr_lost_bytes <= 32'd0;
 
-    // ---------------- ui_clk: stage 128-bit words into burst buffer ---------
-    reg [127:0] wbuf [0:LENGTH-1]; // one burst of LENGTH words staged for DDR3
-    reg [9:0]   word_idx = 0;    // 0..LENGTH-1 words staged
-    reg         burst_ready = 0; // a full LENGTH-word batch is staged
-    reg         burst_done = 0;  // pulse when a DDR3 burst completes (FSM below)
+    // ---------------- ui_clk: PING-PONG stage 128-bit words for DDR3 ---------
+    // Two banks: the producer fills one bank while the DDR write FSM reads out
+    // the other. They NEVER index the same array during a burst, so a burst can
+    // never commit with a half-refilled buffer. The former SINGLE wbuf +
+    // burst_ready/burst_done handshake had a producer/consumer race: at low
+    // fill rate a burst committed while its buffer was only partly refilled,
+    // reusing the previous burst's tail (odd-burst 2-word head + stale tail =
+    // the -1024 burst-reorder, doc 30 / tb TEST F).
+    //
+    // Bank ownership is tracked by two 1-bit "sequence" pointers whose
+    // difference (0,1,2) is the number of filled-but-uncommitted banks:
+    //   fill_seq  : increments when the producer completes a bank
+    //   commit_seq: increments when the FSM finishes committing a bank
+    // occupancy = fill_seq - commit_seq (2-bit). Full when occupancy==2.
+    reg [127:0] wbuf0 [0:LENGTH-1];
+    reg [127:0] wbuf1 [0:LENGTH-1];
+    reg  [1:0]  fill_seq = 0, commit_seq = 0;
+    reg  [9:0]  word_idx = 0;
+    reg         burst_done = 0;     // pulse when a DDR3 burst completes
+    wire        fill_bank   = fill_seq[0];
+    wire        commit_bank = commit_seq[0];
+    wire [1:0]  occupancy   = fill_seq - commit_seq;
+    wire        burst_ready = (occupancy != 2'd0);
 
-    // pop a word whenever we're not mid-burst-commit and a word is available
-    assign fifo_out_ready = fifo_out_valid & ~burst_ready & ~ui_rst;
+    // accept a word while a free bank exists (occupancy < 2)
+    assign fifo_out_ready = fifo_out_valid & (occupancy != 2'd2) & ~ui_rst;
 
     always @(posedge ui_clk) begin
         if (ui_rst) begin
-            word_idx <= 0; burst_ready <= 0;
-        end else begin
-            if (fifo_out_valid & fifo_out_ready) begin
-                wbuf[word_idx] <= fifo_out_data;
-                if (word_idx == LENGTH-1) begin
-                    word_idx <= 0;
-                    burst_ready <= 1'b1;   // batch staged; trigger DDR3 write
-                end else begin
-                    word_idx <= word_idx + 1'b1;
-                end
+            word_idx <= 0; fill_seq <= 0;
+        end else if (fifo_out_valid & fifo_out_ready) begin
+            if (fill_bank) wbuf1[word_idx] <= fifo_out_data;
+            else           wbuf0[word_idx] <= fifo_out_data;
+            if (word_idx == LENGTH-1) begin
+                word_idx <= 0;
+                fill_seq <= fill_seq + 2'd1;   // bank complete -> hand off
+            end else begin
+                word_idx <= word_idx + 1'b1;
             end
-            if (burst_done) burst_ready <= 1'b0;   // clear once written
         end
     end
 
@@ -177,13 +193,15 @@ module la_ddr_writer #(
     reg [1:0] wst = W_IDLE;
     reg [9:0] out_idx = 0;
 
-    assign ddr3_wr_data = wbuf[out_idx];
+    // read out of the CURRENT commit bank (stable: the producer is filling the
+    // OTHER bank, so out_idx-indexed data can't be overwritten mid-burst).
+    assign ddr3_wr_data = commit_bank ? wbuf1[out_idx] : wbuf0[out_idx];
 
     always @(posedge ui_clk) begin
         if (ui_rst) begin
             wst <= W_IDLE; ddr3_wr_start <= 0; out_idx <= 0; burst_done <= 0;
             ddr3_wr_addr <= RING_BASE; wr_ptr_words <= RING_BASE;
-            words_written <= 0;
+            words_written <= 0; commit_seq <= 0;
         end else begin
             ddr3_wr_start <= 1'b0;
             burst_done    <= 1'b0;
@@ -223,6 +241,7 @@ module la_ddr_writer #(
                     else
                         wr_ptr_words <= wr_ptr_words + (LENGTH<<3);
                     burst_done <= 1'b1;
+                    commit_seq <= commit_seq + 2'd1;  // retire committed bank
                     wst <= W_IDLE;
                 end
             endcase
