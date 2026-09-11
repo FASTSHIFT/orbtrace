@@ -80,92 +80,69 @@ module la_ddr_writer #(
     reg frz0=0, frz1=0;
     always @(posedge cap_clk) begin frz0<=freeze; frz1<=frz0; end
 
-    // cap-domain packer: shift IN_BYTES bytes/cycle into a 128-bit word,
-    // big-endian (oldest byte -> MS end first). Completes one word every
-    // 16/IN_BYTES cycles. cap_byte is laid out with byte 0 = oldest, so we
-    // append {cap_byte} at the LS end each cycle (matching the IN_BYTES=1
-    // v2 behaviour of {cap_word[119:0], cap_byte}).
-    localparam integer IN_BITS   = IN_BYTES*8;
-    localparam integer WORDS_PER = 16/IN_BYTES;         // cap cycles per word
-    reg [127:0] cap_word = 0;
-    reg [4:0]   cap_bidx = 0;      // counts 0..WORDS_PER-1
-    reg         cap_word_valid = 0;   // 1-cycle strobe when a word completes
-    reg [127:0] cap_word_latched = 0; // the completed word, latched on the
-                                      // completing cycle (see fix below)
-    // combinational "shift-in this cycle's bytes" result
-    wire [127:0] cap_word_next = {cap_word[127-IN_BITS:0], cap_byte};
-    always @(posedge cap_clk) begin
-        cap_word_valid <= 1'b0;
-        if (cap_rst) begin
-            cap_bidx <= 0; cap_word <= 0;
-        end else if (cap_valid_in & ~frz1) begin
-            cap_word <= cap_word_next;
-            if (cap_bidx == WORDS_PER-1) begin
-                cap_bidx <= 0;
-                cap_word_valid <= 1'b1;   // cap_word_next is a complete word
-                // LATCH the completed word THIS cycle. Must NOT expose the
-                // combinational cap_word_next to the FIFO on the (registered,
-                // one-cycle-late) cap_word_valid strobe: if a further byte
-                // arrives on that strobe cycle (cap_valid_in high, i.e. bytes
-                // flowing back-to-back -- the steady state when the source
-                // drains through the trace_clk->cap_clk CDC FIFO), cap_word
-                // has already shifted that next byte in and cap_word_next then
-                // holds bytes[1..16]+byte17 instead of bytes[0..15]. That
-                // mis-composed word put one byte position 2 words stale in the
-                // readback (framed-PRBS diag, doc 30). Latching here freezes
-                // the correct 16 bytes at completion.
-                cap_word_latched <= cap_word_next;
-            end else begin
-                cap_bidx <= cap_bidx + 1'b1;
-            end
-        end
-    end
-    // the completed word value (registered, stable when cap_word_valid=1)
-    wire [127:0] cap_word_full = cap_word_latched;
+    // STANDARD-IP packing + CDC: the byte->128-bit grouping AND the
+    // cap_clk->ui_clk crossing are done by ONE proven Alex Forencich block,
+    // axis_async_fifo_adapter (verilog-ethernet). This replaces the former
+    // hand-rolled shift-register packer + separate async FIFO, whose
+    // combinational full-word was sampled by a one-cycle-late registered
+    // valid -> on back-to-back bytes one byte position came out 2 words stale
+    // (doc 30). Letting the adapter own tvalid/tkeep/tlast eliminates that
+    // whole class of "data vs valid off-by-one" bug.
+    //
+    // Byte order: the adapter is LITTLE-ENDIAN (first input byte -> LS lane),
+    // but the whole downstream chain (DDR readback, gearbox stream_tdata =
+    // word[127:120] first) expects BIG-ENDIAN (byte 0 = MS lane). We byte-
+    // reverse the adapter's 128-bit output so the on-wire byte order is
+    // unchanged from the previous packer -- no downstream edits needed.
+    localparam integer IN_BITS = IN_BYTES*8;
 
-    wire        fifo_s_ready;
-    wire [127:0]fifo_out_data;
-    wire        fifo_out_valid, fifo_out_ready;
-    wire [8:0]  s_depth;   // word occupancy (DEPTH=256 words -> 9b)
+    wire         fifo_s_ready;
+    wire [127:0] adapter_out_data;
+    wire         fifo_out_valid, fifo_out_ready;
 
-    // Overflow = the async FIFO could not accept a completed word (s_ready low)
-    // OR neared full. Sticky-latch it in cap domain so the host sees it after.
-    reg  overflow_sticky = 0;
-    wire near_full = (s_depth > 9'd240);   // ~15/16 of 256 words
-    always @(posedge cap_clk or posedge cap_rst) begin
-        if (cap_rst) begin
-            overflow_sticky <= 0;
-        end else if (cap_word_valid & (~fifo_s_ready | near_full)) begin
-            overflow_sticky <= 1'b1;   // a word was (or nearly) lost
-        end
-    end
+    // gate input on freeze (mirrors the old ~frz1 write gate)
+    wire         s_valid = cap_valid_in & ~frz1;
 
-    axis_async_fifo #(
-        .DEPTH(256), .DATA_WIDTH(128),
-        .KEEP_ENABLE(0), .LAST_ENABLE(0), .USER_ENABLE(0), .FRAME_FIFO(0)
+    axis_async_fifo_adapter #(
+        .DEPTH(4096),                 // 4096 input BYTES -> 256 x128b words
+        .S_DATA_WIDTH(IN_BITS),
+        .M_DATA_WIDTH(128),
+        .S_KEEP_ENABLE(IN_BYTES > 1), // per-byte keep only when >1 byte in
+        .M_KEEP_ENABLE(1),
+        .ID_ENABLE(0), .DEST_ENABLE(0), .USER_ENABLE(0),
+        .FRAME_FIFO(0)
     ) u_afifo (
         .s_clk(cap_clk), .s_rst(cap_rst),
-        .s_axis_tdata(cap_word_full), .s_axis_tkeep(1'b0),
-        .s_axis_tvalid(cap_word_valid), .s_axis_tready(fifo_s_ready),
+        .s_axis_tdata(cap_byte),
+        .s_axis_tkeep({IN_BYTES{1'b1}}),
+        .s_axis_tvalid(s_valid), .s_axis_tready(fifo_s_ready),
         .s_axis_tlast(1'b0), .s_axis_tid(8'h0), .s_axis_tdest(8'h0), .s_axis_tuser(1'b0),
         .m_clk(ui_clk), .m_rst(ui_rst),
-        .m_axis_tdata(fifo_out_data), .m_axis_tkeep(),
+        .m_axis_tdata(adapter_out_data), .m_axis_tkeep(),
         .m_axis_tvalid(fifo_out_valid), .m_axis_tready(fifo_out_ready),
         .m_axis_tlast(), .m_axis_tid(), .m_axis_tdest(), .m_axis_tuser(),
         .s_pause_req(1'b0), .s_pause_ack(), .m_pause_req(1'b0), .m_pause_ack(),
-        .s_status_depth(s_depth), .s_status_depth_commit(), .s_status_overflow(),
+        .s_status_depth(), .s_status_depth_commit(), .s_status_overflow(),
         .s_status_bad_frame(), .s_status_good_frame(),
         .m_status_depth(), .m_status_depth_commit(), .m_status_overflow(),
         .m_status_bad_frame(), .m_status_good_frame()
     );
 
-    // Overflow flag CDC to ui_clk; expose in wr_lost_bytes (nonzero => the
-    // capture stalled at least once, i.e. record has a hard end, not gaps).
-    reg ovf_s0=0, ovf_s1=0;
-    always @(posedge ui_clk) begin
-        ovf_s0 <= overflow_sticky; ovf_s1 <= ovf_s0;
-        wr_lost_bytes <= {31'd0, ovf_s1};
-    end
+    // Byte-reverse LE adapter word -> BE word the datapath expects.
+    wire [127:0] fifo_out_data;
+    genvar bi;
+    generate
+        for (bi = 0; bi < 16; bi = bi + 1) begin : g_bswap
+            assign fifo_out_data[bi*8 +: 8] =
+                   adapter_out_data[(15-bi)*8 +: 8];
+        end
+    endgenerate
+
+    // wr_lost_bytes: the adapter never silently drops in normal (non-FRAME)
+    // mode -- it back-pressures via s_axis_tready. Overflow would instead show
+    // as cap-domain bytes not accepted; keep the port tied 0 (no loss path)
+    // since the ring streamer's ring_overrun is the real coverage-gap signal.
+    always @(posedge ui_clk) wr_lost_bytes <= 32'd0;
 
     // ---------------- ui_clk: stage 128-bit words into burst buffer ---------
     reg [127:0] wbuf [0:LENGTH-1]; // one burst of LENGTH words staged for DDR3

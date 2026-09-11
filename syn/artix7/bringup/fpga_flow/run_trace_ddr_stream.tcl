@@ -84,6 +84,7 @@ foreach s {
     lib/eth/lib/axis/rtl/priority_encoder.v
     lib/eth/lib/axis/rtl/axis_fifo.v
     lib/eth/lib/axis/rtl/axis_async_fifo.v
+    lib/eth/lib/axis/rtl/axis_adapter.v
     lib/eth/lib/axis/rtl/axis_async_fifo_adapter.v
     lib/eth/lib/axis/rtl/sync_reset.v
 } {

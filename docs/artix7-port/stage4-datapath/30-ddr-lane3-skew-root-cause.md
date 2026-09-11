@@ -104,9 +104,35 @@ PRBS 还暴露了一个独立的次级 bug，真实 trace 也受影响（残余 
   MIG 读时序（`app_rd_data_end`/`ddr3_rd_data_vld` 节拍），需真实时序或更精确的
   MIG 模型才能仿真定位。
 
+## 标准方案：用成熟 IP 替换手搓打包器（已做）
+
+不再手写"移位打包 + 独立 async FIFO"，改用 verilog-ethernet 的
+`axis_async_fifo_adapter`（S_DATA_WIDTH=8 → M_DATA_WIDTH=128），一个经过验证的
+块同时完成 **8→128 位宽转换 + cap_clk→ui_clk CDC**，由它自己管 tvalid/tkeep，
+从根上消除"数据 vs valid 差一拍"这类 bug。注意 adapter 是小端（首字节进 LS lane），
+下游是大端，故对 128 位输出做字节反转保持线上字节序不变。
+
+硬件验证（`trace_ddr_stream_stdip.bit`，56M PRBS）：
+- **lane-3 skew 消失**：不含 burst 边界毛刺的包 100% 逐字节正确（每 16 字节错误清零）。
+- **低速重复消失**：相邻包重复 = 0。
+- 回归：`tb_la_ddr_ring` A–E 全过。
+
+## 仍存在：−1024 burst 边界跳变（第二 bug，独立于打包器）
+
+标准 IP 修好了打包器，但暴露出**另一个独立缺陷仍在**：约一半的包，开头 2 个字
+（32 字节）来自"下一个 burst"（payload_ref 位置 +? ），随后回跳 **−1024**（正好
+一个 burst/一个 packet）到正确位置。signature：`pkt = ref[s:s+32]` 然后
+`ref[s-1024+32:...]`。1750/3500 非跨界包中招。
+
+这不在打包器（已用标准 IP），在 **DDR ring 读路径**（`la_ddr_ring_streamer` /
+`ddr3_rd_ctrl`）：每个读 burst 的头 2 个 beat 疑似是上一次读残留/预取。方向：
+查 `ddr3_rd_data_vld`（=valid&end）与 streamer R_RUN 首拍捕获的关系，读数据流水
+延迟是否让首 2 拍落到错误 burst。
+
 ## 下一步
-定位 burst 边界 ±1024 / 头部 2-word 泄漏：在 la_ddr_writer 的 out_idx wrap 和
-ddr3_wr_data 组合读时序上找 off-by-2；或给 tb 换更贴近 MIG 的读延迟模型复现。
+定位读 burst 头部 2-word 错位：检查 ddr3_rd_ctrl 的 `app_rd_data_valid`/
+`app_rd_data_end` 与 streamer 首拍 f_wr_data 捕获时序；或在 tb_la_ddr_ring 用
+non-ramp（位置编码）源 + 精确读延迟模型复现。
 
 ## 现存改动（未 commit）
 - `trace_capture_a7.v`：加 `test_src_en` + 帧化 xorshift32 PRBS 源（诊断用，
