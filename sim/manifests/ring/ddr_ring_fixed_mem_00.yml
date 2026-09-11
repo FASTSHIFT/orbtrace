@@ -8,6 +8,8 @@ sources:
   - syn/artix7/bringup/rtl/ddr3/ddr3_rd_ctrl.v
   - syn/artix7/bringup/rtl/ddr3/ddr3_arbit.v
   - syn/external/verilog-ethernet/lib/axis/rtl/axis_async_fifo.v
+  - syn/external/verilog-ethernet/lib/axis/rtl/axis_adapter.v
+  - syn/external/verilog-ethernet/lib/axis/rtl/axis_async_fifo_adapter.v
 defines: [SIM_MEM_INIT_00]
 expect:
   contains: "RESULT=ALL_PASS"

@@ -138,11 +138,23 @@ module la_ddr_writer #(
         end
     endgenerate
 
-    // wr_lost_bytes: the adapter never silently drops in normal (non-FRAME)
-    // mode -- it back-pressures via s_axis_tready. Overflow would instead show
-    // as cap-domain bytes not accepted; keep the port tied 0 (no loss path)
-    // since the ring streamer's ring_overrun is the real coverage-gap signal.
-    always @(posedge ui_clk) wr_lost_bytes <= 32'd0;
+    // Overflow honesty: the adapter back-pressures via s_axis_tready, but the
+    // capture source is free-running (cap_valid_in can't stall). If a valid
+    // input byte arrives while the adapter can't accept it (~fifo_s_ready), it
+    // is lost -- latch that in the cap domain and expose via wr_lost_bytes so a
+    // capture with a hard end (not silent gaps) is observable.
+    reg overflow_sticky = 0;
+    always @(posedge cap_clk or posedge cap_rst) begin
+        if (cap_rst)
+            overflow_sticky <= 1'b0;
+        else if (s_valid & ~fifo_s_ready)
+            overflow_sticky <= 1'b1;   // a captured byte was dropped
+    end
+    reg ovf_s0=0, ovf_s1=0;
+    always @(posedge ui_clk) begin
+        ovf_s0 <= overflow_sticky; ovf_s1 <= ovf_s0;
+        wr_lost_bytes <= {31'd0, ovf_s1};
+    end
 
     // ---------------- ui_clk: PING-PONG stage 128-bit words for DDR3 ---------
     // Two banks: the producer fills one bank while the DDR write FSM reads out
