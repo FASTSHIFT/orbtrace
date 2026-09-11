@@ -114,37 +114,75 @@ module tb_prbs_cdc;
     wire [127:0] cap_word_full = cap_word_next;
 `endif
 
-    // ---- collect drained bytes (big-endian within word) and check ----
-    integer fo, nbytes = 0;
-    integer wi;
-    reg [7:0] b;
-    initial fo = $fopen("/tmp/tb_prbs_bytes.bin","wb");
+    // ---- SELF-CHECK: the drained bytes (big-endian within word) must equal a
+    // locally-regenerated framed-PRBS reference. This is the lane-skew
+    // regression: with the buggy combinational-full-word packer (default here)
+    // every 16th byte is 2 words stale; with FIX_LATCH the stream is exact.
+    // The RTL that ships (la_ddr_writer) now packs via axis_async_fifo_adapter
+    // and is covered end-to-end by tb_la_ddr_ring TEST F; this tb keeps a fast,
+    // focused check of the pack-completion timing in isolation.
+    //
+    // Reference generator: mirror the emit-then-advance framed PRBS byte stream
+    // and compare the drained bytes to it. We lock on the first drained byte
+    // (which is the marker byte at blkpos 0) so both sides start aligned.
+    integer nbytes = 0, errors = 0, wi;
+    reg [7:0] b, r_exp;
+    // reference state (blocking-updated inside the per-byte loop)
+    reg [12:0] r_blkpos = 0;
+    reg [31:0] r_prbs = 32'h1;
+    reg        r_started = 0;
+    reg [63:0] lock_sr = 0;   // rolling last-8-bytes, to lock on the full marker
+    localparam [63:0] MARKER8 = 64'hA55A_C33C_F00F_9966;
+
+    function [31:0] xs32(input [31:0] s);
+        reg [31:0] a, c;
+        begin
+            a = s ^ (s << 13);
+            c = a ^ (a >> 17);
+            xs32 = c ^ (c << 5);
+        end
+    endfunction
+    function [7:0] mk(input [2:0] p);
+        case (p)
+            3'd0: mk=8'hA5; 3'd1: mk=8'h5A; 3'd2: mk=8'hC3; 3'd3: mk=8'h3C;
+            3'd4: mk=8'hF0; 3'd5: mk=8'h0F; 3'd6: mk=8'h99; default: mk=8'h66;
+        endcase
+    endfunction
+
     always @(posedge ref_200m) begin
         if (!rst && word_valid) begin
             for (wi = 15; wi >= 0; wi = wi - 1) begin
                 b = cap_word_full[wi*8 +: 8];
-                $fwrite(fo, "%c", b);
-                nbytes = nbytes + 1;
+                if (!r_started) begin
+                    // lock on the FULL 8-byte marker (a lone 0xA5 also occurs
+                    // in PRBS payload). After the 8th marker byte, the next
+                    // byte is payload index 0 (prbs seed low byte).
+                    lock_sr = {lock_sr[55:0], b};
+                    if (lock_sr == MARKER8) begin
+                        r_started = 1;
+                        r_blkpos  = 13'd8;   // marker consumed; next is payload
+                        r_prbs    = 32'h1;
+                    end
+                end else begin
+                    r_exp = (r_blkpos < 13'd8) ? mk(r_blkpos[2:0]) : r_prbs[7:0];
+                    if (b !== r_exp) errors = errors + 1;
+                    nbytes = nbytes + 1;
+                    r_prbs   = (r_blkpos < 13'd8) ? 32'h1 : xs32(r_prbs);
+                    r_blkpos = (r_blkpos==BLK_LEN-1) ? 13'd0 : r_blkpos+13'd1;
+                end
             end
-        end
-    end
-
-    // Also log the RAW popped byte stream (before packing) with cap_valid, to
-    // see whether the FIFO output itself is already defective or the packer is.
-    integer fr, nraw = 0;
-    initial fr = $fopen("/tmp/tb_prbs_raw.bin","wb");
-    always @(posedge ref_200m) begin
-        if (!rst && cap_valid) begin
-            $fwrite(fr, "%c", cap_byte);
-            nraw = nraw + 1;
         end
     end
 
     initial begin
         #2_000_000;   // ~2 ms sim -> ~20k trace_clk bytes
-        $fclose(fo);
-        $fclose(fr);
-        $display("tb_prbs_cdc: wrote %0d packed bytes, %0d raw popped bytes", nbytes, nraw);
+        $display("tb_prbs_cdc: checked %0d packed bytes, errors=%0d", nbytes, errors);
+        if (nbytes < 4096)
+            $display("==== SIM DONE ==== RESULT=FAIL (too few bytes checked)");
+        else if (errors != 0)
+            $display("==== SIM DONE ==== RESULT=FAIL (%0d byte errors)", errors);
+        else
+            $display("==== SIM DONE ==== RESULT=ALL_PASS");
         $finish;
     end
 endmodule

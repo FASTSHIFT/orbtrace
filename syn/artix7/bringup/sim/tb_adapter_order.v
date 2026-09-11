@@ -41,13 +41,28 @@ module tb_adapter_order;
         .m_status_bad_frame(), .m_status_good_frame()
     );
 
-    integer got=0;
+    // The adapter is documented (and relied on by la_ddr_writer's byte-reverse)
+    // to be LITTLE-ENDIAN: the first input byte lands in the LS lane. For input
+    // 0,1,..,15 the first output word must be 0f0e0d0c0b0a09080706050403020100.
+    integer got=0, errors=0;
+    reg [127:0] exp0 = 128'h0f0e0d0c0b0a09080706050403020100;
     always @(posedge m_clk) begin
         if (!rst && m_valid && m_ready) begin
             got=got+1;
             if (got<=3) $display("word %0d = %032x  keep=%04x", got, m_data, m_keep);
+            if (got==1 && m_data !== exp0) errors=errors+1;
+            if (got==1 && m_keep !== 16'hffff) errors=errors+1;
         end
     end
-    initial begin #20000; $finish; end
+    initial begin
+        #20000;
+        if (got < 1)
+            $display("==== SIM DONE ==== RESULT=FAIL (no adapter output word)");
+        else if (errors != 0)
+            $display("==== SIM DONE ==== RESULT=FAIL (adapter byte order not little-endian)");
+        else
+            $display("==== SIM DONE ==== RESULT=ALL_PASS");
+        $finish;
+    end
 endmodule
 `default_nettype wire

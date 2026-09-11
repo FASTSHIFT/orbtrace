@@ -48,20 +48,18 @@ module tb_iddr_gap;
     wire [7:0]  cap_byte;
     wire        cap_valid;
 
-    trace_capture_a7 #(.CLK_BUF("BUFR_IO"), .CAP_METHOD("IDDR"),
-                       .EYE_DELAY(4)) dut (
+    // Current trace_capture_a7 interface (post OVERSAMPLE removal): IDDR-only,
+    // no CAP_METHOD/EYE_DELAY/duty/glitch ports. test_src_en tied 0 so the real
+    // IDDR sample path (not the PRBS diagnostic source) is exercised here.
+    trace_capture_a7 #(.CLK_BUF("BUFR_IO")) dut (
         .rst(1'b0), .ref_200m(ref_200m),
         .trace_clk_p(trace_clk), .trace_data_p(tdata),
+        .test_src_en(1'b0),
         .tap_data0(5'd16), .tap_data1(5'd16),
         .tap_data2(5'd16), .tap_data3(5'd16), .tap_clk(5'd0), .tap_load(1'b0),
-        .eye_delay_rt(8'd0), .cap_clear(1'b0),
-        .test_en(1'b0), .test_clk(1'b0), .test_data(4'b0),
         .trace_clk(trace_clk_o), .trace_a(ta), .trace_b(tb),
         .idelayctrl_rdy(idc_rdy),
-        .cap_byte(cap_byte), .cap_valid(cap_valid),
-        .duty_hi_min(), .duty_hi_max(), .duty_lo_min(), .duty_lo_max(),
-        .duty_hi_sum(), .duty_hi_cnt(), .duty_lo_sum(), .duty_lo_cnt(),
-        .glitch_cnt()
+        .cap_byte(cap_byte), .cap_valid(cap_valid)
     );
 
     // Byte collectors, gated by a phase flag set by the testbench.

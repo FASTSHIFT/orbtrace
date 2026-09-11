@@ -4,6 +4,8 @@ sources:
   - syn/artix7/bringup/sim/tb_la_ddr_writer.v
   - syn/artix7/bringup/rtl/la_ddr_writer.v
   - syn/external/verilog-ethernet/lib/axis/rtl/axis_async_fifo.v
+  - syn/external/verilog-ethernet/lib/axis/rtl/axis_adapter.v
+  - syn/external/verilog-ethernet/lib/axis/rtl/axis_async_fifo_adapter.v
 expect:
   contains: "RESULT=ALL_PASS"
 tags: [ring]
