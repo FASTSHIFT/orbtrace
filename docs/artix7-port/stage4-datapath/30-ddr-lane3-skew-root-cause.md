@@ -80,9 +80,33 @@ bytes[1..16]+byte17，而不是 bytes[0..15]。存进 FIFO 的 128-bit 字因此
 `cap_word_full` 改接这个寄存器而非组合的 `cap_word_next`。仿真验证：
 `FIX_LATCH` 版 packed 流 0 错。
 
-改动：`la_ddr_writer.v`（+ `tb_prbs_cdc.v` 复现/回归仿真）。硬件回归：烧
-`trace_ddr_stream_fix.bit`，`iddr-prbs 1` → `prbs_check.py` 应 BYTE-PERFECT，
-且真实 trace 应大幅改善。
+改动：`la_ddr_writer.v`（+ `tb_prbs_cdc.v` 复现/回归仿真）。
+
+## 硬件回归结果（lane 修复已验证）
+
+- 帧化 PRBS（`iddr-prbs 1`）：修复前每 16 字节坏，修复后干净跨度内 0 错。
+- **真实 56M trace，A-sync 坏率 87.7% → 27.1%**；cortrace 解码从 786KB 处 fatal
+  推进到 **7.7MB**（10×），begin/end 平衡 305617 对、max depth 11、解出真实函数。
+
+## 仍存在的第二个缺陷（burst 边界 ±1024 错位）
+
+PRBS 还暴露了一个独立的次级 bug，真实 trace 也受影响（残余 27% 坏 async / 7.7MB
+处 fatal 的来源）：
+
+- **低速（10M）表现**：ring streamer 把每个 1024B burst 发两遍（相邻包字节完全相同，
+  seq 仍 +1）。纯低速 ring 饥饿：drain 快于 slow writer 填充。56M 下 packet 重复=0。
+- **56M 表现**：偶发 burst 边界错位——某包头部 32 字节（=2 个 128-bit 字）来自
+  "下一 burst"，随后回跳 **−1024**（正好一个 burst）到正确位置。signature：
+  `pkt = ref[a:a+32] 然后 ref[a-1024:...]`。
+- 嫌疑：`la_ddr_writer` 的突发 staging（`wbuf`/`out_idx` 组合读 `ddr3_wr_data`，
+  W_RUN→W_DONE 的 out_idx wrap）或 streamer R_NEXT→R_START 边界多吐 2 个字。
+- 行为级 MIG 仿真（tb_la_ddr_ring TEST E, CAP_DIV=40）**未复现**——触发点在真实
+  MIG 读时序（`app_rd_data_end`/`ddr3_rd_data_vld` 节拍），需真实时序或更精确的
+  MIG 模型才能仿真定位。
+
+## 下一步
+定位 burst 边界 ±1024 / 头部 2-word 泄漏：在 la_ddr_writer 的 out_idx wrap 和
+ddr3_wr_data 组合读时序上找 off-by-2；或给 tb 换更贴近 MIG 的读延迟模型复现。
 
 ## 现存改动（未 commit）
 - `trace_capture_a7.v`：加 `test_src_en` + 帧化 xorshift32 PRBS 源（诊断用，
