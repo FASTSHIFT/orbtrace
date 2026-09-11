@@ -129,10 +129,34 @@ PRBS 还暴露了一个独立的次级 bug，真实 trace 也受影响（残余 
 查 `ddr3_rd_data_vld`（=valid&end）与 streamer R_RUN 首拍捕获的关系，读数据流水
 延迟是否让首 2 拍落到错误 burst。
 
-## 下一步
-定位读 burst 头部 2-word 错位：检查 ddr3_rd_ctrl 的 `app_rd_data_valid`/
-`app_rd_data_end` 与 streamer 首拍 f_wr_data 捕获时序；或在 tb_la_ddr_ring 用
-non-ramp（位置编码）源 + 精确读延迟模型复现。
+## −1024 bug 已在仿真确定性复现（tb_la_ddr_ring TEST F）
+
+用**位置编码源**（每字节 = 全局 word 序号低 8 位，每 16 字节 +1）跑 tb_la_ddr_ring
+TEST F，behavioural MIG **复现了**该 bug：drained 字节的 word-staircase 出现
+195 次向后跳，第一次在 byte 1057，每 2048 字节（=2 个 burst）一次。
+
+glitch 数值：
+```
+@byte 1057: prev=word65 now=word1
+@byte 3105: prev=word129 now=word65   (+2048)
+@byte 5153: prev=word193 now=word129
+```
+即每个 burst 实际吐了 **66 个 word（= LENGTH 64 + 2）**，多出的 2 个 word 是"下一
+burst 的头"，然后回跳重读——正是 HW 上"包头 32 字节（2 word）来自下一 burst、
+随后 −1024 回跳"的根源。
+
+## 精确嫌疑：streamer word 计数用 valid&end，rd_ctrl 用 valid
+
+`ddr3_rd_ctrl`：`ddr3_rd_data_vld = app_rd_data_valid & app_rd_data_end`，而其
+内部 `rd_data_cnt` 只按 `app_rd_data_valid` 计数、`end_data_cnt` 在 cnt==63 结束。
+`la_ddr_ring_streamer` R_RUN 却用 `ddr3_rd_data_vld`(=valid&end) 捕获 f_wr_data 并
+计 words_drained。两个计数口径（valid vs valid&end）不一致，在 burst 边界让 streamer
+多捕获/错位 2 个 beat。这是"每 burst 多 2 word"的最可能来源。
+
+## 下一步（聚焦修复）
+对齐 streamer 与 rd_ctrl 的 word 计数口径：让 streamer 按精确的 per-burst
+LENGTH 计数收数据（或让 rd_ctrl 的 data_vld 严格每 burst 恰好 64 拍），用 TEST F
+作回归（backward-word-steps 必须 = 0）。
 
 ## 现存改动（未 commit）
 - `trace_capture_a7.v`：加 `test_src_en` + 帧化 xorshift32 PRBS 源（诊断用，
