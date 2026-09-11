@@ -49,14 +49,24 @@ module tb_la_ddr_ring;
     reg       cap_valid_in = 0;
     reg       cap_tick = 0;
     reg [7:0] cap_phase = 0;
+    // TEST F position-encoded source: each byte = low 8 bits of a global byte
+    // counter's HIGH bits so a whole-word (16-byte) reorder is visible. When
+    // e_pos_src is set, cap_byte carries (byte_index >> 4) & 0xFF, i.e. it
+    // increments once per 16 bytes = once per 128-bit word -> a -1024 (64-word)
+    // burst reorder shows as a 64-count backward jump in the drained stream.
+    reg        e_pos_src = 0;
+    reg [31:0] cap_bcnt = 0;
     always @(posedge cap_clk) begin
         if (cap_rst) begin cap_phase<=0; cap_tick<=0; end
         else if (cap_phase == CAP_DIV-1) begin cap_phase<=0; cap_tick<=cap_valid_in; end
         else begin cap_phase<=cap_phase+1'b1; cap_tick<=0; end
     end
     always @(posedge cap_clk) begin
-        if (cap_rst) cap_byte <= 0;
-        else if (cap_tick) cap_byte <= cap_byte + 8'd1;
+        if (cap_rst) begin cap_byte <= 0; cap_bcnt <= 0; end
+        else if (cap_tick) begin
+            cap_byte <= e_pos_src ? ((cap_bcnt >> 4) & 8'hff) : (cap_byte + 8'd1);
+            cap_bcnt <= cap_bcnt + 1;
+        end
     end
 
     // ================= WRITER (source, cap_clk -> DDR3) =================
@@ -257,6 +267,25 @@ module tb_la_ddr_ring;
 
 
 
+    // ---- TEST F: word-staircase backward-step detector on egress bytes ----
+    integer   f_back, f_bytes, f_first_back;
+    reg [7:0] f_prev; reg f_have, cap_mon_f;
+    always @(posedge clk125) begin
+        if (cap_mon_f & stream_tvalid & stream_tready) begin
+            f_bytes = f_bytes + 1;
+            if (f_have) begin
+                // expected: same value or +1 (mod256); a decrease (not the
+                // +1 wrap 255->0) means a word from another burst leaked in.
+                if (stream_tdata != f_prev &&
+                    stream_tdata != ((f_prev+1)&8'hff)) begin
+                    f_back = f_back + 1;
+                    if (f_first_back < 0) f_first_back = f_bytes;
+                end
+            end
+            f_prev = stream_tdata; f_have = 1;
+        end
+    end
+
     // ---- retransmit capture (TEST C): record rtx bytes + their seq ----
     integer rtx_bytes, rtx_seq_min, rtx_seq_max;
     reg cap_rtx = 0;
@@ -443,6 +472,41 @@ module tb_la_ddr_ring;
             fails=fails+1;
         end else
             $display("  *** PASS E: no burst re-read under slow fill");
+
+        // ===== TEST F: position-encoded source, detect word-level burst
+        // reorder (the -1024 head glitch seen on HW: a packet's first ~2 words
+        // come from the NEXT burst). The source byte = (byte_index>>4)&0xFF, so
+        // it steps once per 16-byte word; the drained byte stream must be a
+        // staircase that only ever steps +1 (mod 256) every 16 bytes and never
+        // jumps backward. A backward step = a word from a later/earlier burst
+        // leaked in. =====
+        reset_all;
+        CAP_DIV = 4; drain_credit = 1;
+        e_pos_src = 1;
+        f_prev = 0; f_have = 0; f_back = 0; f_bytes = 0; f_first_back = -1;
+        cap_mon_f = 1;
+        cap_valid_in = 1;
+        repeat(800000) @(posedge cap_clk);
+        cap_valid_in = 0;
+        repeat(20000) @(posedge ui_clk);
+        cap_mon_f = 0;
+        e_pos_src = 0;
+        $display("---- TEST F position source, word-reorder detector ----");
+        $display("  drained bytes=%0d backward-word-steps=%0d first@%0d",
+                 f_bytes, f_back, f_first_back);
+        // NOTE: TEST F is a KNOWN-BUG reproducer (doc 30, "-1024 burst-boundary
+        // reorder"). It is REPORT-ONLY for now so the suite still gates on the
+        // A-E invariants; flip F_STRICT to make it gate once the streamer/rd
+        // burst-count fix lands (target: f_back == 0).
+        if (f_bytes < 20000) begin
+            $display("  *** F INCONCLUSIVE: too few bytes (%0d)", f_bytes);
+        end else if (f_back != 0) begin
+            $display("  *** F REPRODUCED KNOWN BUG (doc30): %0d backward word-steps, report-only", f_back);
+`ifdef F_STRICT
+            fails=fails+1;
+`endif
+        end else
+            $display("  *** PASS F: monotone word staircase, no burst reorder");
 
         if (fails == 0)
             $display("==== SIM DONE ==== RESULT=ALL_PASS");
