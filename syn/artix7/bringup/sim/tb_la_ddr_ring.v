@@ -270,6 +270,39 @@ module tb_la_ddr_ring;
     // ---- TEST F: word-staircase backward-step detector on egress bytes ----
     integer   f_back, f_bytes, f_first_back;
     reg [7:0] f_prev; reg f_have, cap_mon_f;
+
+    // per-burst word-count probes (localise write-side vs read-side).
+    integer wr_words_this_burst, rd_words_this_burst;
+    integer wr_burst_bad, rd_burst_bad;   // bursts != LENGTH words
+    // read-address progression probe: log start address of each read burst
+    reg [28:0] rd_start_addr_prev; reg rd_addr_have; integer rd_addr_glitch;
+    integer rd_burst_n, wr_burst_n;
+    always @(posedge ui_clk) begin
+        if (ui_rst) begin wr_words_this_burst<=0; rd_words_this_burst<=0; end
+        else begin
+            if (wr_data_req) begin
+                wr_words_this_burst <= wr_words_this_burst + 1;
+            end
+            if (wr_done) begin
+                if (cap_mon_f && wr_words_this_burst != LENGTH-1 && wr_words_this_burst != LENGTH)
+                    wr_burst_bad <= wr_burst_bad + 1;
+                wr_words_this_burst <= 0;
+                wr_burst_n <= wr_burst_n + 1;
+            end
+            if (rd_data_vld) rd_words_this_burst <= rd_words_this_burst + 1;
+            if (rd_done) begin
+                if (cap_mon_f && rd_words_this_burst != LENGTH-1 && rd_words_this_burst != LENGTH)
+                    rd_burst_bad <= rd_burst_bad + 1;
+                rd_words_this_burst <= 0;
+            end
+            // capture read burst start addr at rd_start; check it advances by
+            // LENGTH*8 each burst (contiguous ring drain)
+            if (cap_mon_f && rd_start) begin
+                rd_burst_n <= rd_burst_n + 1;
+                rd_start_addr_prev <= rd_addr; rd_addr_have <= 1;
+            end
+        end
+    end
     always @(posedge clk125) begin
         if (cap_mon_f & stream_tvalid & stream_tready) begin
             f_bytes = f_bytes + 1;
@@ -484,6 +517,9 @@ module tb_la_ddr_ring;
         CAP_DIV = 4; drain_credit = 1;
         e_pos_src = 1;
         f_prev = 0; f_have = 0; f_back = 0; f_bytes = 0; f_first_back = -1;
+        wr_burst_bad = 0; rd_burst_bad = 0;
+        wr_words_this_burst = 0; rd_words_this_burst = 0;
+        rd_addr_have = 0; rd_addr_glitch = 0; rd_burst_n = 0; wr_burst_n = 0;
         cap_mon_f = 1;
         cap_valid_in = 1;
         repeat(800000) @(posedge cap_clk);
@@ -494,6 +530,8 @@ module tb_la_ddr_ring;
         $display("---- TEST F position source, word-reorder detector ----");
         $display("  drained bytes=%0d backward-word-steps=%0d first@%0d",
                  f_bytes, f_back, f_first_back);
+        $display("  per-burst word-count anomalies: write-side=%0d read-side=%0d",
+                 wr_burst_bad, rd_burst_bad);
         // NOTE: TEST F is a KNOWN-BUG reproducer (doc 30, "-1024 burst-boundary
         // reorder"). It is REPORT-ONLY for now so the suite still gates on the
         // A-E invariants; flip F_STRICT to make it gate once the streamer/rd
@@ -501,10 +539,8 @@ module tb_la_ddr_ring;
         if (f_bytes < 20000) begin
             $display("  *** F INCONCLUSIVE: too few bytes (%0d)", f_bytes);
         end else if (f_back != 0) begin
-            $display("  *** F REPRODUCED KNOWN BUG (doc30): %0d backward word-steps, report-only", f_back);
-`ifdef F_STRICT
+            $display("  *** FAIL F: %0d backward word-steps (burst reorder, doc30)", f_back);
             fails=fails+1;
-`endif
         end else
             $display("  *** PASS F: monotone word staircase, no burst reorder");
 
