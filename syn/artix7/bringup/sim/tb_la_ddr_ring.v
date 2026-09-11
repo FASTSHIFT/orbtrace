@@ -241,6 +241,22 @@ module tb_la_ddr_ring;
         end
     end
 
+    // ---- TEST E: detect the streamer re-reading the SAME ring burst on two
+    // consecutive NORMAL drains (=> duplicate packet, the slow-fill dup bug).
+    // We sample rd_addr at each rd_start pulse for a NORMAL (non-rtx) drain.
+    integer e_reread, e_bursts;
+    reg [28:0] e_prev_addr;
+    reg        e_have, cap_mon_e;
+    always @(posedge ui_clk) begin
+        if (cap_mon_e & rd_start & ~nack_busy) begin
+            e_bursts = e_bursts + 1;
+            if (e_have && rd_addr == e_prev_addr) e_reread = e_reread + 1;
+            e_prev_addr = rd_addr; e_have = 1;
+        end
+    end
+
+
+
     // ---- retransmit capture (TEST C): record rtx bytes + their seq ----
     integer rtx_bytes, rtx_seq_min, rtx_seq_max;
     reg cap_rtx = 0;
@@ -397,6 +413,36 @@ module tb_la_ddr_ring;
             end else
                 $display("  *** PASS D: out-of-window NACK honestly reported nack_fail");
         end
+
+        // ===== TEST E: VERY SLOW fill (fill << drain), detect whole-block
+        // duplication. The ramp canary (period 256) is blind to a 1024-byte
+        // block being emitted twice (1024 % 256 == 0), which is exactly the
+        // hardware symptom seen with the 10 MB/s framed-PRBS source: the
+        // streamer re-emits the same ring burst before the slow writer commits
+        // a new one. Here we drive a per-emit ramp but detect duplication by
+        // watching the DUT read the SAME ddr3_rd_addr on two consecutive drain
+        // bursts (a re-read => duplicate packet). =====
+        reset_all;
+        CAP_DIV = 40;           // ~5 MB/s fill: writer barely ahead of drain
+        drain_credit = 1;       // full-speed drain -> streamer starves for data
+        e_reread = 0; e_bursts = 0; e_prev_addr = 29'h1fffffff; e_have = 0;
+        cap_mon_e = 1;
+        cap_stream = 0;         // don't use the ramp checker here
+        cap_valid_in = 1;
+        repeat(1500000) @(posedge cap_clk);   // long, slow fill
+        cap_valid_in = 0;
+        repeat(20000) @(posedge ui_clk);
+        cap_mon_e = 0;
+        $display("---- TEST E slow fill (CAP_DIV=40), re-read detector ----");
+        $display("  drain bursts=%0d  repeated-address bursts=%0d", e_bursts, e_reread);
+        if (e_bursts < 4) begin
+            $display("  *** FAIL E: too few drain bursts to judge");
+            fails=fails+1;
+        end else if (e_reread != 0) begin
+            $display("  *** FAIL E: streamer re-read same burst %0d times (dup)", e_reread);
+            fails=fails+1;
+        end else
+            $display("  *** PASS E: no burst re-read under slow fill");
 
         if (fails == 0)
             $display("==== SIM DONE ==== RESULT=ALL_PASS");
