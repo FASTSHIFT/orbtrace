@@ -21,9 +21,7 @@
 //     0x0B bit as ddr_ring_selftest_top, so S1b results transfer directly
 //
 // Config CSRs (:5002, same map as trace_stream_top for tool reuse):
-//   0x05  IDELAY tap (all data lanes)
-//   0x06  IDELAY tap per-lane {lane[6:5], tap[4:0]}
-//   0x07  IDELAY tap on clock lane
+//   0x05-0x07  (removed) were IDELAY tap tuning; the front-end has no IDELAY
 //   0x08  TPIU port width (4/2/1)
 //   0x09  1 -> use FPGA-side ramp source (selftest, bypass trace pins)
 //   0x0A  1 -> pause stream (for :5001 CSR readback while stream is running)
@@ -43,14 +41,10 @@
 `default_nettype none
 
 module trace_ddr_stream_top #(
-    parameter [4:0] TAP         = 5'd2,         // eye centre from doc 20 Part D
-    parameter [4:0] TAP_CLK     = 5'd0,
-    // 1 = IDELAYE2 on the data lanes (needed to meet IDDR input hold).
-    // 0 = bare IBUF->IDDR (violates IDDR hold on 7-series; diagnostic only).
-    parameter       USE_IDELAY  = 1,
-    // Data IDELAY as FIXED (STA==hardware) with this tap; see trace_capture_a7.
-    parameter       CAP_IDELAY_FIXED     = 1,
-    parameter [4:0] CAP_IDELAY_FIXED_VAL = 5'd24,
+    // No IDELAY: IBUF->IDDR samples the centre-aligned data on the TRACECLK
+    // edge directly (see trace_capture_a7). The former TAP/USE_IDELAY/
+    // CAP_IDELAY_FIXED* knobs are gone -- the delay element was harmful, not
+    // needed (doc 30: tap=0 gave 0% bad A-sync at 112 MHz, tap=24 gave 79%).
     parameter       TRACE_WIDTH = 4,            // power-on TPIU width (4/2/1)
     parameter [31:0] DEST_IP        = {8'd192, 8'd168, 8'd10, 8'd245},
     parameter [15:0] DEST_PORT      = 16'd5555,
@@ -187,10 +181,6 @@ module trace_ddr_stream_top #(
     wire [7:0]  csr_addr_w, csr_data_w;
     wire        csr_we_w;
 
-    reg  [4:0]  tap_csr = TAP;
-    reg         tap_ld = 0;
-    reg  [4:0]  tap_clk_csr = TAP_CLK;
-    reg  [4:0]  tap_lane_csr [0:3];
     reg  [1:0]  width_csr = TRACE_WIDTH[1:0];   // encoded 4/2/1 -> 2'd0/1/2 later
     reg         selftest_csr = 0;    // 0x09
     reg         stream_pause_125 = 0;// 0x0A
@@ -199,18 +189,13 @@ module trace_ddr_stream_top #(
     reg         iddr_prbs_125 = 0;   // 0x0D (trace_clk PRBS into the CDC FIFO,
                                      //       stresses IDDR->CDC->DDR->UDP path)
 
-    integer li0;
-    initial for (li0=0; li0<4; li0=li0+1) tap_lane_csr[li0] = TAP;
+    // IDELAY tap CSRs (0x05/0x06/0x07) are gone: the capture front-end has no
+    // delay element (IBUF->IDDR direct), so there is nothing to tune.
     always @(posedge clk125) begin
-        tap_ld <= 1'b0;               // one-shot pulse
         if (sys_rst) begin
-            tap_csr <= TAP; tap_clk_csr <= TAP_CLK;
             selftest_csr <= 0; stream_pause_125 <= 0; src_fixed_125 <= 0;
             diag_clr_125 <= 0; iddr_prbs_125 <= 0;
         end else if (csr_we_w) case (csr_addr_w)
-            8'h05: begin tap_csr <= csr_data_w[4:0]; tap_ld <= 1'b1; end
-            8'h06: tap_lane_csr[csr_data_w[6:5]] <= csr_data_w[4:0];
-            8'h07: begin tap_clk_csr <= csr_data_w[4:0]; tap_ld <= 1'b1; end
             8'h08: width_csr      <= (csr_data_w == 8'd2) ? 2'd1 :
                                      (csr_data_w == 8'd1) ? 2'd2 : 2'd0;
             8'h09: selftest_csr   <= csr_data_w[0];
@@ -222,46 +207,21 @@ module trace_ddr_stream_top #(
         endcase
     end
 
-    // tap_csr into clk200 for trace_capture_a7
-    reg [4:0] tap0_s0=0, tap1_s0=0, tap2_s0=0, tap3_s0=0, tapc_s0=0;
-    reg [4:0] tap0_200=0, tap1_200=0, tap2_200=0, tap3_200=0, tapc_200=0;
-    reg       tap_ld_s0=0, tap_ld_200=0, tap_ld_200_q=0;
-    always @(posedge clk200) begin
-        tap0_s0<=tap_lane_csr[0]; tap0_200<=tap0_s0;
-        tap1_s0<=tap_lane_csr[1]; tap1_200<=tap1_s0;
-        tap2_s0<=tap_lane_csr[2]; tap2_200<=tap2_s0;
-        tap3_s0<=tap_lane_csr[3]; tap3_200<=tap3_s0;
-        tapc_s0<=tap_clk_csr;     tapc_200<=tapc_s0;
-        tap_ld_s0<=tap_ld; tap_ld_200<=tap_ld_s0; tap_ld_200_q<=tap_ld_200;
-    end
-    wire tap_load_200 = tap_ld_200 & ~tap_ld_200_q;   // clean 1-cycle pulse
-
     // ============ trace_capture_a7 (clk200 domain) ============
     wire [7:0]  cap_byte;
     wire        cap_valid;
-    wire        idelayctrl_rdy;
 
     trace_capture_a7 #(
-        .CLK_BUF   ("BUFR_IO"),
-        .USE_IDELAY(USE_IDELAY),
-        .IDELAY_FIXED(CAP_IDELAY_FIXED),
-        .IDELAY_FIXED_VAL(CAP_IDELAY_FIXED_VAL)
+        .CLK_BUF   ("BUFR_IO")
     ) u_capture (
         .rst          (rst200),
         .ref_200m     (clk200),
         .trace_clk_p  (trace_clk_in),
         .trace_data_p (trace_data_in),
-        .tap_data0    (tap0_200),
-        .tap_data1    (tap1_200),
-        .tap_data2    (tap2_200),
-        .tap_data3    (tap3_200),
-        .tap_clk      (tapc_200),
-        .tap_load     (tap_load_200),
         .test_src_en  (iddr_prbs_125),   // synced to trace_clk inside
         .trace_clk    (),
         .trace_a      (),
         .trace_b      (),
-        .idelayctrl_rdy(idelayctrl_rdy),
         .cap_byte     (cap_byte),
         .cap_valid    (cap_valid)
     );

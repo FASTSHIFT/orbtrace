@@ -147,24 +147,18 @@ module trace_probe_top #(
     // ------------------------------------------------------------------
     wire        trace_clk;
     wire [3:0]  trace_a, trace_b;
-    wire        idelayctrl_rdy;
-
     (* DONT_TOUCH = "true" *)
     trace_capture_a7 u_capture (
         .rst           (sys_rst),
         .ref_200m      (clk200),
         .trace_clk_p   (trace_clk_in),
         .trace_data_p  (trace_data_in),
-        .tap_data0     (5'd16),
-        .tap_data1     (5'd16),
-        .tap_data2     (5'd16),
-        .tap_data3     (5'd16),
-        .tap_clk       (5'd0),
-        .tap_load      (1'b0),
+        .test_src_en   (1'b0),
         .trace_clk     (trace_clk),
         .trace_a       (trace_a),
         .trace_b       (trace_b),
-        .idelayctrl_rdy(idelayctrl_rdy)
+        .cap_byte      (),
+        .cap_valid     ()
     );
 
     // ------------------------------------------------------------------
@@ -172,7 +166,7 @@ module trace_probe_top #(
     // ------------------------------------------------------------------
     wire        fr_avail;
     wire [127:0] frame128;
-    wire         tif_rst = sys_rst | ~idelayctrl_rdy;
+    wire         tif_rst = sys_rst;   // no IDELAYCTRL to wait for any more
 
     (* DONT_TOUCH = "true" *)
     traceIF #(.MAXBUSWIDTH(4)) u_traceif (

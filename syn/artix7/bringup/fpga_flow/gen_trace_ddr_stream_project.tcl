@@ -20,7 +20,7 @@
 #   vivado build/trace_ddr_stream_proj/trace_ddr_stream_proj.xpr
 #
 # Options (env):
-#   USE_IDELAY=0|1   default 0 (shipped direct IBUF->IDDR capture)
+#   (capture is IBUF->IDDR direct; no IDELAY knobs)
 #   RUN_SYNTH=1      also run synth_design in project mode (slower)
 #   PROJ_DIR=<path>  project location (default build/trace_ddr_stream_proj)
 
@@ -32,8 +32,6 @@ set ex        $repo_root/syn/external/verilog-ethernet/example/NexysVideo/fpga
 set rtl       $repo_root/syn/artix7/rtl
 set ipdir     $bringup/rtl/ddr3/ip
 
-set use_idelay 0
-if {[info exists ::env(USE_IDELAY)]} { set use_idelay $::env(USE_IDELAY) }
 set proj_dir "$bringup/build/trace_ddr_stream_proj"
 if {[info exists ::env(PROJ_DIR)]} { set proj_dir $::env(PROJ_DIR) }
 set proj_name "trace_ddr_stream_proj"
@@ -105,16 +103,13 @@ add_files -norecurse $design_v
 # ---- constraints ----
 add_files -fileset constrs_1 -norecurse $bringup/rtl/trace_ddr_stream.xdc
 
-# Top + the USE_IDELAY generic (so the elaborated/synth schematic matches the
-# shipped direct build).
 set_property top trace_ddr_stream_top [current_fileset]
-set_property generic "USE_IDELAY=$use_idelay" [current_fileset]
 
 update_compile_order -fileset sources_1
 
 puts "============================================================"
 puts " Project created: $proj_dir/$proj_name.xpr"
-puts " top = trace_ddr_stream_top   USE_IDELAY = $use_idelay   part = $part"
+puts " top = trace_ddr_stream_top   part = $part"
 puts ""
 puts " Open in GUI:"
 puts "   vivado $proj_dir/$proj_name.xpr"
